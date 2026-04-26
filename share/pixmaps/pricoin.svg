@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!--
+    Pricoin logo
+    Concept: privacy coin = a coin (currency) with a keyhole (secrecy/access control).
+    Color: deep violet — distinct from established privacy-coin palettes (Monero
+    orange, Zcash gold, Dash blue, Firo navy) while still reading "mysterious".
+  -->
+  <defs>
+    <radialGradient id="pric_coin" cx="35%" cy="28%" r="88%">
+      <stop offset="0%" stop-color="#a866ed"/>
+      <stop offset="55%" stop-color="#562aa6"/>
+      <stop offset="100%" stop-color="#1c0633"/>
+    </radialGradient>
+    <linearGradient id="pric_rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#c08af0"/>
+      <stop offset="100%" stop-color="#2a0d4a"/>
+    </linearGradient>
+    <linearGradient id="pric_key" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#cdb0f0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Coin body -->
+  <circle cx="128" cy="128" r="120" fill="url(#pric_coin)"/>
+  <!-- Outer rim highlight -->
+  <circle cx="128" cy="128" r="120" fill="none" stroke="url(#pric_rim)" stroke-width="5"/>
+  <!-- Inner edge ring -->
+  <circle cx="128" cy="128" r="108" fill="none" stroke="#b481e6" stroke-width="1.5" opacity="0.5"/>
+
+  <!-- Keyhole symbol: round head + tapered shaft -->
+  <g fill="url(#pric_key)">
+    <circle cx="128" cy="108" r="32"/>
+    <polygon points="106,132 150,132 158,202 98,202"/>
+  </g>
+
+  <!-- Ticker label arched along the lower rim -->
+  <text x="128" y="227" text-anchor="middle"
+        font-family="'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-size="14" font-weight="700" letter-spacing="3"
+        fill="#e3d2f7" opacity="0.85">PRIC</text>
+</svg>
