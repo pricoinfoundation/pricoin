@@ -903,6 +903,7 @@ RPCMethod abortrescan();
 RPCMethod walletsendct_export();
 RPCMethod pricoin_getstealthaddress_export();
 RPCMethod pricoin_listownct_export();
+RPCMethod walletsendct_from_ct_export();
 
 std::span<const CRPCCommand> GetWalletRPCCommands()
 {
@@ -911,6 +912,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &walletsendct_export},
         {"wallet", &pricoin_getstealthaddress_export},
         {"wallet", &pricoin_listownct_export},
+        {"wallet", &walletsendct_from_ct_export},
         {"wallet", &abandontransaction},
         {"wallet", &abortrescan},
         {"wallet", &backupwallet},

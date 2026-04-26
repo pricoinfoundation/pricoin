@@ -49,30 +49,29 @@ bool VerifyConfidentialContextual(
                 strprintf("tried to spend coinbase at depth %d", nSpendHeight - coin.nHeight));
         }
 
-        // Phase 2d-2 restriction: prev output must be transparent. We detect
-        // this via nValue > 0 (CT outputs are stored with nValue=0 in their
-        // CTxOut). A more permissive check (allowing CT-spending-CT) needs
-        // Coin to carry the commitment for v4 outputs, deferred to a later
-        // phase.
-        if (coin.out.nValue == 0) {
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-spends-confidential-prev",
-                "Phase 2d-2 only allows CT to spend transparent prev outputs");
+        // Two cases:
+        //   - Transparent prev (legacy v1/v2/v3 output): expected commitment
+        //     is Commit(prev_value, blind=0).
+        //   - Confidential prev (v4 output): the Coin carries its commitment;
+        //     use it directly. This was previously rejected ("Phase 2d-2
+        //     only allows transparent prev") and is unlocked here.
+        ct::Commitment expected{};
+        if (coin.IsConfidential()) {
+            expected = coin.commitment;
+        } else {
+            if (!MoneyRange(coin.out.nValue)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-inputvalues-outofrange");
+            }
+            ct::BlindingFactor zero_blind{};
+            auto built = ct::Commitment::Create(static_cast<uint64_t>(coin.out.nValue), zero_blind);
+            if (!built) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-input-commit-construction");
+            }
+            expected = *built;
         }
-        if (!MoneyRange(coin.out.nValue)) {
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-inputvalues-outofrange");
-        }
-
-        // Reconstruct the expected input commitment: Commit(prev_value, 0).
-        // Sender must have used these in their balance calculation; if they
-        // claim something else, balance verifies against fake amounts.
-        ct::BlindingFactor zero_blind{};
-        auto expected = ct::Commitment::Create(static_cast<uint64_t>(coin.out.nValue), zero_blind);
-        if (!expected) {
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-input-commit-construction");
-        }
-        if (*expected != tx.ct_bundle.input_commitments[i]) {
+        if (expected != tx.ct_bundle.input_commitments[i]) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-input-commit-mismatch",
-                strprintf("vin[%u] claims input commitment that does not match prev output value", i));
+                strprintf("vin[%u] claims input commitment that does not match prev output", i));
         }
     }
 

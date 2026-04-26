@@ -1,5 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-present The Bitcoin Core developers
+// Copyright (c) 2026-present The Pricoin developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -10,6 +11,7 @@
 #include <compressor.h>
 #include <core_memusage.h>
 #include <memusage.h>
+#include <pricoin/ct.h>
 #include <primitives/transaction.h>
 #include <serialize.h>
 #include <support/allocators/pool.h>
@@ -40,41 +42,69 @@ public:
     //! whether containing transaction was a coinbase
     bool fCoinBase : 1;
 
+    //! whether this is a Pricoin confidential output (a v4 tx output);
+    //! when true, `commitment` carries the prev-output's Pedersen commitment
+    //! so that a future v4 tx spending this UTXO can construct its
+    //! `ct_bundle.input_commitments[i]` even though `out.nValue == 0`.
+    bool fConfidential : 1;
+
     //! at which height this containing transaction was included in the active block chain
-    uint32_t nHeight : 31;
+    uint32_t nHeight : 30;
+
+    //! Pedersen commitment for confidential outputs (33 bytes). Valid iff
+    //! fConfidential is true; all-zero otherwise. Persisted with the UTXO so
+    //! v4-spending-v4 doesn't need to look up the prev tx body.
+    pricoin::ct::Commitment commitment{};
 
     //! construct a Coin from a CTxOut and height/coinbase information.
-    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), nHeight(nHeightIn) {}
-    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn) : out(outIn), fCoinBase(fCoinBaseIn),nHeight(nHeightIn) {}
+    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), fConfidential(false), nHeight(nHeightIn) {}
+    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn) : out(outIn), fCoinBase(fCoinBaseIn), fConfidential(false), nHeight(nHeightIn) {}
+
+    //! Pricoin: construct a confidential Coin (records the commitment).
+    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, const pricoin::ct::Commitment& c)
+        : out(std::move(outIn)), fCoinBase(fCoinBaseIn), fConfidential(true), nHeight(nHeightIn), commitment(c) {}
 
     void Clear() {
         out.SetNull();
         fCoinBase = false;
+        fConfidential = false;
         nHeight = 0;
+        commitment = pricoin::ct::Commitment{};
     }
 
     //! empty constructor
-    Coin() : fCoinBase(false), nHeight(0) { }
+    Coin() : fCoinBase(false), fConfidential(false), nHeight(0) { }
 
     bool IsCoinBase() const {
         return fCoinBase;
     }
 
+    bool IsConfidential() const {
+        return fConfidential;
+    }
+
     template<typename Stream>
     void Serialize(Stream &s) const {
         assert(!IsSpent());
-        uint32_t code{(uint32_t{nHeight} << 1) | uint32_t{fCoinBase}};
+        uint32_t code{(uint32_t{nHeight} << 2) | (uint32_t{fConfidential} << 1) | uint32_t{fCoinBase}};
         ::Serialize(s, VARINT(code));
         ::Serialize(s, Using<TxOutCompression>(out));
+        if (fConfidential) {
+            ::Serialize(s, commitment.bytes);
+        }
     }
 
     template<typename Stream>
     void Unserialize(Stream &s) {
         uint32_t code = 0;
         ::Unserialize(s, VARINT(code));
-        nHeight = code >> 1;
+        nHeight = code >> 2;
+        fConfidential = (code >> 1) & 1;
         fCoinBase = code & 1;
         ::Unserialize(s, Using<TxOutCompression>(out));
+        if (fConfidential) {
+            ::Unserialize(s, commitment.bytes);
+        }
     }
 
     /** Either this coin never existed (see e.g. coinEmpty in coins.cpp), or it
