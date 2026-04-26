@@ -15,16 +15,25 @@
 namespace pricoin::ct {
 
 // One confidential output: commitment to value + rangeproof binding the
-// commitment to a specific scriptPubKey.
+// commitment to a specific scriptPubKey + per-output tx pubkey R = rG used
+// by the recipient (with their view key) to ECDH-derive the rangeproof's
+// rewind nonce and recognise outputs paid to their stealth address.
+//
+// For non-stealth flows (Phase 2d-5/6a), tx_pubkey is the all-zero point
+// — the recipient cannot scan but the bundle is otherwise well-formed.
+using SerializedPubKey33 = std::array<unsigned char, 33>;
+
 struct CTOutput {
     Commitment commitment{};
     RangeProof rangeproof{};
     std::vector<unsigned char> script_pubkey{};
+    SerializedPubKey33 tx_pubkey{};
 
     SERIALIZE_METHODS(CTOutput, obj) {
         READWRITE(obj.commitment.bytes);
         READWRITE(obj.rangeproof);
         READWRITE(obj.script_pubkey);
+        READWRITE(obj.tx_pubkey);
     }
 
     bool operator==(const CTOutput&) const = default;

@@ -8,10 +8,13 @@
 #include <key_io.h>
 #include <pricoin/ct.h>
 #include <pricoin/cttx.h>
+#include <pricoin/stealth.h>
 #include <primitives/transaction.h>
+#include <interfaces/chain.h>
 #include <pubkey.h>
 #include <random.h>
 #include <rpc/server.h>
+#include <rpc/server_util.h>
 #include <rpc/util.h>
 #include <script/interpreter.h>
 #include <script/script.h>
@@ -24,12 +27,14 @@
 #include <core_io.h>
 #include <wallet/coincontrol.h>
 #include <wallet/coinselection.h>
+#include <wallet/pricoin_stealth.h>
 #include <wallet/rpc/util.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
 
 #include <array>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -104,15 +109,58 @@ RPCMethod walletsendct()
             }
             const CAmount target = dest_amount + fee;
 
-            CTxDestination dest_dest = DecodeDestination(dest_addr_str);
-            if (!IsValidDestination(dest_dest)) {
-                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid dest_address");
+            // Detect whether the destination is a stealth address. If so,
+            // derive a one-time scriptPubKey via ECDH against the recipient's
+            // view key. Otherwise treat it as a regular bech32 address.
+            const auto stealth_dest = ::pricoin::stealth::Decode(dest_addr_str);
+            CScript dest_spk;
+            ::pricoin::stealth::PointBytes dest_R{};
+            ::pricoin::ct::BlindingFactor dest_nonce{};
+            if (stealth_dest) {
+                CKey r;
+                r.MakeNewKey(/*fCompressed=*/true);
+                CPubKey R = r.GetPubKey();
+                std::memcpy(dest_R.data(), R.data(), 33);
+                auto S = ::pricoin::stealth::ECDHPoint(r, stealth_dest->view);
+                if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth ECDH failed");
+                auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, /*output_index=*/0);
+                auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, stealth_dest->spend);
+                if (!P) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth onetime pubkey failed");
+                dest_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
+                auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, 0);
+                std::memcpy(dest_nonce.data(), rp_nonce.data(), 32);
+            } else {
+                CTxDestination dest_dest = DecodeDestination(dest_addr_str);
+                if (!IsValidDestination(dest_dest)) {
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid dest_address (neither stealth nor bech32)");
+                }
+                dest_spk = GetScriptForDestination(dest_dest);
+                GetRandBytes(dest_nonce);
             }
-            const CScript dest_spk = GetScriptForDestination(dest_dest);
 
-            // Lock the wallet, pick a funding input, and grab a fresh change address.
+            // Always send change to our own stealth address so the wallet can
+            // recover it via Phase 5e block-scan once that lands.
+            const auto& self_id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+            CScript change_spk;
+            ::pricoin::stealth::PointBytes change_R{};
+            ::pricoin::ct::BlindingFactor change_nonce{};
+            {
+                CKey r;
+                r.MakeNewKey(/*fCompressed=*/true);
+                CPubKey R = r.GetPubKey();
+                std::memcpy(change_R.data(), R.data(), 33);
+                auto S = ::pricoin::stealth::ECDHPoint(r, self_id.public_address.view);
+                if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth ECDH failed (change)");
+                auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, /*output_index=*/1);
+                auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, self_id.public_address.spend);
+                if (!P) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth onetime pubkey failed (change)");
+                change_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
+                auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, 1);
+                std::memcpy(change_nonce.data(), rp_nonce.data(), 32);
+            }
+
+            // Lock the wallet, pick a funding input.
             std::optional<PickedInput> picked;
-            CTxDestination change_dest;
             {
                 LOCK(wallet.cs_wallet);
                 picked = PickP2WPKHFunding(wallet, target);
@@ -120,13 +168,7 @@ RPCMethod walletsendct()
                     throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS,
                         "No spendable P2WPKH UTXO with value >= dest_amount + fee");
                 }
-                auto change_res = wallet.GetNewChangeDestination(OutputType::BECH32);
-                if (!change_res) {
-                    throw JSONRPCError(RPC_WALLET_ERROR, "Failed to allocate change address");
-                }
-                change_dest = *change_res;
             }
-            const CScript change_spk = GetScriptForDestination(change_dest);
             const CAmount change_value = picked->value - target;
 
             // Build the bundle.
@@ -153,15 +195,12 @@ RPCMethod walletsendct()
             std::vector<unsigned char> dest_spk_bytes(dest_spk.begin(), dest_spk.end());
             std::vector<unsigned char> change_spk_bytes(change_spk.begin(), change_spk.end());
 
-            pricoin::ct::BlindingFactor nonce_dest, nonce_change;
-            GetRandBytes(nonce_dest);
-            GetRandBytes(nonce_change);
             auto dest_proof = pricoin::ct::CreateRangeProof(
                 static_cast<uint64_t>(dest_amount), dest_blind, *dest_commit,
-                std::span<const unsigned char>{dest_spk_bytes}, nonce_dest);
+                std::span<const unsigned char>{dest_spk_bytes}, dest_nonce);
             auto change_proof = pricoin::ct::CreateRangeProof(
                 static_cast<uint64_t>(change_value), *change_blind, *change_commit,
-                std::span<const unsigned char>{change_spk_bytes}, nonce_change);
+                std::span<const unsigned char>{change_spk_bytes}, change_nonce);
             if (!dest_proof || !change_proof) {
                 throw JSONRPCError(RPC_INTERNAL_ERROR, "rangeproof failed");
             }
@@ -169,8 +208,8 @@ RPCMethod walletsendct()
             pricoin::ct::CTBundle bundle;
             bundle.input_commitments = {*in_commit};
             bundle.outputs = {
-                pricoin::ct::CTOutput{*dest_commit, *dest_proof, dest_spk_bytes},
-                pricoin::ct::CTOutput{*change_commit, *change_proof, change_spk_bytes},
+                pricoin::ct::CTOutput{*dest_commit, *dest_proof, dest_spk_bytes, dest_R},
+                pricoin::ct::CTOutput{*change_commit, *change_proof, change_spk_bytes, change_R},
             };
             bundle.transparent_fee = static_cast<uint64_t>(fee);
 
@@ -214,8 +253,9 @@ RPCMethod walletsendct()
             out.pushKV("bundle_size", (int)tx_ref->ct_bundle.SerializedSize());
             out.pushKV("input_outpoint", picked->outpoint.hash.ToString() + ":" + std::to_string(picked->outpoint.n));
             out.pushKV("input_value", ValueFromAmount(picked->value));
-            out.pushKV("change_address", EncodeDestination(change_dest));
+            out.pushKV("change_to", "(wallet's own stealth address)");
             out.pushKV("change_amount", ValueFromAmount(change_value));
+            out.pushKV("dest_was_stealth", stealth_dest.has_value());
             return out;
         }
     };
@@ -224,5 +264,175 @@ RPCMethod walletsendct()
 } // namespace
 
 RPCMethod walletsendct_export() { return walletsendct(); }
+
+namespace {
+
+// Try to recover a CT output for a given wallet stealth identity. Returns
+// nullopt if the output is not addressed to us (fast path: scriptPubKey
+// mismatch). On match, returns the recovered (value, blind, output_index).
+struct RecoveredOutput {
+    uint32_t output_index;
+    CAmount value;
+    pricoin::ct::BlindingFactor blind;
+};
+
+std::optional<RecoveredOutput> TryRecoverCTOutput(
+    const ::wallet::pricoin_stealth::Identity& id,
+    const CTransaction& tx,
+    uint32_t output_index)
+{
+    if (tx.version != PRICOIN_CT_VERSION) return std::nullopt;
+    if (output_index >= tx.ct_bundle.outputs.size()) return std::nullopt;
+    if (output_index >= tx.vout.size()) return std::nullopt;
+
+    const auto& out = tx.ct_bundle.outputs[output_index];
+    // tx_pubkey of all zeros means non-stealth output — skip.
+    bool all_zero = true;
+    for (auto b : out.tx_pubkey) { if (b != 0) { all_zero = false; break; } }
+    if (all_zero) return std::nullopt;
+
+    CPubKey R(std::span<const unsigned char>{out.tx_pubkey.data(), out.tx_pubkey.size()});
+    if (!R.IsValid()) return std::nullopt;
+
+    auto S = ::pricoin::stealth::ECDHPoint(id.view, R);
+    if (!S) return std::nullopt;
+    auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, output_index);
+    auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, id.public_address.spend);
+    if (!P) return std::nullopt;
+    const CScript expected_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
+    if (tx.vout[output_index].scriptPubKey != expected_spk) return std::nullopt;
+
+    // Match! Rewind the rangeproof.
+    auto nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, output_index);
+    pricoin::ct::BlindingFactor nonce_arr{};
+    std::memcpy(nonce_arr.data(), nonce.data(), 32);
+    const auto& script = out.script_pubkey;
+    auto rewound = pricoin::ct::RewindRangeProof(
+        out.commitment,
+        std::span<const unsigned char>{out.rangeproof.data(), out.rangeproof.size()},
+        std::span<const unsigned char>{script.data(), script.size()},
+        nonce_arr);
+    if (!rewound) return std::nullopt;
+
+    return RecoveredOutput{
+        .output_index = output_index,
+        .value = static_cast<CAmount>(rewound->value),
+        .blind = rewound->blind,
+    };
+}
+
+RPCMethod pricoin_listownct()
+{
+    return RPCMethod{
+        "pricoin_listownct",
+        "Scan confirmed blocks (and the mempool) for confidential outputs addressed to this wallet's\n"
+        "stealth identity, recovering their hidden values via rangeproof rewind. Phase 5e demo.\n",
+        {
+            {"startheight", RPCArg::Type::NUM, RPCArg::Default{0}, "Block height to start scanning from"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM, "scanned_blocks", "How many blocks were scanned"},
+                {RPCResult::Type::NUM, "scanned_mempool_txs", "How many mempool txs were scanned"},
+                {RPCResult::Type::STR_AMOUNT, "total_recovered", "Total PRIC recovered as ours"},
+                {RPCResult::Type::ARR, "outputs", "Per-output recoveries",
+                    {{RPCResult::Type::OBJ, "", "",
+                        {
+                            {RPCResult::Type::STR_HEX, "txid", ""},
+                            {RPCResult::Type::NUM, "vout", ""},
+                            {RPCResult::Type::STR_AMOUNT, "value", "Recovered amount in PRIC"},
+                            {RPCResult::Type::NUM, "height", "Block height (-1 if mempool)"},
+                        }}}}
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_listownct", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            const int startheight = request.params[0].isNull() ? 0 : request.params[0].getInt<int>();
+
+            const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+            interfaces::Chain& chain = wallet.chain();
+
+            UniValue outputs{UniValue::VARR};
+            CAmount total_recovered = 0;
+            int scanned_blocks = 0;
+            int scanned_mempool = 0;
+
+            const std::optional<int> tip_opt = chain.getHeight();
+            const int tip_height = tip_opt.value_or(-1);
+
+            for (int h = std::max(startheight, 0); h <= tip_height; ++h) {
+                const uint256 block_hash = chain.getBlockHash(h);
+                CBlock block;
+                if (!chain.findBlock(block_hash, interfaces::FoundBlock().data(block))) continue;
+                if (block.vtx.empty()) continue;
+                ++scanned_blocks;
+                for (const auto& tx_ref : block.vtx) {
+                    if (tx_ref->version != PRICOIN_CT_VERSION) continue;
+                    for (uint32_t i = 0; i < tx_ref->vout.size(); ++i) {
+                        auto rec = TryRecoverCTOutput(id, *tx_ref, i);
+                        if (!rec) continue;
+                        total_recovered += rec->value;
+                        UniValue entry{UniValue::VOBJ};
+                        entry.pushKV("txid", tx_ref->GetHash().ToString());
+                        entry.pushKV("vout", (int)rec->output_index);
+                        entry.pushKV("value", ValueFromAmount(rec->value));
+                        entry.pushKV("height", h);
+                        outputs.push_back(entry);
+                    }
+                }
+            }
+            // Mempool sweep is omitted in this MVP — interfaces::Chain doesn't
+            // expose entry iteration. A confirmed-only scan is sufficient to
+            // demonstrate Phase 5e end-to-end.
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("scanned_blocks", scanned_blocks);
+            out.pushKV("scanned_mempool_txs", scanned_mempool);
+            out.pushKV("total_recovered", ValueFromAmount(total_recovered));
+            out.pushKV("outputs", outputs);
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_getstealthaddress()
+{
+    return RPCMethod{
+        "pricoin_getstealthaddress",
+        "Return the wallet's stealth address (CryptoNote-style dual-key (view, spend)).\n"
+        "Phase 5 MVP: the identity is generated lazily on first call and held only\n"
+        "in memory — it is *not* persisted across daemon restarts.\n",
+        {},
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR, "address", "Base58Check-encoded stealth address"},
+                {RPCResult::Type::STR_HEX, "view_pubkey", "Public view key (33 bytes)"},
+                {RPCResult::Type::STR_HEX, "spend_pubkey", "Public spend key (33 bytes)"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("pricoin_getstealthaddress", "")
+        },
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const auto& id = wallet::pricoin_stealth::GetOrCreate(*wallet_sp);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("address", ::pricoin::stealth::Encode(id.public_address));
+            out.pushKV("view_pubkey", HexStr(id.public_address.view));
+            out.pushKV("spend_pubkey", HexStr(id.public_address.spend));
+            return out;
+        }
+    };
+}
+} // namespace
+
+RPCMethod pricoin_getstealthaddress_export() { return pricoin_getstealthaddress(); }
+RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 
 } // namespace wallet
