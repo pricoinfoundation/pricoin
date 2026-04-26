@@ -5,6 +5,7 @@
 #include <pricoin/cttx.h>
 
 #include <crypto/sha256.h>
+#include <hash.h>
 #include <random.h>
 #include <streams.h>
 
@@ -111,6 +112,15 @@ std::optional<CTBuildResult> BuildBundle(
         });
     }
     return result;
+}
+
+uint256 HashBundle(const CTBundle& bundle)
+{
+    HashWriter hw{};
+    hw << bundle;
+    // Plain SHA-256 (single, not double) — matches Bitcoin's HashWriter::GetSHA256
+    // pattern used for sighash subhashes.
+    return hw.GetSHA256();
 }
 
 bool VerifyBundle(const CTBundle& bundle)

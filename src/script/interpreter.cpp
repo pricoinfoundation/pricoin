@@ -1,5 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-present The Bitcoin Core developers
+// Copyright (c) 2026-present The Pricoin developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -8,6 +9,8 @@
 #include <crypto/ripemd160.h>
 #include <crypto/sha1.h>
 #include <crypto/sha256.h>
+#include <pricoin/cttx.h>
+#include <primitives/transaction.h>
 #include <pubkey.h>
 #include <script/script.h>
 #include <tinyformat.h>
@@ -1613,8 +1616,10 @@ uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn
 
     HashWriter ss{};
 
-    // Try to compute using cached SHA256 midstate.
-    if (sighash_cache && sighash_cache->Load(nHashType, scriptCode, ss)) {
+    // Try to compute using cached SHA256 midstate. Disabled for Pricoin
+    // CT-bearing transactions because the cache key doesn't include the
+    // bundle hash; reusing a cached midstate could cross bundles silently.
+    if (sighash_cache && txTo.version != PRICOIN_CT_VERSION && sighash_cache->Load(nHashType, scriptCode, ss)) {
         // Add sighash type and hash.
         ss << nHashType;
         return ss.GetHash();
@@ -1666,8 +1671,21 @@ uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn
         ss << txTmp;
     }
 
-    // If a cache object was provided, store the midstate there.
-    if (sighash_cache != nullptr) {
+    // Pricoin: for v4 (CT) transactions, mix in the bundle hash so the
+    // signature commits to the confidential outputs. Without this, an
+    // attacker could swap the bundle while keeping the signature intact,
+    // breaking the integrity of "this signature authorizes these outputs".
+    // Done before the cache store so we don't poison the cache, and after
+    // the existing preimage so legacy v1-3 sighashes are byte-identical to
+    // upstream Bitcoin.
+    if (txTo.version == PRICOIN_CT_VERSION) {
+        ss << pricoin::ct::HashBundle(txTo.ct_bundle);
+    }
+
+    // If a cache object was provided, store the midstate there. Skipped for
+    // CT-bearing transactions because the cache key does not include the
+    // bundle hash.
+    if (sighash_cache != nullptr && txTo.version != PRICOIN_CT_VERSION) {
         sighash_cache->Store(nHashType, scriptCode, ss);
     }
 

@@ -7,6 +7,7 @@
 
 #include <pricoin/ct.h>
 #include <serialize.h>
+#include <uint256.h>
 
 #include <cstdint>
 #include <vector>
@@ -72,6 +73,12 @@ std::optional<CTBuildResult> BuildBundle(
 // scriptPubKey, and the Pedersen tally must balance with the transparent
 // fee. Returns true iff all checks pass.
 bool VerifyBundle(const CTBundle& bundle);
+
+// Deterministic 32-byte digest of a CTBundle. Used by signature hashing on
+// v4 transactions so a signature commits to the bundle (preventing an
+// attacker from swapping the bundle while keeping the signature intact).
+// Plain SHA-256 of the bundle's standard serialization.
+uint256 HashBundle(const CTBundle& bundle);
 
 } // namespace pricoin::ct
 
