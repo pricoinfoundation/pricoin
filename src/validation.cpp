@@ -38,6 +38,7 @@
 #include <policy/truc_policy.h>
 #include <pow.h>
 #include <pow/randomx_pricoin.h>
+#include <pricoin/validation.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <random.h>
@@ -886,8 +887,14 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "non-BIP68-final");
     }
 
-    // The mempool holds txs for the next block, so pass height+1 to CheckTxInputs
-    if (!Consensus::CheckTxInputs(tx, state, m_view, m_active_chainstate.m_chain.Height() + 1, ws.m_base_fees)) {
+    // The mempool holds txs for the next block, so pass height+1 to CheckTxInputs.
+    // Pricoin: CT-bearing transactions take a different input-balance path.
+    const int spend_height = m_active_chainstate.m_chain.Height() + 1;
+    if (tx.version == PRICOIN_CT_VERSION) {
+        if (!pricoin::VerifyConfidentialContextual(tx, m_view, spend_height, state, ws.m_base_fees)) {
+            return false;
+        }
+    } else if (!Consensus::CheckTxInputs(tx, state, m_view, spend_height, ws.m_base_fees)) {
         return false; // state filled in by CheckTxInputs
     }
 
@@ -2530,7 +2537,10 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         {
             CAmount txfee = 0;
             TxValidationState tx_state;
-            if (!Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee)) {
+            const bool inputs_ok = (tx.version == PRICOIN_CT_VERSION)
+                ? pricoin::VerifyConfidentialContextual(tx, view, pindex->nHeight, tx_state, txfee)
+                : Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee);
+            if (!inputs_ok) {
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                               tx_state.GetRejectReason(),
