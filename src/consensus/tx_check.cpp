@@ -63,7 +63,18 @@ bool CheckTransaction(const CTransaction& tx, TxValidationState& state)
         if (tx.IsCoinBase()) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-coinbase");
         }
-        if (tx.ct_bundle.input_commitments.size() != tx.vin.size()) {
+        const bool has_direct = !tx.ct_bundle.input_commitments.empty();
+        const bool has_ring = !tx.ct_bundle.ring_inputs.empty();
+        if (has_direct && has_ring) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-mixed-input-modes");
+        }
+        if (!has_direct && !has_ring) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-no-inputs");
+        }
+        const size_t input_count = has_direct
+            ? tx.ct_bundle.input_commitments.size()
+            : tx.ct_bundle.ring_inputs.size();
+        if (input_count != tx.vin.size()) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-input-count");
         }
         if (tx.ct_bundle.outputs.size() != tx.vout.size()) {

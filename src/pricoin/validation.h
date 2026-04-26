@@ -36,6 +36,15 @@ namespace pricoin {
     TxValidationState& state,
     CAmount& txfee_out);
 
+// Pricoin: commit each ring-input's key image to the global in-memory set.
+// Called from ConnectBlock after the block has fully validated. Idempotent
+// at a per-tx level (re-committing the same KI returns false, but doesn't
+// throw) so a re-org replay is safe.
+void CommitRingKeyImages(const CTransaction& tx);
+
+// Remove key images committed by tx (for chain reorgs / DisconnectBlock).
+void UncommitRingKeyImages(const CTransaction& tx);
+
 } // namespace pricoin
 
 #endif // BITCOIN_PRICOIN_VALIDATION_H

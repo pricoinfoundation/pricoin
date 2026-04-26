@@ -11,6 +11,7 @@
 #include <crypto/sha256.h>
 #include <logging.h>
 #include <pricoin/cttx.h>
+#include <pricoin/ringsig.h>
 #include <primitives/transaction.h>
 #include <random.h>
 #include <script/script.h>
@@ -342,6 +343,10 @@ void RunSelfTest()
     }
     LogInfo("Pricoin CT tx round-trip: version=%u tx serialized=%u bytes",
             parsed_tx.version, ::GetSerializeSize(TX_NO_WITNESS(parsed_tx)));
+
+    // Phase 4a — exercise the CLSAG ring-signature primitives.
+    ::pricoin::ringsig::RunSelfTest();
+    LogInfo("Pricoin ringsig (CLSAG single-layer) self-test passed");
 }
 
 } // namespace pricoin::ct

@@ -128,7 +128,9 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, bool 
         // deal with the pre-BIP30 occurrences of duplicate coinbase transactions.
         if (is_pricoin_ct && i < tx.ct_bundle.outputs.size()) {
             cache.AddCoin(COutPoint(txid, i),
-                          Coin(CTxOut{tx.vout[i]}, nHeight, fCoinbase, tx.ct_bundle.outputs[i].commitment),
+                          Coin(CTxOut{tx.vout[i]}, nHeight, fCoinbase,
+                               tx.ct_bundle.outputs[i].commitment,
+                               tx.ct_bundle.outputs[i].one_time_pubkey),
                           overwrite);
         } else {
             cache.AddCoin(COutPoint(txid, i), Coin(tx.vout[i], nHeight, fCoinbase), overwrite);

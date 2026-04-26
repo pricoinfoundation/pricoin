@@ -56,13 +56,21 @@ public:
     //! v4-spending-v4 doesn't need to look up the prev tx body.
     pricoin::ct::Commitment commitment{};
 
+    //! Phase 4b: full one-time recipient pubkey P (33 bytes). Needed for
+    //! ring-sig verification because the scriptPubKey stores only hash160(P).
+    //! Valid iff fConfidential is true.
+    std::array<unsigned char, 33> one_time_pubkey{};
+
     //! construct a Coin from a CTxOut and height/coinbase information.
     Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), fConfidential(false), nHeight(nHeightIn) {}
     Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn) : out(outIn), fCoinBase(fCoinBaseIn), fConfidential(false), nHeight(nHeightIn) {}
 
-    //! Pricoin: construct a confidential Coin (records the commitment).
-    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, const pricoin::ct::Commitment& c)
-        : out(std::move(outIn)), fCoinBase(fCoinBaseIn), fConfidential(true), nHeight(nHeightIn), commitment(c) {}
+    //! Pricoin: construct a confidential Coin (records the commitment + one-time pubkey).
+    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn,
+         const pricoin::ct::Commitment& c,
+         const std::array<unsigned char, 33>& otp)
+        : out(std::move(outIn)), fCoinBase(fCoinBaseIn), fConfidential(true), nHeight(nHeightIn),
+          commitment(c), one_time_pubkey(otp) {}
 
     void Clear() {
         out.SetNull();
@@ -70,6 +78,7 @@ public:
         fConfidential = false;
         nHeight = 0;
         commitment = pricoin::ct::Commitment{};
+        one_time_pubkey = {};
     }
 
     //! empty constructor
@@ -91,6 +100,7 @@ public:
         ::Serialize(s, Using<TxOutCompression>(out));
         if (fConfidential) {
             ::Serialize(s, commitment.bytes);
+            ::Serialize(s, one_time_pubkey);
         }
     }
 
@@ -104,6 +114,7 @@ public:
         ::Unserialize(s, Using<TxOutCompression>(out));
         if (fConfidential) {
             ::Unserialize(s, commitment.bytes);
+            ::Unserialize(s, one_time_pubkey);
         }
     }
 

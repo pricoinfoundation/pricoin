@@ -6,6 +6,7 @@
 #define BITCOIN_PRICOIN_CTTX_H
 
 #include <pricoin/ct.h>
+#include <pricoin/ringsig.h>
 #include <serialize.h>
 #include <uint256.h>
 
@@ -28,27 +29,72 @@ struct CTOutput {
     RangeProof rangeproof{};
     std::vector<unsigned char> script_pubkey{};
     SerializedPubKey33 tx_pubkey{};
+    // Phase 4b: store the full one-time recipient pubkey P (33 bytes)
+    // alongside the P2WPKH script. Future ring-sig verifiers need P
+    // explicitly because the script only stores hash160(P). All-zero for
+    // outputs that don't intend to be ring-signed against (those still work
+    // as direct-spend prevouts).
+    SerializedPubKey33 one_time_pubkey{};
 
     SERIALIZE_METHODS(CTOutput, obj) {
         READWRITE(obj.commitment.bytes);
         READWRITE(obj.rangeproof);
         READWRITE(obj.script_pubkey);
         READWRITE(obj.tx_pubkey);
+        READWRITE(obj.one_time_pubkey);
     }
 
     bool operator==(const CTOutput&) const = default;
 };
 
+// Reference to a previous output, by (txid, vout-index). Same wire layout
+// as COutPoint — duplicated here to avoid a circular dependency with
+// primitives/transaction.h (which already includes cttx.h via CTransaction).
+struct PrevoutRef {
+    uint256 hash{};
+    uint32_t n{0};
+
+    SERIALIZE_METHODS(PrevoutRef, obj) { READWRITE(obj.hash); READWRITE(obj.n); }
+    bool operator==(const PrevoutRef&) const = default;
+};
+
+// Phase 4b — RingCT input. Each one hides the spent prev output among N
+// candidates via a multi-layer CLSAG signature over (P_i, W_i) where
+// W_i = C_i - pseudo_commitment. The sender chooses pseudo_commitment so
+// that pseudo blinds sum to output blinds (same balance math as without
+// rings). The signature also publishes a key image for double-spend
+// detection.
+struct CTRingInput {
+    std::vector<PrevoutRef> ring{};       // N candidate prevouts
+    Commitment pseudo_commitment{};        // C_pseudo_in (used in tally)
+    pricoin::ringsig::Signature sig{};     // CLSAG; key image is sig.key_image
+
+    SERIALIZE_METHODS(CTRingInput, obj) {
+        READWRITE(obj.ring);
+        READWRITE(obj.pseudo_commitment.bytes);
+        READWRITE(obj.sig);
+    }
+    bool operator==(const CTRingInput&) const = default;
+};
+
 // In-memory + serializable shape of a confidential-amount transaction.
-// Phase 2c: this lives alongside, not inside, CTxOut. Phase 2d will wire
-// it into the consensus tx format.
+// Two ways to fund inputs:
+//   - input_commitments[] — direct mode (Phase 2d). Each tx.vin[i].prevout
+//     points to the actual prev output; its commitment is recomputed from
+//     the chainstate. No sender privacy.
+//   - ring_inputs[] — RingCT mode (Phase 4b). Each tx.vin[i].prevout is a
+//     placeholder; the real input is hidden among N candidates in the ring.
+// A v4 tx uses one or the other (verifier picks based on which is
+// non-empty for that input index).
 struct CTBundle {
     std::vector<Commitment> input_commitments{};
+    std::vector<CTRingInput> ring_inputs{};
     std::vector<CTOutput> outputs{};
     uint64_t transparent_fee{0};
 
     SERIALIZE_METHODS(CTBundle, obj) {
         READWRITE(obj.input_commitments);
+        READWRITE(obj.ring_inputs);
         READWRITE(obj.outputs);
         READWRITE(obj.transparent_fee);
     }
@@ -88,6 +134,21 @@ bool VerifyBundle(const CTBundle& bundle);
 // attacker from swapping the bundle while keeping the signature intact).
 // Plain SHA-256 of the bundle's standard serialization.
 uint256 HashBundle(const CTBundle& bundle);
+
+// Subtract two Pedersen commitments as elliptic-curve points and return the
+// result as a compressed 33-byte pubkey. Used by ring-signature verifiers
+// to compute W_i = C_i - C_pseudo for each ring member. Returns nullopt on
+// any cryptographic parse failure.
+std::optional<std::array<unsigned char, 33>> SubtractCommitments(
+    const Commitment& C1, const Commitment& C2);
+
+// Negate a 32-byte scalar mod n (i.e., return n - x). Returns nullopt if x
+// is not a valid scalar.
+std::optional<BlindingFactor> NegateScalar(const BlindingFactor& x);
+
+// Add two 32-byte scalars mod n. Returns nullopt if the result is invalid
+// (e.g., zero) or if either input is invalid.
+std::optional<BlindingFactor> AddScalars(const BlindingFactor& a, const BlindingFactor& b);
 
 } // namespace pricoin::ct
 

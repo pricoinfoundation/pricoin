@@ -870,6 +870,21 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // the cached best block through `m_viewmempool` after caching inputs.
     (void)m_view.GetBestBlock();
 
+    // Pricoin: for v4 ring-input txs, preload each ring member's prev coin
+    // into the cache before switching to the empty backend. Otherwise the
+    // ring-sig verifier sees them as spent/absent.
+    if (tx.version == PRICOIN_CT_VERSION) {
+        for (const auto& ri : tx.ct_bundle.ring_inputs) {
+            for (const auto& pref : ri.ring) {
+                const COutPoint op{Txid::FromUint256(pref.hash), pref.n};
+                if (!coins_cache.HaveCoinInCache(op)) {
+                    coins_to_uncache.push_back(op);
+                }
+                (void)m_view.HaveCoin(op); // triggers FetchCoin
+            }
+        }
+    }
+
     // All required inputs are cached now, so switch m_view to the empty backend.
     // This keeps already-fetched cache entries for later checks and prevents new
     // backend lookups (which would avoid coins_to_uncache tracking).
@@ -1147,8 +1162,14 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     constexpr script_verify_flags scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS;
 
     // Check input scripts and signatures.
+    // Pricoin: for v4 ring-input txs, script verification is skipped — the
+    // CLSAG ring signature in ct_bundle.ring_inputs[i] authenticates the
+    // input. The vin[i].prevout is a marker (one of the ring members) and
+    // does not need a per-input witness. VerifyConfidentialContextual has
+    // already validated the ring sig + key-image uniqueness.
+    const bool is_v4_ring = (tx.version == PRICOIN_CT_VERSION) && !tx.ct_bundle.ring_inputs.empty();
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache())) {
+    if (!is_v4_ring && !CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache())) {
         // Detect a failure due to a missing witness so that p2p code can handle rejection caching appropriately.
         if (!tx.HasWitness() && SpendsNonAnchorWitnessProg(tx, m_view)) {
             state.Invalid(TxValidationResult::TX_WITNESS_STRIPPED,
@@ -1184,7 +1205,10 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     // invalid blocks (using TestBlockValidity), however allowing such
     // transactions into the mempool can be exploited as a DoS attack.
     script_verify_flags currentBlockScriptVerifyFlags{GetBlockScriptFlags(*m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman)};
-    if (!CheckInputsFromMempoolAndCache(tx, state, m_view, m_pool, currentBlockScriptVerifyFlags,
+    // Pricoin: skip script verification for v4 ring-input txs (CLSAG ring sig
+    // already verified in VerifyConfidentialContextual).
+    const bool is_v4_ring = (tx.version == PRICOIN_CT_VERSION) && !tx.ct_bundle.ring_inputs.empty();
+    if (!is_v4_ring && !CheckInputsFromMempoolAndCache(tx, state, m_view, m_pool, currentBlockScriptVerifyFlags,
                                         ws.m_precomputed_txdata, m_active_chainstate.CoinsTip(), GetValidationCache())) {
         LogError("BUG! PLEASE REPORT THIS! CheckInputScripts failed against latest-block but not STANDARD flags %s, %s", hash.ToString(), state.ToString());
         return Assume(false);
@@ -2584,9 +2608,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             bool fCacheResults = fJustCheck; /* Don't cache results if we're actually connecting blocks (still consult the cache, though) */
             bool tx_ok;
             TxValidationState tx_state;
+            // Pricoin: skip per-input script verification for v4 ring-input
+            // txs. The CLSAG ring sig (already verified in
+            // VerifyConfidentialContextual via the ring path) authenticates
+            // the input.
+            const bool is_v4_ring = (tx.version == PRICOIN_CT_VERSION) && !tx.ct_bundle.ring_inputs.empty();
             // If CheckInputScripts is called with a pointer to a checks vector, the resulting checks are appended to it. In that case
             // they need to be added to control which runs them asynchronously. Otherwise, CheckInputScripts runs the checks before returning.
-            if (control) {
+            if (is_v4_ring) {
+                tx_ok = true;
+            } else if (control) {
                 std::vector<CScriptCheck> vChecks;
                 tx_ok = CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], m_chainman.m_validation_cache, &vChecks);
                 if (tx_ok) control->Add(std::move(vChecks));
@@ -2606,6 +2637,14 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             blockundo.vtxundo.emplace_back();
         }
         UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight);
+        // Pricoin: commit any ring-input key images to the global set, but
+        // only on the real (non-test) ConnectBlock pass — TestBlockValidity
+        // runs this loop with fJustCheck=true, and we must not pollute the
+        // committed set there or the actual ConnectBlock will reject as
+        // double-spend.
+        if (!fJustCheck) {
+            pricoin::CommitRingKeyImages(tx);
+        }
     }
     const auto time_3{SteadyClock::now()};
     m_chainman.time_connect += time_3 - time_2;
