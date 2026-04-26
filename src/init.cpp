@@ -1,5 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-present The Bitcoin Core developers
+// Copyright (c) 2026-present The Pricoin developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -64,6 +65,7 @@
 #include <policy/fees/block_policy_estimator_args.h>
 #include <policy/policy.h>
 #include <policy/settings.h>
+#include <pricoin/ct.h>
 #include <protocol.h>
 #include <rpc/blockchain.h>
 #include <rpc/register.h>
@@ -1441,6 +1443,17 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (!init::StartLogging(args)) {
         // Detailed error printed inside StartLogging().
         return false;
+    }
+
+    // Pricoin: validate the confidential-transactions wrapper end-to-end on
+    // every startup while the integration is unstable. Cheap (~ms) and
+    // catches any breakage in the secp256k1-zkp <-> wrapper interaction
+    // before we touch user state.
+    try {
+        pricoin::ct::RunSelfTest();
+        LogInfo("Pricoin CT self-test passed");
+    } catch (const std::exception& e) {
+        return InitError(Untranslated(strprintf("Pricoin CT self-test failed: %s", e.what())));
     }
 
     LogInfo("Using at most %i automatic connections (%i file descriptors available)", nMaxConnections, available_fds);

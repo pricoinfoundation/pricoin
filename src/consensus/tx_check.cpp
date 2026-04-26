@@ -1,4 +1,5 @@
 // Copyright (c) 2017-present The Bitcoin Core developers
+// Copyright (c) 2026-present The Pricoin developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -54,6 +55,52 @@ bool CheckTransaction(const CTransaction& tx, TxValidationState& state)
         for (const auto& txin : tx.vin)
             if (txin.prevout.IsNull())
                 return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-prevout-null");
+    }
+
+    // Pricoin: structural rules for the confidential-transaction tx version.
+    // Coinbase is excluded (subsidy is auditable; coinbase stays transparent).
+    if (tx.version == PRICOIN_CT_VERSION) {
+        if (tx.IsCoinBase()) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-coinbase");
+        }
+        if (tx.ct_bundle.input_commitments.size() != tx.vin.size()) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-input-count");
+        }
+        if (tx.ct_bundle.outputs.size() != tx.vout.size()) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-output-count");
+        }
+        // All visible vout amounts must be zero — the real values live in
+        // commitments; the cleartext fee lives in ct_bundle.transparent_fee.
+        for (const auto& txout : tx.vout) {
+            if (txout.nValue != 0) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-nonzero-vout");
+            }
+        }
+        // Bundle output scripts must match vout scripts (the rangeproof's
+        // extra_commit binds to the script, so a mismatch would already make
+        // verification fail — but reject early with a clear reason).
+        for (size_t i = 0; i < tx.vout.size(); ++i) {
+            const auto& spk = tx.vout[i].scriptPubKey;
+            const auto& bundle_spk = tx.ct_bundle.outputs[i].script_pubkey;
+            if (spk.size() != bundle_spk.size() ||
+                !std::equal(spk.begin(), spk.end(), bundle_spk.begin())) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-script-mismatch");
+            }
+            if (tx.ct_bundle.outputs[i].rangeproof.empty()) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-empty-rangeproof");
+            }
+        }
+        // Sanity: transparent_fee fits in CAmount range.
+        if (tx.ct_bundle.transparent_fee > static_cast<uint64_t>(MAX_MONEY)) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-fee-toolarge");
+        }
+    } else {
+        // Non-CT versions must not carry a CT bundle.
+        if (!tx.ct_bundle.input_commitments.empty() ||
+            !tx.ct_bundle.outputs.empty() ||
+            tx.ct_bundle.transparent_fee != 0) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-non-pct-has-bundle");
+        }
     }
 
     return true;

@@ -1,5 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-present The Bitcoin Core developers
+// Copyright (c) 2026-present The Pricoin developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -8,6 +9,7 @@
 
 #include <attributes.h>
 #include <consensus/amount.h>
+#include <pricoin/cttx.h>
 #include <primitives/transaction_identifier.h> // IWYU pragma: export
 #include <script/script.h>
 #include <serialize.h>
@@ -181,11 +183,19 @@ static constexpr TransactionSerParams TX_WITH_WITNESS{.allow_witness = true};
 static constexpr TransactionSerParams TX_NO_WITNESS{.allow_witness = false};
 
 /**
+ * Pricoin CT transaction version: outputs are confidential, inputs reference
+ * prior outputs whose values are reconstructed by the verifier. Carries a
+ * trailing CTBundle.
+ */
+inline constexpr uint32_t PRICOIN_CT_VERSION{4};
+
+/**
  * Basic transaction serialization format:
  * - uint32_t version
  * - std::vector<CTxIn> vin
  * - std::vector<CTxOut> vout
  * - uint32_t nLockTime
+ * - if (version == PRICOIN_CT_VERSION): pricoin::ct::CTBundle ct_bundle
  *
  * Extended transaction serialization format:
  * - uint32_t version
@@ -196,6 +206,7 @@ static constexpr TransactionSerParams TX_NO_WITNESS{.allow_witness = false};
  * - if (flags & 1):
  *   - CScriptWitness scriptWitness; (deserialized into CTxIn)
  * - uint32_t nLockTime
+ * - if (version == PRICOIN_CT_VERSION): pricoin::ct::CTBundle ct_bundle
  */
 template<typename Stream, typename TxType>
 void UnserializeTransaction(TxType& tx, Stream& s, const TransactionSerParams& params)
@@ -235,6 +246,11 @@ void UnserializeTransaction(TxType& tx, Stream& s, const TransactionSerParams& p
         throw std::ios_base::failure("Unknown transaction optional data");
     }
     s >> tx.nLockTime;
+    if (tx.version == PRICOIN_CT_VERSION) {
+        s >> tx.ct_bundle;
+    } else {
+        tx.ct_bundle = pricoin::ct::CTBundle{};
+    }
 }
 
 template<typename Stream, typename TxType>
@@ -265,6 +281,9 @@ void SerializeTransaction(const TxType& tx, Stream& s, const TransactionSerParam
         }
     }
     s << tx.nLockTime;
+    if (tx.version == PRICOIN_CT_VERSION) {
+        s << tx.ct_bundle;
+    }
 }
 
 template<typename TxType>
@@ -292,6 +311,8 @@ public:
     const std::vector<CTxOut> vout;
     const uint32_t version;
     const uint32_t nLockTime;
+    // Pricoin: confidential-transaction bundle. Empty unless version == PRICOIN_CT_VERSION.
+    const pricoin::ct::CTBundle ct_bundle;
 
 private:
     /** Memory only. */
@@ -360,6 +381,8 @@ struct CMutableTransaction
     std::vector<CTxOut> vout;
     uint32_t version;
     uint32_t nLockTime;
+    // Pricoin: confidential-transaction bundle. Empty unless version == PRICOIN_CT_VERSION.
+    pricoin::ct::CTBundle ct_bundle;
 
     explicit CMutableTransaction();
     explicit CMutableTransaction(const CTransaction& tx);

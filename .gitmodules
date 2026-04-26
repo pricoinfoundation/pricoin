@@ -1,3 +1,0 @@
-[submodule "src/crypto/randomx"]
-	path = src/crypto/randomx
-	url = https://github.com/tevador/RandomX.git

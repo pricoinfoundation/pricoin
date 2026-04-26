@@ -1,5 +1,6 @@
 // Copyright (c) 2009-present The Bitcoin Core developers
 // Copyright (c) 2017 The Zcash developers
+// Copyright (c) 2026-present The Pricoin developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -446,7 +447,7 @@ std::optional<uint256> CKey::CreateMuSig2PartialSig(const uint256& sighash, cons
 
     // Create musig_session
     secp256k1_musig_session session;
-    if (!secp256k1_musig_nonce_process(secp256k1_context_static, &session, &aggnonce, sighash.data(), &keyagg_cache)) {
+    if (!secp256k1_musig_nonce_process(secp256k1_context_static, &session, &aggnonce, sighash.data(), &keyagg_cache, /*adaptor=*/nullptr)) {
         return std::nullopt;
     }
 

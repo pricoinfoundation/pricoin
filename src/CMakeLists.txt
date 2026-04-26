@@ -134,6 +134,8 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   policy/policy.cpp
   pow.cpp
   pow/randomx_pricoin.cpp
+  pricoin/ct.cpp
+  pricoin/cttx.cpp
   protocol.cpp
   psbt.cpp
   rpc/rawtransaction_util.cpp
