@@ -900,11 +900,13 @@ RPCMethod gettransaction();
 RPCMethod abandontransaction();
 RPCMethod rescanblockchain();
 RPCMethod abortrescan();
+RPCMethod walletsendct_export();
 
 std::span<const CRPCCommand> GetWalletRPCCommands()
 {
     static const CRPCCommand commands[]{
         {"rawtransactions", &fundrawtransaction},
+        {"wallet", &walletsendct_export},
         {"wallet", &abandontransaction},
         {"wallet", &abortrescan},
         {"wallet", &backupwallet},
