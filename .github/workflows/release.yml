@@ -108,7 +108,11 @@ jobs:
   build-windows:
     name: Windows x86_64 (qt) — cross from Linux
     needs: resolve-tag
-    runs-on: ubuntu-22.04
+    # ubuntu-24.04 ships gcc-mingw-w64 13.x. ubuntu-22.04 has 10.x which
+    # ICEs in `i386_pe_seh_unwind_emit` when building Qt's bundled PCRE2
+    # under the hardening flags Qt enables (-fstack-clash-protection,
+    # -fstack-protector-strong, -Wa,-mbig-obj). Newer mingw GCC fixes it.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -165,19 +169,13 @@ jobs:
           path: dist/*.zip
 
   build-macos:
-    name: macOS ${{ matrix.arch }} (qt)
+    # arm64 only. GitHub Actions retired the macos-13 (Intel) runners in
+    # late 2025; jobs scheduled there sit in the queue indefinitely. Apple
+    # Silicon binaries run on x86_64 Macs via Rosetta 2, so this still
+    # covers all current macOS users with a single artifact.
+    name: macOS arm64 (qt) — .dmg
     needs: resolve-tag
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-latest
-            arch: arm64
-            brew_prefix: /opt/homebrew
-          - runner: macos-13
-            arch: x86_64
-            brew_prefix: /usr/local
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -189,36 +187,67 @@ jobs:
       - name: Configure
         env:
           # Homebrew installs Qt6 in a versioned prefix; cmake's find_package
-          # needs the hint. The prefix differs by arch (/opt/homebrew on arm64,
-          # /usr/local on Intel).
-          CMAKE_PREFIX_PATH: ${{ matrix.brew_prefix }}/opt/qt@6:${{ matrix.brew_prefix }}/opt/sqlite:${{ matrix.brew_prefix }}/opt/libevent:${{ matrix.brew_prefix }}/opt/zeromq:${{ matrix.brew_prefix }}/opt/boost
-        # Disable IPC (multiprocess) support — would require Cap'n Proto and
-        # we don't ship the separated bitcoin-node/bitcoin-wallet binaries
-        # for macOS. Linux builds get capnp through depends/.
-        run: cmake -S . -B build -G Ninja -DBUILD_GUI=ON -DWITH_QRENCODE=OFF -DENABLE_IPC=OFF -DCMAKE_BUILD_TYPE=Release
+          # needs the hint. /opt/homebrew is the arm64 prefix.
+          CMAKE_PREFIX_PATH: /opt/homebrew/opt/qt@6:/opt/homebrew/opt/sqlite:/opt/homebrew/opt/libevent:/opt/homebrew/opt/zeromq:/opt/homebrew/opt/boost
+        # Disable IPC (multiprocess) — needs Cap'n Proto, and we don't ship
+        # separated bitcoin-node/bitcoin-wallet binaries for macOS. Linux
+        # builds get capnp through depends/.
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DBUILD_GUI=ON -DWITH_QRENCODE=OFF -DENABLE_IPC=OFF \
+            -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build -j "$(sysctl -n hw.ncpu)"
 
-      - name: Strip
-        run: strip -x build/bin/pricoin-qt
+      - name: Bundle Qt frameworks into Pricoin-Qt.app
+        # The `deploy` target is wired in cmake/module/Maintenance.cmake.
+        # On macOS hosts it runs contrib/macdeploy/macdeployqtplus, which
+        # copies QtCore/QtGui/QtWidgets/etc into the .app bundle so the
+        # binary is portable to a stock macOS install with no Qt present.
+        # We discard the bundled .zip and DMG the .app ourselves below.
+        run: cmake --build build --target deploy
 
-      - name: Package
+      - name: Build Pricoin .icns from PNG logo
+        # Bitcoin Core's bitcoin.icns is left over and has the wrong
+        # branding; macdeployqtplus already copied that file in. Regenerate
+        # in-place from the master Pricoin logo before DMG'ing.
+        run: |
+          ICONSET=icon.iconset
+          rm -rf "$ICONSET"; mkdir "$ICONSET"
+          SRC="src/qt/res/icons/bitcoin.png"   # the 1024x1024 master we replaced
+          for size in 16 32 64 128 256 512 1024; do
+            sips -z "$size" "$size" "$SRC" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+          done
+          # macOS expects the @2x variants too (each is just the next size up).
+          cp "$ICONSET/icon_32x32.png"     "$ICONSET/icon_16x16@2x.png"
+          cp "$ICONSET/icon_64x64.png"     "$ICONSET/icon_32x32@2x.png"
+          cp "$ICONSET/icon_256x256.png"   "$ICONSET/icon_128x128@2x.png"
+          cp "$ICONSET/icon_512x512.png"   "$ICONSET/icon_256x256@2x.png"
+          cp "$ICONSET/icon_1024x1024.png" "$ICONSET/icon_512x512@2x.png"
+          rm -f "$ICONSET/icon_64x64.png" "$ICONSET/icon_1024x1024.png"
+          iconutil -c icns "$ICONSET" -o build/Pricoin-Qt.app/Contents/Resources/bitcoin.icns
+
+      - name: Build .dmg
         run: |
           mkdir -p dist
-          STAGE="pricoin-${{ needs.resolve-tag.outputs.tag }}-${{ matrix.arch }}-macos"
-          mkdir -p "dist/$STAGE"
-          cp build/bin/pricoin-qt "dist/$STAGE/"
-          cp COPYING              "dist/$STAGE/"
-          cp README.md            "dist/$STAGE/"
-          tar -C dist -czf "dist/${STAGE}.tar.gz" "$STAGE"
-          rm -rf "dist/$STAGE"
+          DMG="dist/pricoin-${{ needs.resolve-tag.outputs.tag }}-arm64-macos.dmg"
+          # Stage the .app + a Drag-to-Applications symlink so the user can
+          # install with one drag. UDZO = compressed read-only DMG.
+          STAGE=$(mktemp -d)
+          cp -R build/Pricoin-Qt.app "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create \
+            -volname "Pricoin-Qt ${{ needs.resolve-tag.outputs.tag }}" \
+            -srcfolder "$STAGE" \
+            -ov -format UDZO \
+            "$DMG"
           ls -la dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pricoin-macos-${{ matrix.arch }}
-          path: dist/*.tar.gz
+          name: pricoin-macos-arm64
+          path: dist/*.dmg
 
   release:
     name: Draft GitHub release
@@ -232,13 +261,13 @@ jobs:
       - name: Flatten and list
         run: |
           mkdir -p release
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release/ \;
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.dmg" \) -exec cp {} release/ \;
           ls -la release/
 
       - name: Generate checksums
         run: |
           cd release
-          sha256sum *.tar.gz *.zip 2>/dev/null | sort > ../checksums.txt
+          sha256sum *.tar.gz *.zip *.dmg 2>/dev/null | sort > ../checksums.txt
           cd ..
           cat checksums.txt
           {
@@ -251,10 +280,10 @@ jobs:
             echo "## Verify"
             echo ""
             echo '```bash'
-            echo "# Linux / macOS"
-            echo "sha256sum  pricoin-${{ needs.resolve-tag.outputs.tag }}-x86_64-linux.tar.gz"
-            echo "shasum -a 256  pricoin-${{ needs.resolve-tag.outputs.tag }}-arm64-macos.tar.gz"
-            echo "shasum -a 256  pricoin-${{ needs.resolve-tag.outputs.tag }}-x86_64-macos.tar.gz"
+            echo "# Linux"
+            echo "sha256sum     pricoin-${{ needs.resolve-tag.outputs.tag }}-x86_64-linux.tar.gz"
+            echo "# macOS"
+            echo "shasum -a 256 pricoin-${{ needs.resolve-tag.outputs.tag }}-arm64-macos.dmg"
             echo "# Windows (PowerShell)"
             echo "Get-FileHash .\\pricoin-${{ needs.resolve-tag.outputs.tag }}-x86_64-windows.zip -Algorithm SHA256"
             echo '```'
@@ -263,8 +292,7 @@ jobs:
             echo ""
             echo "- **Linux (x86_64)** — pricoind, pricoin-cli, pricoin-qt"
             echo "- **Windows (x86_64)** — pricoin-qt.exe"
-            echo "- **macOS (arm64, Apple Silicon)** — pricoin-qt"
-            echo "- **macOS (x86_64, Intel)** — pricoin-qt"
+            echo "- **macOS (arm64)** — Pricoin-Qt.app inside a .dmg; runs on x86_64 Macs via Rosetta 2"
             echo ""
             echo "Toy/educational fork of Bitcoin Core. Privacy-mandatory: only v4 confidential transactions are valid. See README.md for build prerequisites and CLI usage."
           } > release_body.md
@@ -279,4 +307,5 @@ jobs:
           files: |
             release/*.tar.gz
             release/*.zip
+            release/*.dmg
             checksums.txt

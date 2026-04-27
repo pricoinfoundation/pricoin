@@ -521,6 +521,60 @@ void TxToUniv(const CTransaction& tx, const uint256& block_hash, UniValue& entry
         entry.pushKV("fee", ValueFromAmount(fee));
     }
 
+    // Pricoin: surface the v4 confidential-tx bundle so explorers, RPC
+    // consumers, and debugging tools see key images, one-time pubkeys,
+    // commitments, and the cleartext transparent fee. Amounts and recipients
+    // remain hidden by design — only the privacy-public commitments and the
+    // KIs (which are needed for double-spend prevention) are exposed.
+    if (tx.version == PRICOIN_CT_VERSION) {
+        const auto& b = tx.ct_bundle;
+        UniValue ct(UniValue::VOBJ);
+
+        UniValue input_commits(UniValue::VARR);
+        input_commits.reserve(b.input_commitments.size());
+        for (const auto& c : b.input_commitments) {
+            input_commits.push_back(HexStr(c.bytes));
+        }
+        ct.pushKV("input_commitments", std::move(input_commits));
+
+        UniValue rings(UniValue::VARR);
+        rings.reserve(b.ring_inputs.size());
+        for (const auto& ri : b.ring_inputs) {
+            UniValue r(UniValue::VOBJ);
+            r.pushKV("ring_size", (uint64_t)ri.ring.size());
+            r.pushKV("key_image", HexStr(ri.sig.key_image));
+            r.pushKV("commitment_image", HexStr(ri.sig.commitment_image));
+            r.pushKV("pseudo_commitment", HexStr(ri.pseudo_commitment.bytes));
+            UniValue ring_members(UniValue::VARR);
+            ring_members.reserve(ri.ring.size());
+            for (const auto& m : ri.ring) {
+                UniValue rm(UniValue::VOBJ);
+                rm.pushKV("txid", m.hash.GetHex());
+                rm.pushKV("vout", (uint64_t)m.n);
+                ring_members.push_back(std::move(rm));
+            }
+            r.pushKV("ring", std::move(ring_members));
+            rings.push_back(std::move(r));
+        }
+        ct.pushKV("ring_inputs", std::move(rings));
+
+        UniValue ct_outs(UniValue::VARR);
+        ct_outs.reserve(b.outputs.size());
+        for (size_t i = 0; i < b.outputs.size(); ++i) {
+            const auto& o = b.outputs[i];
+            UniValue oj(UniValue::VOBJ);
+            oj.pushKV("n", (uint64_t)i);
+            oj.pushKV("commitment", HexStr(o.commitment.bytes));
+            oj.pushKV("one_time_pubkey", HexStr(o.one_time_pubkey));
+            oj.pushKV("rangeproof_size", (uint64_t)o.rangeproof.size());
+            ct_outs.push_back(std::move(oj));
+        }
+        ct.pushKV("outputs", std::move(ct_outs));
+        ct.pushKV("transparent_fee", ValueFromAmount((CAmount)b.transparent_fee));
+
+        entry.pushKV("ct_bundle", std::move(ct));
+    }
+
     if (!block_hash.IsNull()) {
         entry.pushKV("blockhash", block_hash.GetHex());
     }
