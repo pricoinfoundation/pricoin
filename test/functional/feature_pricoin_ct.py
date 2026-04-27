@@ -57,6 +57,26 @@ class PricoinCTTest(BitcoinTestFramework):
         balances = bob.getbalances()["mine"]
         assert_equal(balances["confidential"], 25.0)
 
+        # ---- 1b. multi-input self-send transparent → CT ----
+        # Each coinbase output is 50 PRIC. Sending 120 PRIC forces walletsendct
+        # to pick ≥ 3 separate UTXOs — the prior wallet code only picked one.
+        # Also exercises self-send: alice sends to her own stealth address,
+        # which previously skipped ScanTxForCTReceives because
+        # CommitTransaction had already added the tx to mapWallet with empty
+        # mapValue, leaving pct_v<i> unset and confidential balance stuck at 0.
+        alice_stealth = alice.pricoin_getstealthaddress()["address"]
+        multi = alice.walletsendct(alice_stealth, 120.0, 0.0001)
+        assert multi["dest_was_stealth"] is True
+        self.generatetoaddress(node, 1, alice_addr)
+        multi_raw = node.decoderawtransaction(node.getrawtransaction(multi["txid"]))
+        assert_greater_than(len(multi_raw["vin"]), 2)
+        # Self-send recovery: the dest output (120) is now in alice's CT set.
+        recovered_120 = [o for o in alice.pricoin_listownct(0)["outputs"]
+                         if abs(float(o["value"]) - 120.0) < 1e-8]
+        assert len(recovered_120) == 1, "alice should have exactly one 120 PRIC CT output"
+        # And it shows up in the confidential balance.
+        assert_greater_than(alice.getbalances()["mine"]["confidential"], 119.9)
+
         # Give bob more CT outputs so ring=4 has enough decoys.
         for _ in range(3):
             alice.walletsendct(bob_stealth, 10.0, 0.0001)
@@ -71,6 +91,10 @@ class PricoinCTTest(BitcoinTestFramework):
         assert_equal(ring_tx["ring_size"], 4)
         ring_hex = node.getrawtransaction(ring_txid)
         self.generatetoaddress(node, 1, alice_addr)
+        # Capture the ring block now — sections below mine more blocks before
+        # the invalidate-and-rebroadcast test, so getblockcount() later won't
+        # point at the ring block.
+        ring_block = node.getbestblockhash()
 
         # Carol recovers, bob's listownct drops the spent input via KI filter.
         assert_equal(carol.pricoin_listownct(0)["total_recovered"], 5.0)
@@ -84,6 +108,27 @@ class PricoinCTTest(BitcoinTestFramework):
         gtx = node.gettxout(spent_signer["txid"], spent_signer["vout"])
         assert gtx is not None, "Phase 3a: spent v4 output should still be in chainstate"
 
+        # ---- 2b. multi-input walletsendct_from_ct ----
+        # carol now holds the 5.0 PRIC output. To exercise multi-input
+        # CT-spending-CT, give bob more small CT outputs and have him
+        # consolidate via from_ct. We send carol two more 3-PRIC outputs
+        # from bob, then have carol send 7 PRIC out — forcing from_ct to
+        # pick at least 3 of carol's CT outputs (5 + 3 + ... = 11 > 7).
+        for _ in range(2):
+            bob.walletsendct_ring(carol_stealth, 3.0, 0.0001, 4)
+            self.generatetoaddress(node, 1, alice_addr)
+        carol_outs = carol.pricoin_listownct(0)["outputs"]
+        assert len(carol_outs) >= 3, f"expected >= 3 CT outputs, got {len(carol_outs)}"
+        from_ct_dest = bob.pricoin_getstealthaddress()["address"]
+        from_ct = carol.walletsendct_from_ct(from_ct_dest, 7.0, 0.0001)
+        # Multi-input: spent_outpoints is now an array, must contain >= 2.
+        assert_greater_than(len(from_ct["spent_outpoints"]), 1)
+        self.generatetoaddress(node, 1, alice_addr)
+        # Recipient (bob) recovered the 7-PRIC output.
+        bob_seven = [o for o in bob.pricoin_listownct(0)["outputs"]
+                     if abs(float(o["value"]) - 7.0) < 1e-8]
+        assert len(bob_seven) == 1, "bob should have recovered one 7 PRIC CT output"
+
         # ---- 3. KI persistence + reject-after-restart ----
         self.restart_node(0, extra_args=["-txindex=1"])
         node = self.nodes[0]
@@ -91,7 +136,6 @@ class PricoinCTTest(BitcoinTestFramework):
         # The same hex re-broadcast should hit "txn-already-known" (chain has it).
         # To exercise the KI rejection path specifically, invalidate the block,
         # restart so the KI loads from disk, and try to send the tx fresh.
-        ring_block = node.getblockhash(node.getblockcount())
         node.invalidateblock(ring_block)
         self.restart_node(0, extra_args=["-txindex=1"])
         node = self.nodes[0]

@@ -1246,7 +1246,6 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
         }
 
         bool fExisted = mapWallet.contains(tx.GetHash());
-        if (fExisted && !fUpdate) return false;
         // Pricoin: scan v4 confidential txs for outputs paid to our stealth
         // identity. These don't trip IsMine because the one-time scriptPubKey
         // isn't in the keystore; we need an explicit predicate so the tx
@@ -1257,6 +1256,15 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
             ct_receives = ScanTxForCTReceives(*this, tx);
         } catch (...) {}
         const bool has_ct_receive = !ct_receives.empty();
+
+        // For self-send v4 txs (sender == recipient via own stealth address),
+        // CommitTransaction has already added the tx to mapWallet with empty
+        // mapValue before the mempool callback fires. The early-return on
+        // fExisted&&!fUpdate would skip the receive-side scan, leaving
+        // pct_v<i>/pct_p<i> unset and ConfidentialBalance reading 0. So
+        // continue past the early-return whenever we recovered CT outputs,
+        // and let the update_fn below merge the new entries into mapValue.
+        if (fExisted && !fUpdate && !has_ct_receive) return false;
 
         if (fExisted || IsMine(tx) || IsFromMe(tx) || has_ct_receive)
         {

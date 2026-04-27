@@ -389,5 +389,39 @@ std::vector<RPCResult> TxDoc(const TxDocOptions& opts)
                 )
             },
         }, {.print_elision=maybe_skip}},
+        // Pricoin: v4 confidential-transaction bundle. Present iff
+        // version == PRICOIN_CT_VERSION (4). Surfaces only privacy-public
+        // data — key images (for spent-set lookup), Pedersen commitments,
+        // one-time stealth pubkeys, ring-member outpoints, and the
+        // cleartext transparent fee. Amounts and recipients stay hidden.
+        {RPCResult::Type::OBJ, "ct_bundle", /*optional=*/true,
+         "Confidential transaction bundle (v4 only)", {
+            {RPCResult::Type::ARR, "input_commitments", "Pedersen commitments for transparent prevouts (direct-spend mode)", {
+                {RPCResult::Type::STR_HEX, "", "33-byte compressed Pedersen commitment"},
+            }},
+            {RPCResult::Type::ARR, "ring_inputs", "RingCT (CLSAG) inputs", {
+                {RPCResult::Type::OBJ, "", "", {
+                    {RPCResult::Type::NUM, "ring_size", "Number of candidate prevouts in the ring"},
+                    {RPCResult::Type::STR_HEX, "key_image", "33-byte CLSAG key image (consensus-tracked for double-spend prevention)"},
+                    {RPCResult::Type::STR_HEX, "commitment_image", "33-byte multi-layer commitment image (zeroed for single-layer signatures)"},
+                    {RPCResult::Type::STR_HEX, "pseudo_commitment", "33-byte pseudo input commitment"},
+                    {RPCResult::Type::ARR, "ring", "Candidate prevout outpoints (real spend hidden among them)", {
+                        {RPCResult::Type::OBJ, "", "", {
+                            {RPCResult::Type::STR_HEX, "txid", "Prev tx id"},
+                            {RPCResult::Type::NUM, "vout", "Prev vout index"},
+                        }},
+                    }},
+                }},
+            }},
+            {RPCResult::Type::ARR, "outputs", "Confidential outputs", {
+                {RPCResult::Type::OBJ, "", "", {
+                    {RPCResult::Type::NUM, "n", "Output index"},
+                    {RPCResult::Type::STR_HEX, "commitment", "33-byte Pedersen commitment to the (hidden) value"},
+                    {RPCResult::Type::STR_HEX, "one_time_pubkey", "33-byte one-time recipient pubkey (P)"},
+                    {RPCResult::Type::NUM, "rangeproof_size", "Size of the Borromean rangeproof in bytes"},
+                }},
+            }},
+            {RPCResult::Type::STR_AMOUNT, "transparent_fee", "Cleartext transaction fee in " + CURRENCY_UNIT},
+        }, {.print_elision=maybe_skip}},
     };
 }
