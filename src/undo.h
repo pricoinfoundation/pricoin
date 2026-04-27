@@ -18,6 +18,12 @@
  *  (coinbase or not, height). The serialization contains a dummy value of
  *  zero. This is compatible with older versions which expect to see
  *  the transaction version there.
+ *
+ *  Pricoin: a trailing flag byte (and conditional commitment + one-time
+ *  pubkey) preserves the v4 CT metadata so that a reorg-disconnected coin
+ *  is restored to chainstate as confidential, not transparent. The legacy
+ *  Bitcoin undo format ended after TxOutCompression; we extend by appending
+ *  one byte (0 = transparent, 1 = confidential).
  */
 struct TxInUndoFormatter
 {
@@ -30,6 +36,11 @@ struct TxInUndoFormatter
             ::Serialize(s, (unsigned char)0);
         }
         ::Serialize(s, Using<TxOutCompression>(txout.out));
+        ::Serialize(s, (unsigned char)(txout.fConfidential ? 1 : 0));
+        if (txout.fConfidential) {
+            ::Serialize(s, txout.commitment.bytes);
+            ::Serialize(s, txout.one_time_pubkey);
+        }
     }
 
     template<typename Stream>
@@ -46,6 +57,13 @@ struct TxInUndoFormatter
             ::Unserialize(s, VARINT(nVersionDummy));
         }
         ::Unserialize(s, Using<TxOutCompression>(txout.out));
+        unsigned char cflag = 0;
+        ::Unserialize(s, cflag);
+        txout.fConfidential = (cflag == 1);
+        if (txout.fConfidential) {
+            ::Unserialize(s, txout.commitment.bytes);
+            ::Unserialize(s, txout.one_time_pubkey);
+        }
     }
 };
 

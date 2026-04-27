@@ -32,6 +32,25 @@ using common::TransactionErrorString;
 using node::TransactionError;
 
 namespace wallet {
+
+// Pricoin: privacy is mandatory at consensus (CheckTransaction rejects
+// non-coinbase non-v4 with "bad-non-pct-non-coinbase"). The classic
+// transparent send/PSBT/bumpfee RPCs would build v2 txs that can never
+// be relayed or confirmed, so they're stubbed to fail loudly with a
+// pointer to the v4-CT alternatives.
+static const std::string PRICOIN_DEPRECATED_TRANSPARENT_BANNER{
+    "DEPRECATED in Pricoin: this RPC builds transparent (v1/v2) transactions which are\n"
+    "rejected at consensus. Use walletsendct (transparent → CT), walletsendct_ring\n"
+    "(CT → CT with sender privacy), or walletsendct_from_ct (CT → CT direct) instead.\n\n"};
+
+[[noreturn]] static void ThrowDeprecatedTransparentSend()
+{
+    throw JSONRPCError(RPC_METHOD_DEPRECATED,
+        "This RPC is disabled in Pricoin. Privacy is mandatory: only v4 confidential "
+        "transactions are valid. Use walletsendct, walletsendct_ring, or "
+        "walletsendct_from_ct instead.");
+}
+
 std::vector<CRecipient> CreateRecipients(const std::vector<std::pair<CTxDestination, CAmount>>& outputs, const std::set<int>& subtract_fee_outputs)
 {
     std::vector<CRecipient> recipients;
@@ -239,6 +258,7 @@ RPCMethod sendtoaddress()
 {
     return RPCMethod{
         "sendtoaddress",
+        PRICOIN_DEPRECATED_TRANSPARENT_BANNER +
         "Send an amount to a given address." +
         HELP_REQUIRING_PASSPHRASE,
                 {
@@ -273,7 +293,7 @@ RPCMethod sendtoaddress()
                     },
                 },
                 RPCExamples{
-                    "\nSend 0.1 BTC\n"
+                    "(disabled — see walletsendct)\n"
                     + HelpExampleCli("sendtoaddress", "\"" + EXAMPLE_ADDRESS[0] + "\" 0.1") +
                     "\nSend 0.1 BTC with a confirmation target of 6 blocks in economical fee estimate mode using positional arguments\n"
                     + HelpExampleCli("sendtoaddress", "\"" + EXAMPLE_ADDRESS[0] + "\" 0.1 \"donation\" \"sean's outpost\" false true 6 economical") +
@@ -287,6 +307,7 @@ RPCMethod sendtoaddress()
                 },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
 {
+    ThrowDeprecatedTransparentSend();
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
@@ -336,6 +357,7 @@ RPCMethod sendtoaddress()
 RPCMethod sendmany()
 {
     return RPCMethod{"sendmany",
+        PRICOIN_DEPRECATED_TRANSPARENT_BANNER +
         "Send multiple times. Amounts are double-precision floating point numbers." +
         HELP_REQUIRING_PASSPHRASE,
                 {
@@ -391,6 +413,7 @@ RPCMethod sendmany()
                 },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
 {
+    ThrowDeprecatedTransparentSend();
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
@@ -963,6 +986,7 @@ static RPCMethod bumpfee_helper(std::string method_name)
     const std::string incremental_fee{CFeeRate(DEFAULT_INCREMENTAL_RELAY_FEE).ToString(FeeRateFormat::SAT_VB)};
 
     return RPCMethod{method_name,
+        PRICOIN_DEPRECATED_TRANSPARENT_BANNER +
         "Bumps the fee of a transaction T, replacing it with a new transaction B.\n"
         + std::string(want_psbt ? "Returns a PSBT instead of creating and signing a new transaction.\n" : "") +
         "A transaction with the given txid must be in the wallet.\n"
@@ -1029,6 +1053,7 @@ static RPCMethod bumpfee_helper(std::string method_name)
         },
         [want_psbt](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
 {
+    ThrowDeprecatedTransparentSend();
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
@@ -1166,6 +1191,7 @@ RPCMethod send()
 {
     return RPCMethod{
         "send",
+        PRICOIN_DEPRECATED_TRANSPARENT_BANNER +
         "EXPERIMENTAL warning: this call may be changed in future releases.\n"
         "\nSend a transaction.\n",
         {
@@ -1249,6 +1275,7 @@ RPCMethod send()
         },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
         {
+            ThrowDeprecatedTransparentSend();
             std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
             if (!pwallet) return UniValue::VNULL;
 
@@ -1289,6 +1316,7 @@ RPCMethod send()
 RPCMethod sendall()
 {
     return RPCMethod{"sendall",
+        PRICOIN_DEPRECATED_TRANSPARENT_BANNER +
         "EXPERIMENTAL warning: this call may be changed in future releases.\n"
         "\nSpend the value of all (or specific) confirmed UTXOs and unconfirmed change in the wallet to one or more recipients.\n"
         "Unconfirmed inbound UTXOs and locked UTXOs will not be spent. Sendall will respect the avoid_reuse wallet flag.\n"
@@ -1363,6 +1391,7 @@ RPCMethod sendall()
         },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
         {
+            ThrowDeprecatedTransparentSend();
             std::shared_ptr<CWallet> const pwallet{GetWalletForJSONRPCRequest(request)};
             if (!pwallet) return UniValue::VNULL;
             // Make sure the results are valid at least up to the most recent block

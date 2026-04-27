@@ -12,6 +12,7 @@
 #include <pricoin/ct.h>
 #include <pricoin/cttx.h>
 #include <pricoin/stealth.h>
+#include <pricoin/validation.h>
 #include <primitives/transaction.h>
 #include <interfaces/chain.h>
 #include <node/types.h>
@@ -31,6 +32,7 @@
 #include <core_io.h>
 #include <wallet/coincontrol.h>
 #include <wallet/coinselection.h>
+#include <wallet/pricoin_ct_send.h>
 #include <wallet/pricoin_stealth.h>
 #include <wallet/rpc/util.h>
 #include <wallet/scriptpubkeyman.h>
@@ -70,6 +72,35 @@ std::optional<PickedInput> PickP2WPKHFunding(CWallet& wallet, CAmount target)
     return std::nullopt;
 }
 
+} // namespace (close anonymous)
+
+// Public helper used by both `walletsendct` RPC and the Qt GUI's
+// interfaces::Wallet::sendConfidential. Returns a util::Result so callers
+// can translate to either JSONRPCError or a UI message.
+namespace detail { // forward-decl in this TU; defined below the RPC.
+util::Result<uint256> SendConfidentialTxImpl(
+    CWallet& wallet,
+    const std::string& dest_addr_str,
+    CAmount dest_amount,
+    CAmount fee,
+    CAmount target);
+} // namespace detail
+
+util::Result<uint256> SendConfidentialTx(
+    CWallet& wallet,
+    const std::string& dest_addr_str,
+    CAmount dest_amount,
+    CAmount fee)
+{
+    if (dest_amount <= 0 || fee < 0) {
+        return util::Error{Untranslated("negative or zero amount")};
+    }
+    const CAmount target = dest_amount + fee;
+    return detail::SendConfidentialTxImpl(wallet, dest_addr_str, dest_amount, fee, target);
+}
+
+namespace { // re-enter anonymous
+
 RPCMethod walletsendct()
 {
     return RPCMethod{
@@ -77,10 +108,10 @@ RPCMethod walletsendct()
         "Build, sign, and submit a Pricoin Confidential Transaction using wallet UTXOs.\n"
         "Picks the first P2WPKH wallet UTXO whose value >= dest_amount + fee, signs with the\n"
         "wallet's keystore, generates a change address from the wallet, and submits the\n"
-        "resulting v4 transaction. Receive-side detection is not yet implemented (Phase 2d-6b),\n"
-        "so the recipient cannot auto-recover the value from the rangeproof.\n",
+        "resulting v4 transaction. dest_address may be either a stealth address (preferred —\n"
+        "recipient can recover) or a regular bech32 (recipient cannot scan).\n",
         {
-            {"dest_address", RPCArg::Type::STR, RPCArg::Optional::NO, "Destination Pricoin bech32 address"},
+            {"dest_address", RPCArg::Type::STR, RPCArg::Optional::NO, "Destination Pricoin stealth or bech32 address"},
             {"dest_amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Amount to send in PRIC"},
             {"fee", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Transparent fee in PRIC"},
         },
@@ -88,17 +119,11 @@ RPCMethod walletsendct()
             RPCResult::Type::OBJ, "", "",
             {
                 {RPCResult::Type::STR_HEX, "txid", "Submitted transaction id"},
-                {RPCResult::Type::STR_HEX, "hex", "Hex-encoded signed v4 transaction"},
-                {RPCResult::Type::NUM, "size", "Total serialized size in bytes"},
-                {RPCResult::Type::NUM, "bundle_size", "CT bundle size in bytes"},
-                {RPCResult::Type::STR, "input_outpoint", "Spent input as txid:vout"},
-                {RPCResult::Type::STR_AMOUNT, "input_value", "Value of the consumed input in PRIC"},
-                {RPCResult::Type::STR, "change_address", "Change address used"},
-                {RPCResult::Type::STR_AMOUNT, "change_amount", "Change value (carried in the bundle, not visible)"},
+                {RPCResult::Type::BOOL, "dest_was_stealth", "Whether dest_address was decoded as a stealth address"},
             }
         },
         RPCExamples{
-            HelpExampleCli("walletsendct", "\"pricrt1q...\" 25.0 0.001")
+            HelpExampleCli("walletsendct", "\"H6...\" 25.0 0.001")
         },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue {
             std::shared_ptr<CWallet> wallet_sp = GetWalletForJSONRPCRequest(request);
@@ -108,169 +133,160 @@ RPCMethod walletsendct()
             const std::string dest_addr_str = request.params[0].get_str();
             const CAmount dest_amount = AmountFromValue(request.params[1]);
             const CAmount fee = AmountFromValue(request.params[2]);
-            if (dest_amount <= 0 || fee < 0) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "Negative or zero amount");
-            }
-            const CAmount target = dest_amount + fee;
 
-            // Detect whether the destination is a stealth address. If so,
-            // derive a one-time scriptPubKey via ECDH against the recipient's
-            // view key. Otherwise treat it as a regular bech32 address.
-            const auto stealth_dest = ::pricoin::stealth::Decode(dest_addr_str);
-            CScript dest_spk;
-            ::pricoin::stealth::PointBytes dest_R{};
-            ::pricoin::ct::BlindingFactor dest_nonce{};
-            ::pricoin::ct::SerializedPubKey33 dest_otp{};
-            if (stealth_dest) {
-                CKey r;
-                r.MakeNewKey(/*fCompressed=*/true);
-                CPubKey R = r.GetPubKey();
-                std::memcpy(dest_R.data(), R.data(), 33);
-                auto S = ::pricoin::stealth::ECDHPoint(r, stealth_dest->view);
-                if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth ECDH failed");
-                auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, /*output_index=*/0);
-                auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, stealth_dest->spend);
-                if (!P) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth onetime pubkey failed");
-                dest_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
-                std::memcpy(dest_otp.data(), P->data(), 33);
-                auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, 0);
-                std::memcpy(dest_nonce.data(), rp_nonce.data(), 32);
-            } else {
-                CTxDestination dest_dest = DecodeDestination(dest_addr_str);
-                if (!IsValidDestination(dest_dest)) {
-                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid dest_address (neither stealth nor bech32)");
-                }
-                dest_spk = GetScriptForDestination(dest_dest);
-                GetRandBytes(dest_nonce);
-                // dest_otp stays zero — non-stealth output won't be usable as a ring member.
-            }
-
-            // Always send change to our own stealth address so the wallet can
-            // recover it via Phase 5e block-scan once that lands.
-            const auto& self_id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
-            CScript change_spk;
-            ::pricoin::stealth::PointBytes change_R{};
-            ::pricoin::ct::BlindingFactor change_nonce{};
-            ::pricoin::ct::SerializedPubKey33 change_otp{};
-            {
-                CKey r;
-                r.MakeNewKey(/*fCompressed=*/true);
-                CPubKey R = r.GetPubKey();
-                std::memcpy(change_R.data(), R.data(), 33);
-                auto S = ::pricoin::stealth::ECDHPoint(r, self_id.public_address.view);
-                if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth ECDH failed (change)");
-                auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, /*output_index=*/1);
-                auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, self_id.public_address.spend);
-                if (!P) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth onetime pubkey failed (change)");
-                change_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
-                std::memcpy(change_otp.data(), P->data(), 33);
-                auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, 1);
-                std::memcpy(change_nonce.data(), rp_nonce.data(), 32);
-            }
-
-            // Lock the wallet, pick a funding input.
-            std::optional<PickedInput> picked;
-            {
-                LOCK(wallet.cs_wallet);
-                picked = PickP2WPKHFunding(wallet, target);
-                if (!picked) {
-                    throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS,
-                        "No spendable P2WPKH UTXO with value >= dest_amount + fee");
-                }
-            }
-            const CAmount change_value = picked->value - target;
-
-            // Build the bundle.
-            pricoin::ct::BlindingFactor zero_blind{};
-            auto in_commit = pricoin::ct::Commitment::Create(
-                static_cast<uint64_t>(picked->value), zero_blind);
-            if (!in_commit) throw JSONRPCError(RPC_INTERNAL_ERROR, "input commit failed");
-
-            pricoin::ct::BlindingFactor dest_blind;
-            GetRandBytes(dest_blind);
-            auto change_blind = pricoin::ct::BalancingBlind(
-                std::array<pricoin::ct::BlindingFactor, 1>{zero_blind},
-                std::array<pricoin::ct::BlindingFactor, 1>{dest_blind});
-            if (!change_blind) throw JSONRPCError(RPC_INTERNAL_ERROR, "blind sum failed");
-
-            auto dest_commit = pricoin::ct::Commitment::Create(
-                static_cast<uint64_t>(dest_amount), dest_blind);
-            auto change_commit = pricoin::ct::Commitment::Create(
-                static_cast<uint64_t>(change_value), *change_blind);
-            if (!dest_commit || !change_commit) {
-                throw JSONRPCError(RPC_INTERNAL_ERROR, "output commit failed");
-            }
-
-            std::vector<unsigned char> dest_spk_bytes(dest_spk.begin(), dest_spk.end());
-            std::vector<unsigned char> change_spk_bytes(change_spk.begin(), change_spk.end());
-
-            auto dest_proof = pricoin::ct::CreateRangeProof(
-                static_cast<uint64_t>(dest_amount), dest_blind, *dest_commit,
-                std::span<const unsigned char>{dest_spk_bytes}, dest_nonce);
-            auto change_proof = pricoin::ct::CreateRangeProof(
-                static_cast<uint64_t>(change_value), *change_blind, *change_commit,
-                std::span<const unsigned char>{change_spk_bytes}, change_nonce);
-            if (!dest_proof || !change_proof) {
-                throw JSONRPCError(RPC_INTERNAL_ERROR, "rangeproof failed");
-            }
-
-            pricoin::ct::CTBundle bundle;
-            bundle.input_commitments = {*in_commit};
-            bundle.outputs = {
-                pricoin::ct::CTOutput{*dest_commit, *dest_proof, dest_spk_bytes, dest_R, dest_otp},
-                pricoin::ct::CTOutput{*change_commit, *change_proof, change_spk_bytes, change_R, change_otp},
-            };
-            bundle.transparent_fee = static_cast<uint64_t>(fee);
-
-            CMutableTransaction mtx;
-            mtx.version = PRICOIN_CT_VERSION;
-            mtx.nLockTime = 0;
-            mtx.vin.emplace_back(picked->outpoint, CScript{}, 0xfffffffe);
-            mtx.vout.emplace_back(0, dest_spk);
-            mtx.vout.emplace_back(0, change_spk);
-            mtx.ct_bundle = std::move(bundle);
-
-            // Build the prev-coin map the wallet needs to sign the input
-            // (BIP143 sighash needs the prev value/script).
-            std::map<COutPoint, Coin> coins;
-            Coin prev_coin;
-            prev_coin.out = CTxOut{picked->value, picked->scriptPubKey};
-            prev_coin.fCoinBase = false; // wallet's signer doesn't care for sigs
-            prev_coin.nHeight = 0;
-            coins.emplace(picked->outpoint, std::move(prev_coin));
-
-            std::map<int, bilingual_str> input_errors;
-            if (!wallet.SignTransaction(mtx, coins, SIGHASH_ALL, input_errors)) {
-                std::string msg;
-                for (const auto& [i, e] : input_errors) msg += strprintf("vin[%d]: %s; ", i, e.original);
-                throw JSONRPCError(RPC_WALLET_ERROR, "Wallet failed to sign tx: " + msg);
-            }
-
-            CTransactionRef tx_ref = MakeTransactionRef(std::move(mtx));
-            DataStream ds;
-            ds << TX_WITH_WITNESS(*tx_ref);
-
-            // Submit through the wallet's broadcast path so the wallet
-            // tracks it as outgoing.
-            std::string err;
-            wallet.CommitTransaction(tx_ref, /*mapValue=*/{}, /*orderForm=*/{});
+            auto res = SendConfidentialTx(wallet, dest_addr_str, dest_amount, fee);
+            if (!res) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(res).original);
 
             UniValue out{UniValue::VOBJ};
-            out.pushKV("txid", tx_ref->GetHash().ToString());
-            out.pushKV("hex", HexStr(ds));
-            out.pushKV("size", (int)::GetSerializeSize(TX_WITH_WITNESS(*tx_ref)));
-            out.pushKV("bundle_size", (int)tx_ref->ct_bundle.SerializedSize());
-            out.pushKV("input_outpoint", picked->outpoint.hash.ToString() + ":" + std::to_string(picked->outpoint.n));
-            out.pushKV("input_value", ValueFromAmount(picked->value));
-            out.pushKV("change_to", "(wallet's own stealth address)");
-            out.pushKV("change_amount", ValueFromAmount(change_value));
-            out.pushKV("dest_was_stealth", stealth_dest.has_value());
+            out.pushKV("txid", res->ToString());
+            out.pushKV("dest_was_stealth", ::pricoin::stealth::Decode(dest_addr_str).has_value());
             return out;
         }
     };
 }
 
-} // namespace
+} // namespace anonymous
+
+namespace detail {
+
+// Real implementation; preserves the existing semantics. Defined out of
+// the anonymous namespace so SendConfidentialTx() above can call it.
+util::Result<uint256> SendConfidentialTxImpl(
+    CWallet& wallet,
+    const std::string& dest_addr_str,
+    CAmount dest_amount,
+    CAmount fee,
+    CAmount target)
+{
+
+    const auto stealth_dest = ::pricoin::stealth::Decode(dest_addr_str);
+    CScript dest_spk;
+    ::pricoin::stealth::PointBytes dest_R{};
+    ::pricoin::ct::BlindingFactor dest_nonce{};
+    ::pricoin::ct::SerializedPubKey33 dest_otp{};
+    if (stealth_dest) {
+        CKey r;
+        r.MakeNewKey(/*fCompressed=*/true);
+        CPubKey R = r.GetPubKey();
+        std::memcpy(dest_R.data(), R.data(), 33);
+        auto S = ::pricoin::stealth::ECDHPoint(r, stealth_dest->view);
+        if (!S) return util::Error{Untranslated("stealth ECDH failed")};
+        auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, /*output_index=*/0);
+        auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, stealth_dest->spend);
+        if (!P) return util::Error{Untranslated("stealth onetime pubkey failed")};
+        dest_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
+        std::memcpy(dest_otp.data(), P->data(), 33);
+        auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, 0);
+        std::memcpy(dest_nonce.data(), rp_nonce.data(), 32);
+    } else {
+        CTxDestination dest_dest = DecodeDestination(dest_addr_str);
+        if (!IsValidDestination(dest_dest)) {
+            return util::Error{Untranslated("invalid dest_address (neither stealth nor bech32)")};
+        }
+        dest_spk = GetScriptForDestination(dest_dest);
+        GetRandBytes(dest_nonce);
+    }
+
+    const auto& self_id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+    CScript change_spk;
+    ::pricoin::stealth::PointBytes change_R{};
+    ::pricoin::ct::BlindingFactor change_nonce{};
+    ::pricoin::ct::SerializedPubKey33 change_otp{};
+    {
+        CKey r;
+        r.MakeNewKey(/*fCompressed=*/true);
+        CPubKey R = r.GetPubKey();
+        std::memcpy(change_R.data(), R.data(), 33);
+        auto S = ::pricoin::stealth::ECDHPoint(r, self_id.public_address.view);
+        if (!S) return util::Error{Untranslated("stealth ECDH failed (change)")};
+        auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, /*output_index=*/1);
+        auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, self_id.public_address.spend);
+        if (!P) return util::Error{Untranslated("stealth onetime pubkey failed (change)")};
+        change_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
+        std::memcpy(change_otp.data(), P->data(), 33);
+        auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, 1);
+        std::memcpy(change_nonce.data(), rp_nonce.data(), 32);
+    }
+
+    std::optional<PickedInput> picked;
+    {
+        LOCK(wallet.cs_wallet);
+        picked = PickP2WPKHFunding(wallet, target);
+        if (!picked) {
+            return util::Error{Untranslated("no spendable P2WPKH UTXO with value >= dest_amount + fee")};
+        }
+    }
+    const CAmount change_value = picked->value - target;
+
+    pricoin::ct::BlindingFactor zero_blind{};
+    auto in_commit = pricoin::ct::Commitment::Create(
+        static_cast<uint64_t>(picked->value), zero_blind);
+    if (!in_commit) return util::Error{Untranslated("input commit failed")};
+
+    pricoin::ct::BlindingFactor dest_blind;
+    GetRandBytes(dest_blind);
+    auto change_blind = pricoin::ct::BalancingBlind(
+        std::array<pricoin::ct::BlindingFactor, 1>{zero_blind},
+        std::array<pricoin::ct::BlindingFactor, 1>{dest_blind});
+    if (!change_blind) return util::Error{Untranslated("blind sum failed")};
+
+    auto dest_commit = pricoin::ct::Commitment::Create(
+        static_cast<uint64_t>(dest_amount), dest_blind);
+    auto change_commit = pricoin::ct::Commitment::Create(
+        static_cast<uint64_t>(change_value), *change_blind);
+    if (!dest_commit || !change_commit) {
+        return util::Error{Untranslated("output commit failed")};
+    }
+
+    std::vector<unsigned char> dest_spk_bytes(dest_spk.begin(), dest_spk.end());
+    std::vector<unsigned char> change_spk_bytes(change_spk.begin(), change_spk.end());
+
+    auto dest_proof = pricoin::ct::CreateRangeProof(
+        static_cast<uint64_t>(dest_amount), dest_blind, *dest_commit,
+        std::span<const unsigned char>{dest_spk_bytes}, dest_nonce);
+    auto change_proof = pricoin::ct::CreateRangeProof(
+        static_cast<uint64_t>(change_value), *change_blind, *change_commit,
+        std::span<const unsigned char>{change_spk_bytes}, change_nonce);
+    if (!dest_proof || !change_proof) {
+        return util::Error{Untranslated("rangeproof failed")};
+    }
+
+    pricoin::ct::CTBundle bundle;
+    bundle.input_commitments = {*in_commit};
+    bundle.outputs = {
+        pricoin::ct::CTOutput{*dest_commit, *dest_proof, dest_spk_bytes, dest_R, dest_otp},
+        pricoin::ct::CTOutput{*change_commit, *change_proof, change_spk_bytes, change_R, change_otp},
+    };
+    bundle.transparent_fee = static_cast<uint64_t>(fee);
+
+    CMutableTransaction mtx;
+    mtx.version = PRICOIN_CT_VERSION;
+    mtx.nLockTime = 0;
+    mtx.vin.emplace_back(picked->outpoint, CScript{}, 0xfffffffe);
+    mtx.vout.emplace_back(0, dest_spk);
+    mtx.vout.emplace_back(0, change_spk);
+    mtx.ct_bundle = std::move(bundle);
+
+    std::map<COutPoint, Coin> coins;
+    Coin prev_coin;
+    prev_coin.out = CTxOut{picked->value, picked->scriptPubKey};
+    prev_coin.fCoinBase = false;
+    prev_coin.nHeight = 0;
+    coins.emplace(picked->outpoint, std::move(prev_coin));
+
+    std::map<int, bilingual_str> input_errors;
+    if (!wallet.SignTransaction(mtx, coins, SIGHASH_ALL, input_errors)) {
+        std::string msg;
+        for (const auto& [i, e] : input_errors) msg += strprintf("vin[%d]: %s; ", i, e.original);
+        return util::Error{Untranslated("wallet failed to sign tx: " + msg)};
+    }
+
+    CTransactionRef tx_ref = MakeTransactionRef(std::move(mtx));
+    wallet.CommitTransaction(tx_ref, /*mapValue=*/{}, /*orderForm=*/{});
+    return tx_ref->GetHash().ToUint256();
+}
+
+} // namespace detail
 
 RPCMethod walletsendct_export() { return walletsendct(); }
 
@@ -287,6 +303,7 @@ struct RecoveredOutput {
     pricoin::ct::Commitment commitment;
     CScript scriptPubKey;
     CKey one_time_priv; // derived spend key for this output
+    pricoin::ringsig::Point key_image{}; // I = x · H_p(P) — for spent-by-KI lookup
 };
 
 std::optional<RecoveredOutput> TryRecoverCTOutput(
@@ -330,6 +347,15 @@ std::optional<RecoveredOutput> TryRecoverCTOutput(
     auto one_time_priv = ::pricoin::stealth::DeriveOneTimePriv(shared, id.spend);
     if (!one_time_priv) return std::nullopt;
 
+    // Compute the key image for this output — needed to detect whether
+    // it has been spent on chain (the KI would appear in the global set).
+    pricoin::ringsig::Point P_bytes{};
+    std::memcpy(P_bytes.data(), P->data(), 33);
+    pricoin::ringsig::Scalar x_bytes{};
+    std::memcpy(x_bytes.data(), one_time_priv->begin(), 32);
+    auto ki = pricoin::ringsig::ComputeKeyImage(P_bytes, x_bytes);
+    if (!ki) return std::nullopt;
+
     return RecoveredOutput{
         .output_index = output_index,
         .value = static_cast<CAmount>(rewound->value),
@@ -337,6 +363,7 @@ std::optional<RecoveredOutput> TryRecoverCTOutput(
         .commitment = out.commitment,
         .scriptPubKey = tx.vout[output_index].scriptPubKey,
         .one_time_priv = std::move(*one_time_priv),
+        .key_image = *ki,
     };
 }
 
@@ -375,8 +402,13 @@ RPCMethod pricoin_listownct()
             const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
             interfaces::Chain& chain = wallet.chain();
 
-            UniValue outputs{UniValue::VARR};
-            CAmount total_recovered = 0;
+            struct Pending {
+                COutPoint outpoint;
+                CAmount value;
+                int height;
+                pricoin::ringsig::Point key_image;
+            };
+            std::vector<Pending> pending;
             int scanned_blocks = 0;
             int scanned_mempool = 0;
 
@@ -394,15 +426,28 @@ RPCMethod pricoin_listownct()
                     for (uint32_t i = 0; i < tx_ref->vout.size(); ++i) {
                         auto rec = TryRecoverCTOutput(id, *tx_ref, i);
                         if (!rec) continue;
-                        total_recovered += rec->value;
-                        UniValue entry{UniValue::VOBJ};
-                        entry.pushKV("txid", tx_ref->GetHash().ToString());
-                        entry.pushKV("vout", (int)rec->output_index);
-                        entry.pushKV("value", ValueFromAmount(rec->value));
-                        entry.pushKV("height", h);
-                        outputs.push_back(entry);
+                        pending.push_back(Pending{
+                            COutPoint{tx_ref->GetHash(), rec->output_index},
+                            rec->value, h, rec->key_image});
                     }
                 }
+            }
+
+            // Phase 3a: chainstate-erasure no longer marks v4 outputs spent
+            // (they're kept indefinitely as ring-decoy candidates). Filter
+            // by the global key-image set instead — an output is spent iff
+            // its KI has been committed.
+            UniValue outputs{UniValue::VARR};
+            CAmount total_recovered = 0;
+            for (const auto& p : pending) {
+                if (pricoin::IsKeyImageCommitted(p.key_image)) continue;
+                total_recovered += p.value;
+                UniValue entry{UniValue::VOBJ};
+                entry.pushKV("txid", p.outpoint.hash.ToString());
+                entry.pushKV("vout", (int)p.outpoint.n);
+                entry.pushKV("value", ValueFromAmount(p.value));
+                entry.pushKV("height", p.height);
+                outputs.push_back(entry);
             }
             // Mempool sweep is omitted in this MVP — interfaces::Chain doesn't
             // expose entry iteration. A confirmed-only scan is sufficient to
@@ -510,6 +555,8 @@ RPCMethod walletsendct_ring()
                     for (uint32_t i = 0; i < tx_ref->vout.size(); ++i) {
                         auto rec = TryRecoverCTOutput(id, *tx_ref, i);
                         if (!rec || rec->value < target) continue;
+                        // Phase 3a: skip outputs whose KI is already on chain.
+                        if (pricoin::IsKeyImageCommitted(rec->key_image)) continue;
                         picked = std::move(rec);
                         picked_outpoint = COutPoint(tx_ref->GetHash(), picked->output_index);
                         break;
@@ -681,26 +728,27 @@ RPCMethod walletsendct_ring()
             hw << TX_NO_WITNESS(CTransaction{sig_input_tx});
             const uint256 msg = hw.GetSHA256();
 
-            // Phase 4b-mini: single-layer CLSAG over spend pubkeys. The
-            // commitment-row of multi-layer CLSAG is deferred because correct
-            // commitment-to-pubkey conversion needs faithful y-parity reconstruction
-            // (Pedersen uses is-square indicator, BIP66 pubkeys use is-even — these
-            // are independent properties on secp256k1). Without the commitment row,
-            // the sig doesn't bind the chosen ring member to its commitment, so a
-            // malicious sender could construct a pseudo commitment with the wrong
-            // value and the sig would still verify. Toy scope acknowledges this gap.
-            std::vector<pricoin::ringsig::Point> p_ring(ring_size);
+            // Phase 4c: multi-layer CLSAG over (P_i, W_i) pairs where
+            // W_i = C_i − C_pseudo (computed at field level via the
+            // pedersen_commitments_subtract_to_pubkey helper added to
+            // secp256k1-zkp; this preserves the proper y-parity, so z*G
+            // matches W_pi byte-for-byte without any negation hack).
+            std::vector<pricoin::ringsig::MultiLayerMember> ml_ring(ring_size);
             for (size_t k = 0; k < (size_t)ring_size; ++k) {
-                p_ring[k] = ring[k].one_time_pubkey;
+                ml_ring[k].P = ring[k].one_time_pubkey;
+                auto W = pricoin::ct::SubtractCommitments(ring[k].commitment, *pseudo);
+                if (!W) throw JSONRPCError(RPC_INTERNAL_ERROR,
+                    strprintf("W_%u computation failed", (unsigned)k));
+                ml_ring[k].W = *W;
             }
 
             pricoin::ringsig::Scalar x_pi;
             std::memcpy(x_pi.data(), picked->one_time_priv.data(), 32);
 
-            auto sig = pricoin::ringsig::Sign(
-                std::span<const pricoin::ringsig::Point>{p_ring}, pi, x_pi, msg);
+            auto sig = pricoin::ringsig::SignMultiLayer(
+                std::span<const pricoin::ringsig::MultiLayerMember>{ml_ring}, pi, x_pi, z_pi, msg);
             if (!sig) {
-                throw JSONRPCError(RPC_INTERNAL_ERROR, "ring signing failed");
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "ring signing (multi-layer) failed");
             }
 
             // 10. Insert sig into the bundle and broadcast.
@@ -780,6 +828,7 @@ RPCMethod walletsendct_from_ct()
                         auto rec = TryRecoverCTOutput(id, *tx_ref, i);
                         if (!rec) continue;
                         if (rec->value < target) continue;
+                        if (pricoin::IsKeyImageCommitted(rec->key_image)) continue;
                         picked = std::move(rec);
                         picked_outpoint = COutPoint(tx_ref->GetHash(), picked->output_index);
                         break;
@@ -969,5 +1018,49 @@ RPCMethod pricoin_getstealthaddress_export() { return pricoin_getstealthaddress(
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }
+
+std::vector<PricoinCTRecovery> ScanTxForCTReceives(
+    CWallet& wallet,
+    const CTransaction& tx)
+{
+    std::vector<PricoinCTRecovery> out;
+    if (tx.version != PRICOIN_CT_VERSION) return out;
+    const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+    for (uint32_t i = 0; i < tx.vout.size(); ++i) {
+        auto rec = TryRecoverCTOutput(id, tx, i);
+        if (!rec) continue;
+        PricoinCTRecovery r;
+        r.vout_index = rec->output_index;
+        r.value = rec->value;
+        std::memcpy(r.one_time_priv.data(), rec->one_time_priv.begin(), 32);
+        out.push_back(r);
+    }
+    return out;
+}
+
+CAmount ConfidentialBalance(CWallet& wallet)
+{
+    const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+    interfaces::Chain& chain = wallet.chain();
+    const int tip = chain.getHeight().value_or(-1);
+
+    CAmount total = 0;
+    for (int h = 0; h <= tip; ++h) {
+        const uint256 block_hash = chain.getBlockHash(h);
+        CBlock block;
+        if (!chain.findBlock(block_hash, interfaces::FoundBlock().data(block))) continue;
+        for (const auto& tx_ref : block.vtx) {
+            if (tx_ref->version != PRICOIN_CT_VERSION) continue;
+            for (uint32_t i = 0; i < tx_ref->vout.size(); ++i) {
+                auto rec = TryRecoverCTOutput(id, *tx_ref, i);
+                if (!rec) continue;
+                // Phase 3a: spentness is the KI set, not chainstate erasure.
+                if (pricoin::IsKeyImageCommitted(rec->key_image)) continue;
+                total += rec->value;
+            }
+        }
+    }
+    return total;
+}
 
 } // namespace wallet

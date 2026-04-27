@@ -43,6 +43,8 @@
 #include <script/signingprovider.h>
 #include <script/solver.h>
 #include <serialize.h>
+#include <util/strencodings.h>
+#include <wallet/pricoin_ct_send.h>
 #include <span.h>
 #include <streams.h>
 #include <support/allocators/secure.h>
@@ -1245,7 +1247,18 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
 
         bool fExisted = mapWallet.contains(tx.GetHash());
         if (fExisted && !fUpdate) return false;
-        if (fExisted || IsMine(tx) || IsFromMe(tx))
+        // Pricoin: scan v4 confidential txs for outputs paid to our stealth
+        // identity. These don't trip IsMine because the one-time scriptPubKey
+        // isn't in the keystore; we need an explicit predicate so the tx
+        // enters mapWallet and shows up in history. Recovered (value, priv)
+        // pairs get stashed in mapValue below for later retrieval by the GUI.
+        std::vector<PricoinCTRecovery> ct_receives;
+        try {
+            ct_receives = ScanTxForCTReceives(*this, tx);
+        } catch (...) {}
+        const bool has_ct_receive = !ct_receives.empty();
+
+        if (fExisted || IsMine(tx) || IsFromMe(tx) || has_ct_receive)
         {
             /* Check if any keys in the wallet keypool that were supposed to be unused
              * have appeared in a new transaction. If so, remove those keys from the keypool.
@@ -1278,7 +1291,22 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
             // Block disconnection override an abandoned tx as unconfirmed
             // which means user may have to call abandontransaction again
             TxState tx_state = std::visit([](auto&& s) -> TxState { return s; }, state);
-            CWalletTx* wtx = AddToWallet(MakeTransactionRef(tx), tx_state, /*update_wtx=*/nullptr, rescanning_old_block);
+            UpdateWalletTxFn update_fn{nullptr};
+            if (has_ct_receive) {
+                update_fn = [&ct_receives](CWalletTx& wtx, bool /*new_tx*/) -> bool {
+                    bool changed = false;
+                    for (const auto& rec : ct_receives) {
+                        const std::string vk = "pct_v" + std::to_string(rec.vout_index);
+                        const std::string pk = "pct_p" + std::to_string(rec.vout_index);
+                        const std::string vs = std::to_string(rec.value);
+                        const std::string ps = HexStr(rec.one_time_priv);
+                        if (wtx.mapValue[vk] != vs) { wtx.mapValue[vk] = vs; changed = true; }
+                        if (wtx.mapValue[pk] != ps) { wtx.mapValue[pk] = ps; changed = true; }
+                    }
+                    return changed;
+                };
+            }
+            CWalletTx* wtx = AddToWallet(MakeTransactionRef(tx), tx_state, update_fn, rescanning_old_block);
             if (!wtx) {
                 // Can only be nullptr if there was a db write error (missing db, read-only db or a db engine internal writing error).
                 // As we only store arriving transaction in this process, and we don't want an inconsistent state, let's throw an error.

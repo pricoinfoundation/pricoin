@@ -388,8 +388,13 @@ public:
 
 /** Functions for validating blocks and updating the block tree */
 
-/** Context-independent validity checks */
-bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true, bool fCheckMerkleRoot = true);
+/** Context-independent validity checks.
+ *
+ * Pricoin: `height` and `chain` resolve the RandomX seed for the PoW
+ * recheck. If height < 0 or chain == nullptr, falls back to the bootstrap
+ * seed (correct only for heights < EPOCH_LAG). */
+class CChain;
+bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true, bool fCheckMerkleRoot = true, int height = -1, const CChain* chain = nullptr);
 
 /**
  * Verify a block, including transactions.
@@ -414,8 +419,14 @@ BlockValidationState TestBlockValidity(
     bool check_pow,
     bool check_merkle_root) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
-/** Check that the proof of work on each blockheader matches the value in nBits */
-bool HasValidProofOfWork(std::span<const CBlockHeader> headers, const Consensus::Params& consensusParams);
+/** Check that the proof of work on each blockheader matches the value in nBits.
+ *
+ * Pricoin: `chainman` is used to resolve each header's epoch seed via
+ * its parent (header.hashPrevBlock → m_block_index → height). Pass null
+ * only when no chain is available; the bootstrap seed is then used and
+ * only heights < EPOCH_LAG verify correctly. */
+class ChainstateManager;
+bool HasValidProofOfWork(std::span<const CBlockHeader> headers, const Consensus::Params& consensusParams, const ChainstateManager* chainman = nullptr);
 
 /** Check if a block has been mutated (with respect to its merkle root and witness commitments). */
 bool IsBlockMutated(const CBlock& block, bool check_witness_root);

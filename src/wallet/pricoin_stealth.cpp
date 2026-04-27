@@ -93,4 +93,10 @@ const Identity& GetOrCreate(CWallet& wallet)
     return inserted->second;
 }
 
+void Shutdown()
+{
+    LOCK(g_mutex);
+    g_identities.clear();
+}
+
 } // namespace wallet::pricoin_stealth

@@ -8,6 +8,7 @@
 #include <qt/forms/ui_sendcoinsdialog.h>
 
 #include <qt/addresstablemodel.h>
+#include <qt/bitcoinamountfield.h>
 #include <qt/bitcoinunits.h>
 #include <qt/clientmodel.h>
 #include <qt/coincontroldialog.h>
@@ -15,6 +16,9 @@
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
 #include <qt/sendcoinsentry.h>
+
+#include <interfaces/wallet.h>
+#include <util/result.h>
 
 #include <chainparams.h>
 #include <interfaces/node.h>
@@ -34,9 +38,15 @@
 #include <memory>
 
 #include <QFontMetrics>
+#include <QFormLayout>
+#include <QGroupBox>
+#include <QLabel>
+#include <QLineEdit>
+#include <QPushButton>
 #include <QScrollBar>
 #include <QSettings>
 #include <QTextDocument>
+#include <QVBoxLayout>
 
 using common::PSBTError;
 using wallet::CCoinControl;
@@ -68,14 +78,54 @@ SendCoinsDialog::SendCoinsDialog(const PlatformStyle *_platformStyle, QWidget *p
 {
     ui->setupUi(this);
 
-    if (!_platformStyle->getImagesOnButtons()) {
-        ui->addButton->setIcon(QIcon());
-        ui->clearButton->setIcon(QIcon());
-        ui->sendButton->setIcon(QIcon());
-    } else {
-        ui->addButton->setIcon(_platformStyle->SingleColorIcon(":/icons/add"));
-        ui->clearButton->setIcon(_platformStyle->SingleColorIcon(":/icons/remove"));
-        ui->sendButton->setIcon(_platformStyle->SingleColorIcon(":/icons/send"));
+    // Pricoin Phase B: replace the transparent SendCoinsDialog form with a
+    // confidential-send panel that targets a stealth address and calls
+    // interfaces::Wallet::sendConfidential. The original BTC-style form (fee
+    // estimator, coin control, multi-recipient) is hidden — it doesn't apply
+    // when every output is a one-time CT P2WPKH derived from the recipient's
+    // stealth address.
+    {
+        auto* panel = new QGroupBox(tr("Send Confidential Transaction"), this);
+        auto* form = new QFormLayout(panel);
+
+        m_pricoinDestEdit = new QLineEdit(panel);
+        m_pricoinDestEdit->setPlaceholderText(tr("Stealth address (H6…) — the recipient's reusable identity"));
+        form->addRow(tr("To stealth address:"), m_pricoinDestEdit);
+
+        m_pricoinAmountEdit = new BitcoinAmountField(panel);
+        form->addRow(tr("Amount:"), m_pricoinAmountEdit);
+
+        m_pricoinFeeEdit = new BitcoinAmountField(panel);
+        m_pricoinFeeEdit->setValue(10000); // 0.0001 PRIC default
+        form->addRow(tr("Transparent fee:"), m_pricoinFeeEdit);
+
+        m_pricoinSendBtn = new QPushButton(tr("Send Confidential"), panel);
+        form->addRow(m_pricoinSendBtn);
+
+        m_pricoinStatusLabel = new QLabel(panel);
+        m_pricoinStatusLabel->setWordWrap(true);
+        form->addRow(m_pricoinStatusLabel);
+
+        auto* note = new QLabel(tr(
+            "The recipient must give you their stealth address (starts with H6…). "
+            "Funded from the first transparent UTXO with sufficient value; change "
+            "is sent to your own stealth identity."), panel);
+        note->setWordWrap(true);
+        note->setStyleSheet("QLabel { color: #666; font-size: 11px; }");
+        form->addRow(note);
+
+        if (auto* lay = qobject_cast<QVBoxLayout*>(layout())) {
+            lay->insertWidget(0, panel);
+        }
+        // Hide the original BTC form & buttons.
+        ui->scrollArea->setVisible(false);
+        ui->frameFee->setVisible(false);
+        ui->sendButton->setVisible(false);
+        ui->clearButton->setVisible(false);
+        ui->addButton->setVisible(false);
+        ui->pushButtonCoinControl->setVisible(false);
+
+        connect(m_pricoinSendBtn, &QPushButton::clicked, this, &SendCoinsDialog::pricoinSendClicked);
     }
 
     GUIUtil::setupAddressWidget(ui->lineEditCoinControlChange, this);
@@ -472,6 +522,41 @@ bool SendCoinsDialog::signWithExternalSigner(PartiallySignedTransaction& psbtx, 
     // fillPSBT does not always properly finalize
     complete = FinalizeAndExtractPSBT(psbtx, mtx);
     return true;
+}
+
+void SendCoinsDialog::pricoinSendClicked()
+{
+    if (!model || !m_pricoinStatusLabel) return;
+    m_pricoinStatusLabel->clear();
+
+    const QString dest = m_pricoinDestEdit ? m_pricoinDestEdit->text().trimmed() : QString();
+    if (dest.isEmpty()) {
+        m_pricoinStatusLabel->setStyleSheet("QLabel { color: #b71c1c; }");
+        m_pricoinStatusLabel->setText(tr("Enter a stealth address (H6…)."));
+        return;
+    }
+    const CAmount amount = m_pricoinAmountEdit ? m_pricoinAmountEdit->value() : 0;
+    const CAmount fee = m_pricoinFeeEdit ? m_pricoinFeeEdit->value() : 0;
+    if (amount <= 0) {
+        m_pricoinStatusLabel->setStyleSheet("QLabel { color: #b71c1c; }");
+        m_pricoinStatusLabel->setText(tr("Amount must be > 0."));
+        return;
+    }
+
+    auto res = model->wallet().sendConfidential(dest.toStdString(), amount, fee);
+    if (!res) {
+        m_pricoinStatusLabel->setStyleSheet("QLabel { color: #b71c1c; }");
+        m_pricoinStatusLabel->setText(tr("Send failed: %1")
+            .arg(QString::fromStdString(util::ErrorString(res).original)));
+        return;
+    }
+
+    const QString txid = QString::fromStdString(res->ToString());
+    m_pricoinStatusLabel->setStyleSheet("QLabel { color: #1b5e20; }");
+    m_pricoinStatusLabel->setText(tr("Broadcast OK. txid: %1").arg(txid));
+    m_pricoinDestEdit->clear();
+    m_pricoinAmountEdit->setValue(0);
+    Q_EMIT coinsSent(Txid::FromUint256(*res));
 }
 
 void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)

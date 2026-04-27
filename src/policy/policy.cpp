@@ -155,10 +155,16 @@ bool IsStandardTx(const CTransaction& tx, const std::optional<unsigned>& max_dat
         }
     }
 
-    // Only MAX_DUST_OUTPUTS_PER_TX dust is permitted(on otherwise valid ephemeral dust)
-    if (GetDust(tx, dust_relay_fee).size() > MAX_DUST_OUTPUTS_PER_TX) {
-        reason = "dust";
-        return false;
+    // Pricoin: v4 confidential transactions carry their real values inside
+    // Pedersen commitments and serialize each visible vout with nValue=0,
+    // which the dust check would otherwise flag. Skip the dust check for
+    // v4 — every non-coinbase tx is v4 under the consensus rule, so this
+    // turns the historical `-acceptnonstdtxn=1` requirement into a no-op.
+    if (tx.version != PRICOIN_CT_VERSION) {
+        if (GetDust(tx, dust_relay_fee).size() > MAX_DUST_OUTPUTS_PER_TX) {
+            reason = "dust";
+            return false;
+        }
     }
 
     return true;

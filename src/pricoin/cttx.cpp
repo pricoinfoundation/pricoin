@@ -156,16 +156,11 @@ std::optional<std::array<unsigned char, 33>> SubtractCommitments(
 {
     LOCK(g_secp_mu);
     secp256k1_context* ctx = SecpCtx();
-    secp256k1_pubkey pk1, pk2;
-    if (!ParseCommitToPubkey(ctx, C1, pk1)) return std::nullopt;
-    if (!ParseCommitToPubkey(ctx, C2, pk2)) return std::nullopt;
-    if (!secp256k1_ec_pubkey_negate(ctx, &pk2)) return std::nullopt;
-    const secp256k1_pubkey* parts[2] = {&pk1, &pk2};
-    secp256k1_pubkey diff;
-    if (!secp256k1_ec_pubkey_combine(ctx, &diff, parts, 2)) return std::nullopt;
+    secp256k1_pedersen_commitment p1, p2;
+    if (!secp256k1_pedersen_commitment_parse(ctx, &p1, C1.bytes.data())) return std::nullopt;
+    if (!secp256k1_pedersen_commitment_parse(ctx, &p2, C2.bytes.data())) return std::nullopt;
     std::array<unsigned char, 33> out;
-    size_t outlen = out.size();
-    if (!secp256k1_ec_pubkey_serialize(ctx, out.data(), &outlen, &diff, SECP256K1_EC_COMPRESSED)) {
+    if (!secp256k1_pedersen_commitments_subtract_to_pubkey(ctx, out.data(), &p1, &p2)) {
         return std::nullopt;
     }
     return out;
@@ -186,6 +181,21 @@ std::optional<BlindingFactor> AddScalars(const BlindingFactor& a, const Blinding
     BlindingFactor out = a;
     if (!secp256k1_ec_seckey_verify(SecpCtx(), out.data())) return std::nullopt;
     if (!secp256k1_ec_seckey_tweak_add(SecpCtx(), out.data(), b.data())) return std::nullopt;
+    return out;
+}
+
+std::optional<std::array<unsigned char, 33>> ScalarTimesG(const BlindingFactor& s)
+{
+    LOCK(g_secp_mu);
+    secp256k1_context* ctx = SecpCtx();
+    if (!secp256k1_ec_seckey_verify(ctx, s.data())) return std::nullopt;
+    secp256k1_pubkey pk;
+    if (!secp256k1_ec_pubkey_create(ctx, &pk, s.data())) return std::nullopt;
+    std::array<unsigned char, 33> out;
+    size_t len = out.size();
+    if (!secp256k1_ec_pubkey_serialize(ctx, out.data(), &len, &pk, SECP256K1_EC_COMPRESSED)) {
+        return std::nullopt;
+    }
     return out;
 }
 

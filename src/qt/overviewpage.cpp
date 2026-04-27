@@ -16,11 +16,17 @@
 #include <qt/transactiontablemodel.h>
 #include <qt/walletmodel.h>
 
+#include <interfaces/wallet.h>
+
 #include <QAbstractItemDelegate>
 #include <QApplication>
 #include <QDateTime>
+#include <QFormLayout>
+#include <QFrame>
+#include <QLabel>
 #include <QPainter>
 #include <QStatusTipEvent>
+#include <QVBoxLayout>
 
 #include <algorithm>
 #include <map>
@@ -154,6 +160,35 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
     showOutOfSyncWarning(true);
     connect(ui->labelWalletStatus, &QPushButton::clicked, this, &OverviewPage::outOfSyncWarningClicked);
     connect(ui->labelTransactionsStatus, &QPushButton::clicked, this, &OverviewPage::outOfSyncWarningClicked);
+
+    // Pricoin Phase B: surface the recovered confidential balance below the
+    // existing transparent balance block. The CT balance comes from rangeproof
+    // rewind on every chain output paid to this wallet's stealth identity, so
+    // it's a separate quantity from `WalletBalances::balance` (which only sees
+    // transparent UTXOs). We refresh it on the same trigger as transparent
+    // balance updates.
+    if (auto* main = layout()) {
+        auto* ct_frame = new QFrame(this);
+        ct_frame->setFrameShape(QFrame::StyledPanel);
+        auto* form = new QFormLayout(ct_frame);
+        m_pricoin_ct_label = new QLabel("--", ct_frame);
+        m_pricoin_ct_label->setStyleSheet("QLabel { font-weight: bold; }");
+        auto* title = new QLabel(tr("Confidential balance:"), ct_frame);
+        form->addRow(title, m_pricoin_ct_label);
+        auto* note = new QLabel(tr(
+            "Sum of values recovered from confidential outputs paid to your "
+            "stealth address. Updates whenever the transparent balance does."), ct_frame);
+        note->setWordWrap(true);
+        note->setStyleSheet("QLabel { color: #666; font-size: 11px; }");
+        form->addRow(note);
+
+        // Insert just below the existing balance block (top of overview).
+        if (auto* vlay = qobject_cast<QVBoxLayout*>(main)) {
+            vlay->insertWidget(1, ct_frame);
+        } else {
+            main->addWidget(ct_frame);
+        }
+    }
 }
 
 void OverviewPage::handleTransactionClicked(const QModelIndex &index)
@@ -197,6 +232,12 @@ void OverviewPage::setBalance(const interfaces::WalletBalances& balances)
 
     ui->labelImmature->setVisible(showImmature);
     ui->labelImmatureText->setVisible(showImmature);
+
+    if (m_pricoin_ct_label && walletModel) {
+        const CAmount ct = walletModel->wallet().confidentialBalance();
+        m_pricoin_ct_label->setText(BitcoinUnits::formatWithPrivacy(
+            unit, ct, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
+    }
 }
 
 void OverviewPage::setClientModel(ClientModel *model)

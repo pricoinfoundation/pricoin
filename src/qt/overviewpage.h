@@ -21,6 +21,7 @@ namespace Ui {
 }
 
 QT_BEGIN_NAMESPACE
+class QLabel;
 class QModelIndex;
 QT_END_NAMESPACE
 
@@ -58,6 +59,10 @@ private:
 
     TxViewDelegate *txdelegate;
     std::unique_ptr<TransactionFilterProxy> filter;
+
+    // Pricoin Phase B: confidential balance label, populated on each
+    // setBalance() call.
+    QLabel* m_pricoin_ct_label{nullptr};
 
 private Q_SLOTS:
     void LimitTransactionRows();

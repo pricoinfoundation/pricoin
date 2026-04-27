@@ -23,6 +23,7 @@ namespace Ui {
 }
 
 QT_BEGIN_NAMESPACE
+class QLineEdit;
 class QModelIndex;
 QT_END_NAMESPACE
 
@@ -57,6 +58,7 @@ private:
     QAction* copyMessageAction;
     QAction* copyAmountAction;
     const PlatformStyle *platformStyle;
+    QLineEdit* m_stealthAddressEdit{nullptr};
 
     QModelIndex selectedRow();
     void copyColumnToClipboard(int column);

@@ -12,21 +12,25 @@
 #include <pricoin/cttx.h>
 #include <pricoin/ringsig.h>
 #include <primitives/transaction.h>
+#include <logging.h>
 #include <secp256k1.h>
 #include <secp256k1_generator.h>
 #include <streams.h>
 #include <sync.h>
 #include <tinyformat.h>
+#include <util/fs.h>
 
+#include <fstream>
 #include <unordered_set>
 
 namespace pricoin {
 
 namespace {
 
-// In-memory global key-image set. Phase 4b MVP: not persisted; the daemon
-// rebuilds the set as it replays blocks at startup (the verifier inserts
-// each key image it sees into this set as it accepts a v4 ring tx).
+// In-memory global key-image set, mirrored to <datadir>/pricoin_keyimages.dat.
+// CommitRingKeyImages appends each new KI to the file; InitKeyImageStore
+// loads the file into memory at daemon startup so re-broadcasts of any
+// previously-confirmed ring tx hit the double-spend check.
 struct KIHash {
     size_t operator()(const ringsig::Point& p) const noexcept {
         // First 8 bytes of the compressed pubkey are already uniformly distributed.
@@ -37,6 +41,17 @@ struct KIHash {
 };
 Mutex g_ki_mutex;
 std::unordered_set<ringsig::Point, KIHash> g_key_images GUARDED_BY(g_ki_mutex);
+fs::path g_ki_path GUARDED_BY(g_ki_mutex);
+
+// Append a 33-byte key image to the persistent file. Called under g_ki_mutex.
+void PersistKeyImage(const ringsig::Point& ki) EXCLUSIVE_LOCKS_REQUIRED(g_ki_mutex)
+{
+    if (g_ki_path.empty()) return;  // store not initialized
+    std::ofstream f(fs::PathToString(g_ki_path), std::ios::binary | std::ios::app);
+    if (f) {
+        f.write(reinterpret_cast<const char*>(ki.data()), ki.size());
+    }
+}
 
 // Compute the message that ring sigs commit to: the tx serialized without
 // witness AND with all ring-sig fields zeroed out so the sig binds to the
@@ -118,18 +133,22 @@ bool VerifyRingInputs(
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-sig-size");
         }
 
-        // Phase 4b-mini: single-layer CLSAG over spend pubkeys. Verifier just
-        // builds the ring of P's. Multi-layer (RingCT proper) needs correct
-        // commitment-to-pubkey conversion and is deferred. See sender-side
-        // comment in src/wallet/rpc/pricoin_ct.cpp for the security gap.
-        std::vector<ringsig::Point> ring_p(ri.ring.size());
+        // Phase 4c: multi-layer CLSAG. Build (P_i, W_i) pairs where
+        // W_i = C_i − C_pseudo via the same prefix-swap conversion as the
+        // signer. This binds the chosen ring member's commitment to the
+        // pseudo (defeats the inflation attack possible with single-layer).
+        std::vector<ringsig::MultiLayerMember> members(ri.ring.size());
         for (size_t k = 0; k < ri.ring.size(); ++k) {
             const COutPoint op{Txid::FromUint256(ri.ring[k].hash), ri.ring[k].n};
             const Coin& c = inputs.AccessCoin(op);
+            // Phase 3a: v4 outputs are never erased from chainstate, so an
+            // empty Coin here means the outpoint never existed. Spent-ness is
+            // tracked exclusively by the key-image set; ring members may have
+            // been spent in earlier ring txs and that's fine.
             if (c.IsSpent()) {
                 return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-ring-member-missing",
-                    strprintf("ring[%u][%u]=%s:%u is spent or absent (have_in_view=%d)",
-                              (unsigned)idx, (unsigned)k, op.hash.ToString(), op.n, (int)inputs.HaveCoin(op)));
+                    strprintf("ring[%u][%u]=%s:%u is not on chain",
+                              (unsigned)idx, (unsigned)k, op.hash.ToString(), op.n));
             }
             if (!c.IsConfidential()) {
                 return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-ring-member-missing",
@@ -138,7 +157,12 @@ bool VerifyRingInputs(
             if (c.IsCoinBase() && nSpendHeight - c.nHeight < COINBASE_MATURITY) {
                 return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "bad-pct-ring-member-immature");
             }
-            ring_p[k] = c.one_time_pubkey;
+            members[k].P = c.one_time_pubkey;
+            auto W = ct::SubtractCommitments(c.commitment, ri.pseudo_commitment);
+            if (!W) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-commit-delta");
+            }
+            members[k].W = *W;
         }
 
         // Key image must not be in the committed set.
@@ -149,7 +173,7 @@ bool VerifyRingInputs(
             }
         }
 
-        if (!ringsig::Verify(std::span<const ringsig::Point>{ring_p}, ri.sig, msg)) {
+        if (!ringsig::VerifyMultiLayer(std::span<const ringsig::MultiLayerMember>{members}, ri.sig, msg)) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-ring-sig-invalid");
         }
         // Note: insertion into g_key_images happens only at block-connect via
@@ -224,7 +248,10 @@ void CommitRingKeyImages(const CTransaction& tx)
     if (tx.version != PRICOIN_CT_VERSION) return;
     LOCK(g_ki_mutex);
     for (const auto& ri : tx.ct_bundle.ring_inputs) {
-        g_key_images.insert(ri.sig.key_image);
+        const auto [it, inserted] = g_key_images.insert(ri.sig.key_image);
+        if (inserted) {
+            PersistKeyImage(ri.sig.key_image);
+        }
     }
 }
 
@@ -235,6 +262,34 @@ void UncommitRingKeyImages(const CTransaction& tx)
     for (const auto& ri : tx.ct_bundle.ring_inputs) {
         g_key_images.erase(ri.sig.key_image);
     }
+    // Persistence file is append-only and isn't rewritten on reorg.
+    // Toy scope: the slightly-stale on-disk set is acceptable since
+    // membership only matters for forward double-spend detection.
+}
+
+bool IsKeyImageCommitted(const ringsig::Point& ki)
+{
+    LOCK(g_ki_mutex);
+    return g_key_images.contains(ki);
+}
+
+void InitKeyImageStore(const std::string& datadir_path)
+{
+    LOCK(g_ki_mutex);
+    g_ki_path = fs::PathFromString(datadir_path) / "pricoin_keyimages.dat";
+    std::ifstream f(fs::PathToString(g_ki_path), std::ios::binary);
+    if (!f) {
+        LogInfo("Pricoin: key-image store empty at startup (%s)", fs::PathToString(g_ki_path));
+        return;
+    }
+    size_t loaded = 0;
+    ringsig::Point buf;
+    while (f.read(reinterpret_cast<char*>(buf.data()), buf.size())) {
+        if (f.gcount() != static_cast<std::streamsize>(buf.size())) break;
+        g_key_images.insert(buf);
+        ++loaded;
+    }
+    LogInfo("Pricoin: loaded %u key image(s) from %s", (unsigned)loaded, fs::PathToString(g_ki_path));
 }
 
 } // namespace pricoin

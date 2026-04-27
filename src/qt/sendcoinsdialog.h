@@ -27,8 +27,12 @@ namespace Ui {
 }
 
 QT_BEGIN_NAMESPACE
+class QLabel;
+class QLineEdit;
+class QPushButton;
 class QUrl;
 QT_END_NAMESPACE
+class BitcoinAmountField;
 
 /** Dialog for sending bitcoins */
 class SendCoinsDialog : public QDialog
@@ -95,6 +99,13 @@ private:
     void updateFeeMinimizedLabel();
     void updateCoinControlState();
 
+    // Pricoin Phase B: confidential-send panel widgets and handler.
+    QLineEdit* m_pricoinDestEdit{nullptr};
+    BitcoinAmountField* m_pricoinAmountEdit{nullptr};
+    BitcoinAmountField* m_pricoinFeeEdit{nullptr};
+    QPushButton* m_pricoinSendBtn{nullptr};
+    QLabel* m_pricoinStatusLabel{nullptr};
+
 private Q_SLOTS:
     void sendButtonClicked(bool checked);
     void on_buttonChooseFee_clicked();
@@ -120,6 +131,8 @@ private Q_SLOTS:
     void updateFeeSectionControls();
     void updateNumberOfBlocks(int count, const QDateTime& blockDate, double nVerificationProgress, SyncType synctype, SynchronizationState sync_state);
     void updateSmartFeeLabel();
+    // Pricoin Phase B: handle the confidential-send button.
+    void pricoinSendClicked();
 
 Q_SIGNALS:
     // Fired when a message should be reported to the user

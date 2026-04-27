@@ -95,6 +95,26 @@ public:
     //! Get wallet name.
     virtual std::string getWalletName() = 0;
 
+    //! Pricoin: get this wallet's reusable stealth address (base58check
+    //! encoding, version byte 0x53). Generated lazily and persisted to
+    //! wallets/<name>/pricoin_stealth.dat. Returns empty on failure.
+    virtual std::string getStealthAddress() = 0;
+
+    //! Pricoin: build, sign and broadcast a v4 confidential transaction
+    //! sending `amount` PRIC from a transparent wallet input to the given
+    //! stealth address, paying a transparent `fee`. Returns the txid on
+    //! success or an error string. Equivalent to the `walletsendct` RPC.
+    virtual util::Result<uint256> sendConfidential(
+        const std::string& dest_stealth_address,
+        CAmount amount,
+        CAmount fee) = 0;
+
+    //! Pricoin: scan the chain for confidential outputs paid to this
+    //! wallet's stealth identity (via rangeproof rewind). Returns the total
+    //! recovered value across unspent outputs. Equivalent to
+    //! `pricoin_listownct.total_recovered`.
+    virtual CAmount confidentialBalance() = 0;
+
     // Get a new address.
     virtual util::Result<CTxDestination> getNewDestination(OutputType type, const std::string& label) = 0;
 

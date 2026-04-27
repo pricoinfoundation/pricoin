@@ -7,8 +7,10 @@
 #include <chain.h>
 #include <interfaces/wallet.h>
 #include <key_io.h>
+#include <primitives/transaction.h>
 
 #include <cstdint>
+#include <cstdlib>
 
 #include <QDateTime>
 
@@ -44,6 +46,52 @@ QList<TransactionRecord> TransactionRecord::decomposeTransaction(const interface
             all_from_me = all_from_me && mine;
             if (mine) any_from_me = true;
         }
+    }
+
+    // Pricoin Phase B: explicit accounting for v4 confidential transactions.
+    // For these, every vout has nValue=0 (real values live in commitments) and
+    // outputs are P2WPKH on a one-time stealth-derived pubkey, so the wallet's
+    // IsMine returns false for them. The wallet's stealth-scan path stashes
+    // recovered values per vout in mapValue under "pct_v<i>"; surface them
+    // directly as credits, and compute the matching debit from the wallet's
+    // transparent contribution.
+    if (wtx.tx->version == PRICOIN_CT_VERSION) {
+        CAmount total_credit = 0;
+        for (size_t i = 0; i < wtx.tx->vout.size(); ++i) {
+            const std::string vk = "pct_v" + std::to_string(i);
+            auto it = mapValue.find(vk);
+            if (it == mapValue.end()) continue;
+            const CAmount v = std::strtoll(it->second.c_str(), nullptr, 10);
+            if (v <= 0) continue;
+            TransactionRecord sub(hash, nTime);
+            sub.idx = (int)i;
+            sub.credit = v;
+            sub.type = TransactionRecord::RecvWithAddress;
+            sub.address = "(confidential — stealth)";
+            parts.append(sub);
+            total_credit += v;
+        }
+        if (any_from_me) {
+            // We contributed a transparent input (wtx.debit) and recovered
+            // some of it back as our own change (total_credit). Whatever's
+            // left went to the recipient + the transparent fee.
+            const CAmount sent = nDebit - total_credit;
+            if (sent > 0) {
+                TransactionRecord sub(hash, nTime);
+                sub.idx = -1;
+                sub.debit = -sent;
+                sub.type = TransactionRecord::SendToOther;
+                sub.address = "(confidential — stealth)";
+                parts.append(sub);
+            }
+        }
+        if (parts.isEmpty()) {
+            // v4 tx that neither receives to us nor draws on our funds —
+            // shouldn't normally appear, but render a neutral placeholder so
+            // it doesn't vanish silently.
+            parts.append(TransactionRecord(hash, nTime, TransactionRecord::Other, "(confidential)", 0, 0));
+        }
+        return parts;
     }
 
     if (all_from_me || !any_from_me) {

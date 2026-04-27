@@ -6,6 +6,7 @@
 
 #include <kernel/chainparams.h>
 
+#include <arith_uint256.h>
 #include <chainparamsseeds.h>
 #include <consensus/amount.h>
 #include <consensus/merkle.h>
@@ -13,6 +14,7 @@
 #include <crypto/hex_base.h>
 #include <hash.h>
 #include <kernel/messagestartchars.h>
+#include <pow/randomx_pricoin.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -21,6 +23,12 @@
 #include <util/chaintype.h>
 #include <util/log.h>
 #include <util/strencodings.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <string>
+#include <string_view>
 
 #include <algorithm>
 #include <array>
@@ -55,6 +63,54 @@ static CBlock CreateGenesisBlock(const char* pszTimestamp, const CScript& genesi
     return genesis;
 }
 
+// Pricoin: brute-force nNonce until the genesis block's RandomX hash
+// satisfies its declared nBits target. Used once at chain deploy time;
+// the resulting (nNonce, hashGenesisBlock, hashMerkleRoot) is hardcoded
+// into the params asserts below. Triggered by env var
+// PRICOIN_MINE_GENESIS=1 — without it, the daemon assumes the asserts
+// are accurate and skips mining.
+namespace {
+void MineGenesisIfRequested(CBlock& genesis, std::string_view chain_name)
+{
+    if (std::getenv("PRICOIN_MINE_GENESIS") == nullptr) return;
+
+    arith_uint256 target;
+    bool fNegative, fOverflow;
+    target.SetCompact(genesis.nBits, &fNegative, &fOverflow);
+    if (fNegative || fOverflow || target == 0) {
+        LogInfo("Pricoin genesis miner: invalid nBits %08x for %s",
+                 genesis.nBits, chain_name);
+        std::exit(1);
+    }
+
+    LogInfo("Pricoin genesis miner: searching nonce for %s (nTime=%u nBits=%08x)",
+             chain_name, genesis.nTime, genesis.nBits);
+    genesis.nNonce = 0;
+    while (UintToArith256(pricoin::randomx::GetPoWHashOfHeader(genesis)) > target) {
+        if (genesis.nNonce == std::numeric_limits<uint32_t>::max()) {
+            LogInfo("Pricoin genesis miner: nonce space exhausted for %s; bump nTime",
+                     chain_name);
+            std::exit(1);
+        }
+        ++genesis.nNonce;
+    }
+    std::fprintf(stderr,
+        "PRICOIN_GENESIS chain=%s nNonce=%u hashGenesisBlock=%s hashMerkleRoot=%s\n",
+        std::string(chain_name).c_str(), genesis.nNonce,
+        genesis.GetHash().ToString().c_str(),
+        genesis.hashMerkleRoot.ToString().c_str());
+    std::fflush(stderr);
+}
+
+// Bypass the genesis-hash asserts when we're in mining mode (so we don't
+// abort after the first chain's assert fails — we want the miner to run for
+// every chain and print all results in one go).
+bool ShouldSkipGenesisAssert()
+{
+    return std::getenv("PRICOIN_MINE_GENESIS") != nullptr;
+}
+} // namespace
+
 /**
  * Build the genesis block. Note that the output of its generation
  * transaction cannot be spent since it did not originally exist in the
@@ -68,7 +124,12 @@ static CBlock CreateGenesisBlock(const char* pszTimestamp, const CScript& genesi
  */
 static CBlock CreateGenesisBlock(uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
 {
-    const char* pszTimestamp = "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks";
+    // Pricoin: identity-distinct timestamp string (different from Bitcoin's
+    // genesis pszTimestamp so the genesis hashes are necessarily distinct).
+    // The output script is unspendable by convention; we keep Bitcoin's
+    // dummy pubkey since spending the genesis reward isn't possible anyway
+    // (genesis isn't recorded in the UTXO set).
+    const char* pszTimestamp = "Pricoin 2026/04/27 Privacy mandatory: confidential amounts, stealth addresses, ring signatures";
     const CScript genesisOutputScript = CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG;
     return CreateGenesisBlock(pszTimestamp, genesisOutputScript, nTime, nNonce, nBits, nVersion, genesisReward);
 }
@@ -124,24 +185,30 @@ public:
         m_assumed_blockchain_size = 856;
         m_assumed_chain_state_size = 14;
 
-        genesis = CreateGenesisBlock(1231006505, 2083236893, 0x1d00ffff, 1, 50 * COIN);
+        // Pricoin mainnet genesis.
+        genesis = CreateGenesisBlock(
+            "Pricoin main 2026/04/27 confidential amounts stealth ring",
+            CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
+            /*nTime=*/1735689600, /*nNonce=*/7, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
+        MineGenesisIfRequested(genesis, "main");
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"});
-        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+        if (!ShouldSkipGenesisAssert()) {
+            assert(consensus.hashGenesisBlock == uint256{"74d901710791d97a44d75c9d066a712e79dec2857de3433bbf496548c2012e75"});
+            assert(genesis.hashMerkleRoot == uint256{"3b82c1782f70fc6a1318dcbbd0b9513db2c7e38d38a2a5973ecdc5f205a33794"});
+        }
 
         // Note that of those which support the service bits prefix, most only support a subset of
         // possible options.
         // This is fine at runtime as we'll fall back to using them as an addrfetch if they don't support the
         // service bits we want, but we should get them updated to support all service bits wanted by any
         // release ASAP to avoid it where possible.
-        vSeeds.emplace_back("seed.bitcoin.sipa.be."); // Pieter Wuille, only supports x1, x5, x9, and xd
-        vSeeds.emplace_back("dnsseed.bluematt.me."); // Matt Corallo, only supports x9
-        vSeeds.emplace_back("seed.bitcoin.jonasschnelli.ch."); // Jonas Schnelli, only supports x1, x5, x9, and xd
-        vSeeds.emplace_back("seed.btc.petertodd.net."); // Peter Todd, only supports x1, x5, x9, and xd
-        vSeeds.emplace_back("seed.bitcoin.sprovoost.nl."); // Sjors Provoost
-        vSeeds.emplace_back("dnsseed.emzy.de."); // Stephan Oeste
-        vSeeds.emplace_back("seed.bitcoin.wiz.biz."); // Jason Maurice
-        vSeeds.emplace_back("seed.mainnet.achownodes.xyz."); // Ava Chow, only supports x1, x5, x9, x49, x809, x849, xd, x400, x404, x408, x448, xc08, xc48, x40c
+        // Pricoin mainnet DNS seeds. Each entry should resolve to an A/AAAA
+        // record of a long-running node accepting incoming connections on
+        // nDefaultPort (9543).
+        vSeeds.emplace_back("peer1.pricoin.net.");
+        vSeeds.emplace_back("peer2.pricoin.net.");
+        vSeeds.emplace_back("peer3.pricoin.net.");
+        vSeeds.emplace_back("peer4.pricoin.net.");
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,0);
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,5);
@@ -151,7 +218,10 @@ public:
 
         bech32_hrp = "pric";
 
-        vFixedSeeds = std::vector<uint8_t>(std::begin(chainparams_seed_main), std::end(chainparams_seed_main));
+        // Pricoin: no embedded seed list yet — rely on DNS seeds above. The
+        // Bitcoin chainparams_seed_main blob points at Bitcoin nodes that
+        // wouldn't respond on Pricoin's port/magic.
+        vFixedSeeds.clear();
 
         fDefaultConsistencyChecks = false;
         m_is_mockable_chain = false;
@@ -242,19 +312,22 @@ public:
         m_assumed_blockchain_size = 245;
         m_assumed_chain_state_size = 19;
 
-        genesis = CreateGenesisBlock(1296688602, 414098458, 0x1d00ffff, 1, 50 * COIN);
+        // Pricoin testnet3 genesis. Same low-difficulty target as mainnet
+        // genesis under our RandomX scheme; DAA takes over after.
+        genesis = CreateGenesisBlock(
+            "Pricoin test 2026/04/27 confidential amounts stealth ring",
+            CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
+            /*nTime=*/1735689600, /*nNonce=*/1, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
+        MineGenesisIfRequested(genesis, "test");
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"});
-        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+        if (!ShouldSkipGenesisAssert()) {
+            assert(consensus.hashGenesisBlock == uint256{"efc39ecb553fe8086145e8d6454c03ccccfd9b691a64335a2042d11ebab69390"});
+            assert(genesis.hashMerkleRoot == uint256{"58bc5f91f6f7c59fb3dec348d6ec517a61f5d46fbbec237a4333e0219b2c2dad"});
+        }
 
         vFixedSeeds.clear();
         vSeeds.clear();
-        // nodes with support for servicebits filtering should be at the top
-        vSeeds.emplace_back("testnet-seed.bitcoin.jonasschnelli.ch.");
-        vSeeds.emplace_back("seed.tbtc.petertodd.net.");
-        vSeeds.emplace_back("seed.testnet.bitcoin.sprovoost.nl.");
-        vSeeds.emplace_back("testnet-seed.bluematt.me."); // Just a static list of stable node(s), only supports x9
-        vSeeds.emplace_back("seed.testnet.achownodes.xyz."); // Ava Chow, only supports x1, x5, x9, x49, x809, x849, xd, x400, x404, x408, x448, xc08, xc48, x40c
+        // Pricoin: no testnet DNS seeds defined yet.
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,196);
@@ -264,7 +337,7 @@ public:
 
         bech32_hrp = "tpric";
 
-        vFixedSeeds = std::vector<uint8_t>(std::begin(chainparams_seed_test), std::end(chainparams_seed_test));
+        vFixedSeeds.clear();
 
         fDefaultConsistencyChecks = false;
         m_is_mockable_chain = false;
@@ -342,24 +415,21 @@ public:
         m_assumed_blockchain_size = 31;
         m_assumed_chain_state_size = 2;
 
-        const char* testnet4_genesis_msg = "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e";
-        const CScript testnet4_genesis_script = CScript() << "000000000000000000000000000000000000000000000000000000000000000000"_hex << OP_CHECKSIG;
-        genesis = CreateGenesisBlock(testnet4_genesis_msg,
-                testnet4_genesis_script,
-                1714777860,
-                393743547,
-                0x1d00ffff,
-                1,
-                50 * COIN);
+        // Pricoin testnet4 genesis.
+        genesis = CreateGenesisBlock(
+            "Pricoin testnet4 2026/04/27 confidential amounts stealth ring",
+            CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
+            /*nTime=*/1735689600, /*nNonce=*/2, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
+        MineGenesisIfRequested(genesis, "testnet4");
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"});
-        assert(genesis.hashMerkleRoot == uint256{"7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"});
+        if (!ShouldSkipGenesisAssert()) {
+            assert(consensus.hashGenesisBlock == uint256{"175b25f5b16e37c7b483c266285e279c728960883d674c6984e5feab0b031248"});
+            assert(genesis.hashMerkleRoot == uint256{"65336f76a25ac3f179768ab4d1b40d5ef85ebce567c1cbe34811e76a5262c9a0"});
+        }
 
         vFixedSeeds.clear();
         vSeeds.clear();
-        // nodes with support for servicebits filtering should be at the top
-        vSeeds.emplace_back("seed.testnet4.bitcoin.sprovoost.nl."); // Sjors Provoost
-        vSeeds.emplace_back("seed.testnet4.wiz.biz."); // Jason Maurice
+        // Pricoin: no testnet4 DNS seeds defined yet.
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,196);
@@ -369,7 +439,7 @@ public:
 
         bech32_hrp = "tpric";
 
-        vFixedSeeds = std::vector<uint8_t>(std::begin(chainparams_seed_testnet4), std::end(chainparams_seed_testnet4));
+        vFixedSeeds.clear();
 
         fDefaultConsistencyChecks = false;
         m_is_mockable_chain = false;
@@ -417,9 +487,8 @@ public:
 
         if (!options.challenge) {
             bin = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae"_hex_v_u8;
-            vFixedSeeds = std::vector<uint8_t>(std::begin(chainparams_seed_signet), std::end(chainparams_seed_signet));
-            vSeeds.emplace_back("seed.signet.bitcoin.sprovoost.nl.");
-            vSeeds.emplace_back("seed.signet.achownodes.xyz."); // Ava Chow, only supports x1, x5, x9, x49, x809, x849, xd, x400, x404, x408, x448, xc08, xc48, x40c
+            // Pricoin: no signet DNS seeds defined yet.
+            vFixedSeeds.clear();
 
             consensus.nMinimumChainWork = uint256{"00000000000000000000000000000000000000000000000000000b463ea0a4b8"};
             consensus.defaultAssumeValid = uint256{"00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329"}; // 293175
@@ -482,10 +551,17 @@ public:
         nDefaultPort = 39543;
         nPruneAfterHeight = 1000;
 
-        genesis = CreateGenesisBlock(1598918400, 52613770, 0x1e0377ae, 1, 50 * COIN);
+        // Pricoin signet genesis.
+        genesis = CreateGenesisBlock(
+            "Pricoin signet 2026/04/27 confidential amounts stealth ring",
+            CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
+            /*nTime=*/1735689600, /*nNonce=*/3, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
+        MineGenesisIfRequested(genesis, "signet");
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"});
-        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+        if (!ShouldSkipGenesisAssert()) {
+            assert(consensus.hashGenesisBlock == uint256{"ff5426ed83e4392cff094d8027699ba7812947ad4619078c3f51f2e1dc5896e3"});
+            assert(genesis.hashMerkleRoot == uint256{"2d87ce085f268c0c5a9b44dcef4baefdf041bfd6e31bfc6e0cbe28cc5d214fa3"});
+        }
 
         m_assumeutxo_data = {
             {
@@ -593,10 +669,17 @@ public:
             consensus.vDeployments[deployment_pos].min_activation_height = version_bits_params.min_activation_height;
         }
 
-        genesis = CreateGenesisBlock(1296688602, 2, 0x207fffff, 1, 50 * COIN);
+        // Pricoin regtest genesis.
+        genesis = CreateGenesisBlock(
+            "Pricoin regtest 2026/04/27 confidential amounts stealth ring",
+            CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
+            /*nTime=*/1735689600, /*nNonce=*/1, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
+        MineGenesisIfRequested(genesis, "regtest");
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"});
-        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+        if (!ShouldSkipGenesisAssert()) {
+            assert(consensus.hashGenesisBlock == uint256{"bf1e5c0d41c4a20ee7b99f99ace476e67b17a9d5abd188a1aac424361550b3d8"});
+            assert(genesis.hashMerkleRoot == uint256{"d4b91bdbd25f7fbc249b18e9845b7f5346c07cf8f5a4db0d556d834976b24ba0"});
+        }
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.
         vSeeds.clear();

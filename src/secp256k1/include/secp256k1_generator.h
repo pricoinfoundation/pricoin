@@ -195,6 +195,17 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_pedersen_verify_tally(
   size_t ncnt
 ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(4);
 
+/* Pricoin: subtract two commitments and return the difference as a 33-byte
+ * compressed pubkey. Recovers the full y coordinate via the curve equation,
+ * so this is faithful (unlike a naive prefix-swap hack). Used by Pricoin's
+ * RingCT verifier to compute W_i = C_i - C_pseudo with proper parity. */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_pedersen_commitments_subtract_to_pubkey(
+    const secp256k1_context* ctx,
+    unsigned char* output33,
+    const secp256k1_pedersen_commitment* c1,
+    const secp256k1_pedersen_commitment* c2
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4);
+
 /** Sets the final Pedersen blinding factor correctly when the generators themselves
  *  have blinding factors.
  *

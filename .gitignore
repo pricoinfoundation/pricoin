@@ -3,6 +3,8 @@
 # file instead:
 # https://docs.github.com/en/get-started/git-basics/ignoring-files#configuring-ignored-files-for-all-repositories-on-your-computer
 
+.claude/
+
 # Build subdirectories.
 /*build*
 !/build-aux

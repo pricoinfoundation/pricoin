@@ -305,6 +305,41 @@ int secp256k1_pedersen_commitment_serialize(const secp256k1_context* ctx, unsign
     return 1;
 }
 
+/* Pricoin: subtract two Pedersen commitments at the field level (recovering
+ * the full y coordinate from each), and return the result as a 33-byte
+ * compressed pubkey. The result represents the curve point C1 - C2 in pubkey
+ * (BIP66) serialization with proper y-parity. Returns 1 on success, 0 on
+ * failure (e.g. result is the point at infinity).
+ */
+int secp256k1_pedersen_commitments_subtract_to_pubkey(
+    const secp256k1_context* ctx,
+    unsigned char* output33,
+    const secp256k1_pedersen_commitment* c1,
+    const secp256k1_pedersen_commitment* c2) {
+    secp256k1_ge ge1, ge2;
+    secp256k1_gej gj;
+    secp256k1_ge result;
+    size_t outlen = 33;
+    secp256k1_pubkey pk;
+
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(output33 != NULL);
+    ARG_CHECK(c1 != NULL);
+    ARG_CHECK(c2 != NULL);
+
+    secp256k1_pedersen_commitment_load(&ge1, c1);
+    secp256k1_pedersen_commitment_load(&ge2, c2);
+    secp256k1_ge_neg(&ge2, &ge2);
+
+    secp256k1_gej_set_ge(&gj, &ge1);
+    secp256k1_gej_add_ge(&gj, &gj, &ge2);
+    if (secp256k1_gej_is_infinity(&gj)) return 0;
+    secp256k1_ge_set_gej(&result, &gj);
+
+    secp256k1_pubkey_save(&pk, &result);
+    return secp256k1_ec_pubkey_serialize(ctx, output33, &outlen, &pk, SECP256K1_EC_COMPRESSED);
+}
+
 /* Generates a pedersen commitment: *commit = blind * G + value * G2. The blinding factor is 32 bytes.*/
 int secp256k1_pedersen_commit(const secp256k1_context* ctx, secp256k1_pedersen_commitment *commit, const unsigned char *blind, uint64_t value, const secp256k1_generator* gen) {
     secp256k1_ge genp;

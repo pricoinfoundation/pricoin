@@ -27,6 +27,12 @@ struct Identity {
 // Get-or-create the stealth identity associated with this wallet. Thread-safe.
 const Identity& GetOrCreate(CWallet& wallet);
 
+// Clear the in-memory identity cache. Must be called from the daemon's
+// Shutdown path before process exit. Otherwise the static map's destructor
+// races with atexit cleanup of glibc / libsecp256k1 internals and triggers
+// a SIGSEGV inside memory_cleanse() on each cached CKey.
+void Shutdown();
+
 } // namespace wallet::pricoin_stealth
 
 #endif // BITCOIN_WALLET_PRICOIN_STEALTH_H

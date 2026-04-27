@@ -65,7 +65,12 @@
 #include <policy/fees/block_policy_estimator_args.h>
 #include <policy/policy.h>
 #include <policy/settings.h>
+#include <pow/randomx_pricoin.h>
 #include <pricoin/ct.h>
+#include <pricoin/validation.h>
+#ifdef ENABLE_WALLET
+#include <wallet/pricoin_stealth.h>
+#endif
 #include <protocol.h>
 #include <rpc/blockchain.h>
 #include <rpc/register.h>
@@ -417,6 +422,19 @@ void Shutdown(NodeContext& node)
     node.scheduler.reset();
     node.ecc_context.reset();
     node.kernel.reset();
+
+    // Pricoin: tear down the RandomX VM/cache while it's still safe to call
+    // out to the library. Static destructors at process exit have raced with
+    // other vendor cleanup and produced SIGSEGV on stop.
+    try { pricoin::randomx::Shutdown(); } catch (...) {}
+
+#ifdef ENABLE_WALLET
+    // Pricoin: clear the per-process stealth-identity cache. Otherwise its
+    // static map's destructor at atexit fires after the secure-allocator
+    // pool has been torn down, and `memory_cleanse(keydata)` segfaults
+    // inside libc's vectorized memset.
+    try { wallet::pricoin_stealth::Shutdown(); } catch (...) {}
+#endif
 
     RemovePidFile(*node.args);
 
@@ -1006,13 +1024,11 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     }
 
     if (args.GetIntArg("-prune", 0)) {
-        if (args.GetBoolArg("-txindex", DEFAULT_TXINDEX))
-            return InitError(_("Prune mode is incompatible with -txindex."));
-        if (args.GetBoolArg("-txospenderindex", DEFAULT_TXOSPENDERINDEX))
-            return InitError(_("Prune mode is incompatible with -txospenderindex."));
-        if (args.GetBoolArg("-reindex-chainstate", false)) {
-            return InitError(_("Prune mode is incompatible with -reindex-chainstate. Use full -reindex instead."));
-        }
+        // Pricoin: pruning would discard old block data that's required to
+        // resolve v4 ring members and to scan stealth receives. Outputs in
+        // the v4 catalog are append-only and must remain referenceable
+        // indefinitely as decoy candidates.
+        return InitError(_("Pricoin: -prune is not supported. v4 confidential transactions reference historical outputs as ring decoys, so block files must be retained."));
     }
 
     // If -forcednsseed is set to true, ensure -dnsseed has not been set to false
@@ -1455,6 +1471,11 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     } catch (const std::exception& e) {
         return InitError(Untranslated(strprintf("Pricoin CT self-test failed: %s", e.what())));
     }
+
+    // Pricoin: initialize the persistent key-image store. Loads any KIs
+    // committed by past sessions; subsequent CommitRingKeyImages calls
+    // append to this file.
+    pricoin::InitKeyImageStore(fs::PathToString(args.GetDataDirNet()));
 
     LogInfo("Using at most %i automatic connections (%i file descriptors available)", nMaxConnections, available_fds);
 

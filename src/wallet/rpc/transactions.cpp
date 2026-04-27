@@ -5,7 +5,10 @@
 #include <core_io.h>
 #include <key_io.h>
 #include <policy/rbf.h>
+#include <primitives/transaction.h>
 #include <primitives/transaction_identifier.h>
+
+#include <cstdlib>
 #include <rpc/util.h>
 #include <rpc/rawtransaction_util.h>
 #include <rpc/blockchain.h>
@@ -740,8 +743,32 @@ RPCMethod gettransaction()
 
     CAmount nCredit = CachedTxGetCredit(*pwallet, wtx, /*avoid_reuse=*/false);
     CAmount nDebit = CachedTxGetDebit(*pwallet, wtx, /*avoid_reuse=*/false);
+
+    // Pricoin: for v4 confidential transactions, the chainstate vout values
+    // are all zero — the real values live in commitments. The wallet stashes
+    // recovered values as "pct_v<i>" in mapValue when the stealth-scan finds
+    // outputs paid to us. Surface those as the credit so amount/fee reflect
+    // actual sums.
+    if (wtx.tx->version == PRICOIN_CT_VERSION) {
+        nCredit = 0;
+        for (size_t i = 0; i < wtx.tx->vout.size(); ++i) {
+            const std::string vk = "pct_v" + std::to_string(i);
+            const auto vit = wtx.mapValue.find(vk);
+            if (vit == wtx.mapValue.end()) continue;
+            nCredit += std::strtoll(vit->second.c_str(), nullptr, 10);
+        }
+    }
+
     CAmount nNet = nCredit - nDebit;
-    CAmount nFee = (CachedTxIsFromMe(*pwallet, wtx) ? wtx.tx->GetValueOut() - nDebit : 0);
+    CAmount nFee = 0;
+    if (CachedTxIsFromMe(*pwallet, wtx)) {
+        if (wtx.tx->version == PRICOIN_CT_VERSION) {
+            // Transparent fee lives in the bundle.
+            nFee = -static_cast<CAmount>(wtx.tx->ct_bundle.transparent_fee);
+        } else {
+            nFee = wtx.tx->GetValueOut() - nDebit;
+        }
+    }
 
     entry.pushKV("amount", ValueFromAmount(nNet - nFee));
     if (CachedTxIsFromMe(*pwallet, wtx))

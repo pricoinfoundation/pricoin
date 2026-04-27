@@ -2027,11 +2027,20 @@ void Chainstate::InvalidBlockFound(CBlockIndex* pindex, const BlockValidationSta
 
 void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight)
 {
+    // Pricoin Phase 3a: v4 ring inputs don't actually consume their
+    // vin.prevout (which is a fixed-convention marker pointing to the first
+    // ring member, not the real signer). Real spent-ness is tracked
+    // exclusively by the global key-image set. Leaving the chainstate Coin
+    // intact is required so the same outpoint can serve as a decoy for
+    // future ring transactions.
+    const bool is_v4_ring = (tx.version == PRICOIN_CT_VERSION) &&
+                            !tx.ct_bundle.ring_inputs.empty();
     // mark inputs spent
     if (!tx.IsCoinBase()) {
         txundo.vprevout.reserve(tx.vin.size());
         for (const CTxIn &txin : tx.vin) {
             txundo.vprevout.emplace_back();
+            if (is_v4_ring) continue;
             bool is_spent = inputs.SpendCoin(txin.prevout, &txundo.vprevout.back());
             assert(is_spent);
         }
@@ -2259,8 +2268,14 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
                 LogError("DisconnectBlock(): transaction and undo data inconsistent\n");
                 return DISCONNECT_FAILED;
             }
+            // Pricoin Phase 3a: ring-input txs left the chainstate untouched
+            // at connect time (UpdateCoins skipped SpendCoin); skip the undo
+            // restore symmetrically. The undo entries will be empty Coins.
+            const bool is_v4_ring = (tx.version == PRICOIN_CT_VERSION) &&
+                                    !tx.ct_bundle.ring_inputs.empty();
             for (unsigned int j = tx.vin.size(); j > 0;) {
                 --j;
+                if (is_v4_ring) continue;
                 const COutPoint& out = tx.vin[j].prevout;
                 int res = ApplyTxInUndo(std::move(txundo.vprevout[j]), view, out);
                 if (res == DISCONNECT_FAILED) return DISCONNECT_FAILED;
@@ -2346,7 +2361,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // is enforced in ContextualCheckBlockHeader(); we wouldn't want to
     // re-enforce that rule here (at least until we make it impossible for
     // the clock to go backward).
-    if (!CheckBlock(block, state, params.GetConsensus(), !fJustCheck, !fJustCheck)) {
+    if (!CheckBlock(block, state, params.GetConsensus(), !fJustCheck, !fJustCheck, pindex->nHeight, &m_chain)) {
         if (state.GetResult() == BlockValidationResult::BLOCK_MUTATED) {
             // We don't write down blocks to disk if they may have been
             // corrupted, so this should be impossible unless we're having hardware
@@ -3865,13 +3880,21 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
     }
 }
 
-static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true)
+static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true, int height = -1, const CChain* chain = nullptr)
 {
-    // Check proof of work matches claimed amount.
     // Pricoin: PoW is RandomX over the serialized header; block identity hash
     // (block.GetHash()) is still SHA-256d so it can stay as the index/db key.
-    if (fCheckPOW && !CheckProofOfWork(pricoin::randomx::GetPoWHashOfHeader(block), block.nBits, consensusParams))
-        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
+    // Seed for the RandomX cache rotates every EPOCH_BLOCKS with EPOCH_LAG
+    // delay; the caller resolves the seed via (height, chain). For heights
+    // below EPOCH_LAG (or when caller doesn't have height context) the
+    // bootstrap seed is used.
+    if (fCheckPOW) {
+        const uint256 pow_hash = (height >= 0)
+            ? pricoin::randomx::GetPoWHashOfHeader(block, height, chain)
+            : pricoin::randomx::GetPoWHashOfHeader(block);
+        if (!CheckProofOfWork(pow_hash, block.nBits, consensusParams))
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
+    }
 
     return true;
 }
@@ -3957,7 +3980,7 @@ static bool CheckWitnessMalleation(const CBlock& block, bool expect_witness_comm
     return true;
 }
 
-bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW, bool fCheckMerkleRoot)
+bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW, bool fCheckMerkleRoot, int height, const CChain* chain)
 {
     // These are checks that are independent of context.
 
@@ -3966,7 +3989,7 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
 
     // Check that the header is valid (particularly PoW).  This is mostly
     // redundant with the call in AcceptBlockHeader.
-    if (!CheckBlockHeader(block, state, consensusParams, fCheckPOW))
+    if (!CheckBlockHeader(block, state, consensusParams, fCheckPOW, height, chain))
         return false;
 
     // Signet only: check block solution
@@ -4060,10 +4083,31 @@ void ChainstateManager::GenerateCoinbaseCommitment(CBlock& block, const CBlockIn
     UpdateUncommittedBlockStructures(block, pindexPrev);
 }
 
-bool HasValidProofOfWork(std::span<const CBlockHeader> headers, const Consensus::Params& consensusParams)
+bool HasValidProofOfWork(std::span<const CBlockHeader> headers, const Consensus::Params& consensusParams, const ChainstateManager* chainman)
 {
+    // Pricoin: resolve each header's RandomX seed via chainman->m_block_index.
+    // For each header, look up its parent by header.hashPrevBlock to derive
+    // height = parent.nHeight + 1, then walk to ComputeSeedHeight(height).
+    // If the parent isn't known (early header sync), or chainman is null,
+    // fall back to the bootstrap seed — only correct for heights < EPOCH_LAG.
     return std::ranges::all_of(headers,
-                               [&](const auto& header) { return CheckProofOfWork(pricoin::randomx::GetPoWHashOfHeader(header), header.nBits, consensusParams); });
+                               [&](const auto& header) {
+        uint256 pow_hash;
+        if (chainman) {
+            LOCK(::cs_main);
+            const auto& bm = chainman->m_blockman.m_block_index;
+            const auto it = bm.find(header.hashPrevBlock);
+            if (it != bm.end()) {
+                const int height = it->second.nHeight + 1;
+                pow_hash = pricoin::randomx::GetPoWHashOfHeader(header, height, &chainman->ActiveChain());
+            } else {
+                pow_hash = pricoin::randomx::GetPoWHashOfHeader(header);
+            }
+        } else {
+            pow_hash = pricoin::randomx::GetPoWHashOfHeader(header);
+        }
+        return CheckProofOfWork(pow_hash, header.nBits, consensusParams);
+    });
 }
 
 bool IsBlockMutated(const CBlock& block, bool check_witness_root)
@@ -4246,12 +4290,10 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
             return true;
         }
 
-        if (!CheckBlockHeader(block, state, GetConsensus())) {
-            LogDebug(BCLog::VALIDATION, "%s: Consensus::CheckBlockHeader: %s, %s\n", __func__, hash.ToString(), state.ToString());
-            return false;
-        }
-
-        // Get prev block index
+        // Pricoin: resolve the parent FIRST so we know our height for the
+        // RandomX seed. Original Bitcoin Core ordering checked PoW before
+        // parent lookup; we have to invert it because the PoW hash itself
+        // depends on the seed at ComputeSeedHeight(our_height).
         CBlockIndex* pindexPrev = nullptr;
         BlockMap::iterator mi{m_blockman.m_block_index.find(block.hashPrevBlock)};
         if (mi == m_blockman.m_block_index.end()) {
@@ -4263,6 +4305,13 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
             LogDebug(BCLog::VALIDATION, "header %s has prev block invalid: %s\n", hash.ToString(), block.hashPrevBlock.ToString());
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_PREV, "bad-prevblk");
         }
+        const int new_height = pindexPrev->nHeight + 1;
+
+        if (!CheckBlockHeader(block, state, GetConsensus(), /*fCheckPOW=*/true, new_height, &ActiveChain())) {
+            LogDebug(BCLog::VALIDATION, "%s: Consensus::CheckBlockHeader: %s, %s\n", __func__, hash.ToString(), state.ToString());
+            return false;
+        }
+
         if (!ContextualCheckBlockHeader(block, state, *this, pindexPrev)) {
             LogDebug(BCLog::VALIDATION, "%s: Consensus::ContextualCheckBlockHeader: %s, %s\n", __func__, hash.ToString(), state.ToString());
             return false;
@@ -4389,7 +4438,7 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
 
     const CChainParams& params{GetParams()};
 
-    if (!CheckBlock(block, state, params.GetConsensus()) ||
+    if (!CheckBlock(block, state, params.GetConsensus(), /*fCheckPOW=*/true, /*fCheckMerkleRoot=*/true, pindex->nHeight, &ActiveChain()) ||
         !ContextualCheckBlock(block, state, *this, pindex->pprev)) {
         if (Assume(state.IsInvalid())) {
             ActiveChainstate().InvalidBlockFound(pindex, state);
@@ -4455,7 +4504,20 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
         // malleability that cause CheckBlock() to fail; see e.g. CVE-2012-2459 and
         // https://lists.linuxfoundation.org/pipermail/bitcoin-dev/2019-February/016697.html.  Because CheckBlock() is
         // not very expensive, the anti-DoS benefits of caching failure (of a definitely-invalid block) are not substantial.
-        bool ret = CheckBlock(*block, state, GetConsensus());
+        // Pricoin: resolve height for the RandomX seed lookup. If the parent
+        // isn't known yet, fall back to bootstrap (the validator at
+        // AcceptBlockHeader will redo the PoW with the proper height once
+        // the header passes anti-DoS checks).
+        int new_height = -1;
+        const CChain* chain = nullptr;
+        {
+            const auto it = m_blockman.m_block_index.find(block->hashPrevBlock);
+            if (it != m_blockman.m_block_index.end()) {
+                new_height = it->second.nHeight + 1;
+                chain = &ActiveChain();
+            }
+        }
+        bool ret = CheckBlock(*block, state, GetConsensus(), /*fCheckPOW=*/true, /*fCheckMerkleRoot=*/true, new_height, chain);
         if (ret) {
             // Store to disk
             ret = AcceptBlock(block, state, &pindex, force_processing, nullptr, new_block, min_pow_checked);

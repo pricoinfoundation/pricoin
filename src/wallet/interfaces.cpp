@@ -24,10 +24,13 @@
 #include <wallet/feebumper.h>
 #include <wallet/fees.h>
 #include <wallet/load.h>
+#include <wallet/pricoin_ct_send.h>
+#include <wallet/pricoin_stealth.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/wallet.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
+#include <pricoin/stealth.h>
 
 #include <memory>
 #include <string>
@@ -152,6 +155,30 @@ public:
     void abortRescan() override { m_wallet->AbortRescan(); }
     bool backupWallet(const std::string& filename) override { return m_wallet->BackupWallet(filename); }
     std::string getWalletName() override { return m_wallet->GetName(); }
+    std::string getStealthAddress() override
+    {
+        try {
+            const auto& id = ::wallet::pricoin_stealth::GetOrCreate(*m_wallet);
+            return ::pricoin::stealth::Encode(id.public_address);
+        } catch (...) {
+            return {};
+        }
+    }
+    util::Result<uint256> sendConfidential(
+        const std::string& dest_stealth_address,
+        CAmount amount,
+        CAmount fee) override
+    {
+        return ::wallet::SendConfidentialTx(*m_wallet, dest_stealth_address, amount, fee);
+    }
+    CAmount confidentialBalance() override
+    {
+        try {
+            return ::wallet::ConfidentialBalance(*m_wallet);
+        } catch (...) {
+            return 0;
+        }
+    }
     util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label) override
     {
         LOCK(m_wallet->cs_wallet);

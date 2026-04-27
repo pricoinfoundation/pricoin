@@ -15,12 +15,22 @@
 #include <qt/recentrequeststablemodel.h>
 #include <qt/walletmodel.h>
 
+#include <interfaces/wallet.h>
+
 #include <QAction>
+#include <QApplication>
+#include <QClipboard>
 #include <QCursor>
+#include <QGroupBox>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
 #include <QMessageBox>
+#include <QPushButton>
 #include <QScrollBar>
 #include <QSettings>
 #include <QTextDocument>
+#include <QVBoxLayout>
 
 ReceiveCoinsDialog::ReceiveCoinsDialog(const PlatformStyle *_platformStyle, QWidget *parent) :
     QDialog(parent, GUIUtil::dialog_flags),
@@ -28,6 +38,41 @@ ReceiveCoinsDialog::ReceiveCoinsDialog(const PlatformStyle *_platformStyle, QWid
     platformStyle(_platformStyle)
 {
     ui->setupUi(this);
+
+    // Pricoin Phase A: surface this wallet's reusable stealth address. Any
+    // confidential payment to us comes via a one-time output derived from
+    // this address, so it's the right "give this to a sender" string. The
+    // transparent payment-request flow below is for receiving mining-coinbase
+    // funds onto our own wallet (e.g. for funding walletsendct).
+    {
+        auto* group = new QGroupBox(tr("Stealth address (for confidential receives)"), this);
+        auto* glay = new QVBoxLayout(group);
+
+        auto* note = new QLabel(tr(
+            "Share this address with senders. It is reusable — every payment to it "
+            "produces a fresh one-time output on chain, so two payments cannot be "
+            "linked by an outside observer."), this);
+        note->setWordWrap(true);
+        glay->addWidget(note);
+
+        auto* row = new QHBoxLayout();
+        m_stealthAddressEdit = new QLineEdit(this);
+        m_stealthAddressEdit->setReadOnly(true);
+        m_stealthAddressEdit->setPlaceholderText(tr("(load a wallet to see its stealth address)"));
+        row->addWidget(m_stealthAddressEdit);
+        auto* copyBtn = new QPushButton(tr("Copy"), this);
+        connect(copyBtn, &QPushButton::clicked, this, [this]{
+            if (m_stealthAddressEdit && !m_stealthAddressEdit->text().isEmpty()) {
+                QApplication::clipboard()->setText(m_stealthAddressEdit->text());
+            }
+        });
+        row->addWidget(copyBtn);
+        glay->addLayout(row);
+
+        if (auto* dlay = qobject_cast<QVBoxLayout*>(layout())) {
+            dlay->insertWidget(0, group);
+        }
+    }
 
     if (!_platformStyle->getImagesOnButtons()) {
         ui->clearButton->setIcon(QIcon());
@@ -71,6 +116,11 @@ ReceiveCoinsDialog::ReceiveCoinsDialog(const PlatformStyle *_platformStyle, QWid
 void ReceiveCoinsDialog::setModel(WalletModel *_model)
 {
     this->model = _model;
+
+    if (_model && m_stealthAddressEdit) {
+        const std::string s = _model->wallet().getStealthAddress();
+        m_stealthAddressEdit->setText(QString::fromStdString(s));
+    }
 
     if(_model && _model->getOptionsModel())
     {

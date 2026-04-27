@@ -165,9 +165,13 @@ TransactionView::TransactionView(const PlatformStyle *platformStyle, QWidget *pa
     contextMenu->addAction(tr("Copy full transaction &details"), this, &TransactionView::copyTxPlainText);
     contextMenu->addAction(tr("&Show transaction details"), this, &TransactionView::showDetails);
     contextMenu->addSeparator();
+    // Pricoin: bumpfee builds a transparent v2 replacement, which consensus
+    // now rejects (bad-non-pct-non-coinbase). Hide the menu entry. A CT-aware
+    // bump-fee path is a future Phase B item.
     bumpFeeAction = contextMenu->addAction(tr("Increase transaction &fee"));
     GUIUtil::ExceptionSafeConnect(bumpFeeAction, &QAction::triggered, this, &TransactionView::bumpFee);
     bumpFeeAction->setObjectName("bumpFeeAction");
+    bumpFeeAction->setVisible(false);
     abandonAction = contextMenu->addAction(tr("A&bandon transaction"), this, &TransactionView::abandonTx);
     contextMenu->addAction(tr("&Edit address label"), this, &TransactionView::editLabel);
 

@@ -22,6 +22,12 @@
 
 bool PreCheckEphemeralTx(const CTransaction& tx, CFeeRate dust_relay_rate, CAmount base_fee, CAmount mod_fee, TxValidationState& state)
 {
+    // Pricoin: v4 confidential transactions carry a transparent fee inside
+    // the bundle and serialize each output with nValue=0 (real values live
+    // in commitments). The ephemeral-dust rule would otherwise reject any
+    // CT tx that pays a fee. Skip the rule for v4.
+    if (tx.version == PRICOIN_CT_VERSION) return true;
+
     // We never want to give incentives to mine this transaction alone
     if ((base_fee != 0 || mod_fee != 0) && !GetDust(tx, dust_relay_rate).empty()) {
         return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "dust", "tx with dust output must be 0-fee");

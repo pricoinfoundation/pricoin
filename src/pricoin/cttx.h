@@ -139,8 +139,21 @@ uint256 HashBundle(const CTBundle& bundle);
 // result as a compressed 33-byte pubkey. Used by ring-signature verifiers
 // to compute W_i = C_i - C_pseudo for each ring member. Returns nullopt on
 // any cryptographic parse failure.
+//
+// Implementation note: serializes each commitment, swaps prefix 8↔2 / 9↔3,
+// parses as pubkey. The resulting pubkey may be at +y or -y of the actual
+// commitment point (parity depends on point's is_square vs is_even — these
+// are independent on secp256k1). Both sender and verifier use this function,
+// so they get the SAME byte serialization for any given commitment, making
+// the math consistent. Senders that need their secret z to satisfy z*G == W
+// must call ScalarMatchesPoint() and negate z if necessary.
 std::optional<std::array<unsigned char, 33>> SubtractCommitments(
     const Commitment& C1, const Commitment& C2);
+
+// Compute scalar*G as a 33-byte compressed pubkey. Used by ring-sig signers
+// to verify that their secret z (built from blind arithmetic) actually
+// matches the W point the verifier will see for their ring index.
+std::optional<std::array<unsigned char, 33>> ScalarTimesG(const BlindingFactor& s);
 
 // Negate a 32-byte scalar mod n (i.e., return n - x). Returns nullopt if x
 // is not a valid scalar.

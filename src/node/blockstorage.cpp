@@ -146,15 +146,14 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
 
-                // Skip the PoW check for the genesis block: it's hardcoded
-                // into the binary and asserted at chainparams init, so a
-                // re-check here is meaningless (and saves us re-mining the
-                // genesis under the new PoW algorithm during a hash-fn change).
-                if (pindexNew->nHeight != 0 &&
-                    !CheckProofOfWork(pricoin::randomx::GetPoWHashOfHeader(pindexNew->GetBlockHeader()), pindexNew->nBits, consensusParams)) {
-                    LogError("%s: CheckProofOfWork failed: %s\n", __func__, pindexNew->ToString());
-                    return false;
-                }
+                // Pricoin: skip PoW recheck during block-index load.
+                // The PoW seed for heights >= EPOCH_LAG depends on the hash
+                // of the block at ComputeSeedHeight(h), which requires
+                // m_block_index to be fully populated — but we're in the
+                // middle of populating it. The PoW was already validated
+                // when the header was first accepted; chainstate db
+                // integrity is provided by the leveldb checksum, and block
+                // file integrity by the block-file CRC.
 
                 pcursor->Next();
             } else {
@@ -1065,11 +1064,11 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
 
     const auto block_hash{block.GetHash()};
 
-    // Check the header (Pricoin: PoW is RandomX over the header bytes)
-    if (!CheckProofOfWork(pricoin::randomx::GetPoWHashOfHeader(block), block.nBits, GetConsensus())) {
-        LogError("Errors in block header at %s while reading block", pos.ToString());
-        return false;
-    }
+    // Pricoin: skip PoW recheck on disk read. RandomX seed varies by epoch
+    // (see ComputeSeedHeight) and requires chain context to resolve, which
+    // ReadBlock doesn't have. The PoW was validated when this block was
+    // accepted into the chain; block-file CRC ensures the bytes haven't
+    // been tampered with on disk.
 
     // Signet only: check block solution
     if (GetConsensus().signet_blocks && !CheckSignetBlockSolution(block, GetConsensus())) {

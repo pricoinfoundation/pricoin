@@ -9,6 +9,7 @@
 #include <script/script.h>
 #include <util/moneystr.h>
 #include <wallet/coincontrol.h>
+#include <wallet/pricoin_ct_send.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/util.h>
 #include <wallet/spend.h>
@@ -206,7 +207,12 @@ RPCMethod getbalance()
 
     const auto bal = GetBalance(*pwallet, min_depth, avoid_reuse);
 
-    return ValueFromAmount(bal.m_mine_trusted);
+    // Pricoin: also include the recovered confidential balance so callers
+    // see their full holdings, not just transparent UTXOs.
+    CAmount ct_balance = 0;
+    try { ct_balance = ::wallet::ConfidentialBalance(const_cast<CWallet&>(*pwallet)); } catch (...) {}
+
+    return ValueFromAmount(bal.m_mine_trusted + ct_balance);
 },
     };
 }
@@ -414,6 +420,7 @@ RPCMethod getbalances()
                     {RPCResult::Type::STR_AMOUNT, "immature", "balance from immature coinbase outputs"},
                     {RPCResult::Type::STR_AMOUNT, "nonmempool", "sum of coins that are spent by transactions not in the mempool (usually an over-estimate due to not accounting for change or spends that conflict with each other)"},
                     {RPCResult::Type::STR_AMOUNT, "used", /*optional=*/true, "(only present if avoid_reuse is set) balance from coins sent to addresses that were previously spent from (potentially privacy violating)"},
+                    {RPCResult::Type::STR_AMOUNT, "confidential", "Pricoin: total recovered value across confidential (v4) outputs paid to this wallet's stealth identity, excluding ones whose KI has been committed (i.e., spent)."},
                 }},
                 RESULT_LAST_PROCESSED_BLOCK,
             }
@@ -445,6 +452,11 @@ RPCMethod getbalances()
         if (wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE)) {
             balances_mine.pushKV("used", ValueFromAmount(bal.m_mine_used));
         }
+        // Pricoin: surface the confidential (CT) balance separately so
+        // tooling can distinguish transparent UTXOs from recovered CT.
+        CAmount ct_balance = 0;
+        try { ct_balance = ::wallet::ConfidentialBalance(const_cast<CWallet&>(wallet)); } catch (...) {}
+        balances_mine.pushKV("confidential", ValueFromAmount(ct_balance));
         balances.pushKV("mine", std::move(balances_mine));
     }
     AppendLastProcessedBlock(balances, wallet);

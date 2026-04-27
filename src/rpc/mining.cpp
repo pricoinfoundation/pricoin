@@ -140,7 +140,17 @@ static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t&
     block_out.reset();
     block.hashMerkleRoot = BlockMerkleRoot(block);
 
-    while (max_tries > 0 && block.nNonce < std::numeric_limits<uint32_t>::max() && !CheckProofOfWork(pricoin::randomx::GetPoWHashOfHeader(block), block.nBits, chainman.GetConsensus()) && !chainman.m_interrupt) {
+    // Pricoin: pin the RandomX seed to the epoch of the block being mined.
+    // The new block's height is tip+1 (we're building it on top of the
+    // current tip), so resolve the seed via the active chain at that height.
+    const int new_height = chainman.ActiveChain().Height() + 1;
+    const uint256 seed_hash = [&] {
+        const int seed_height = pricoin::randomx::ComputeSeedHeight(new_height);
+        if (seed_height == 0) return pricoin::randomx::BootstrapSeedHash();
+        const CBlockIndex* idx = chainman.ActiveChain()[seed_height];
+        return idx ? idx->GetBlockHash() : pricoin::randomx::BootstrapSeedHash();
+    }();
+    while (max_tries > 0 && block.nNonce < std::numeric_limits<uint32_t>::max() && !CheckProofOfWork(pricoin::randomx::GetPoWHashOfHeader(block, seed_hash), block.nBits, chainman.GetConsensus()) && !chainman.m_interrupt) {
         ++block.nNonce;
         --max_tries;
     }

@@ -33,12 +33,22 @@ using Point = std::array<unsigned char, kPointBytes>;   // compressed pubkey
 using Scalar = std::array<unsigned char, kScalarBytes>; // 32-byte scalar mod n
 
 struct Signature {
-    Point key_image{};                   // I
+    // Standard CLSAG key image: I = x_pi · H_p(P_pi). This is what consensus
+    // checks against the global KI set for double-spend prevention. It is
+    // *tx-invariant* — the same (P, x) signed under any ring/msg/pseudo
+    // produces the same KI.
+    Point key_image{};
+    // Multi-layer commitment image: D = z_pi · H_p(P_pi). Required for
+    // multi-layer CLSAG verification (binds the chosen ring member's
+    // commitment to the pseudo). All-zero for single-layer signatures —
+    // verifiers infer the layer from this field.
+    Point commitment_image{};
     Scalar c0{};                          // initial challenge (closes the ring)
     std::vector<Scalar> s;                // s_0 .. s_{N-1}, parallel to ring
 
     SERIALIZE_METHODS(Signature, obj) {
         READWRITE(obj.key_image);
+        READWRITE(obj.commitment_image);
         READWRITE(obj.c0);
         READWRITE(obj.s);
     }
@@ -68,6 +78,12 @@ bool Verify(
 // Tagged hash-to-point: return a point on secp256k1 deterministically
 // derived from the input bytes. Used internally as H_p; exposed for tests.
 Point HashToPoint(std::span<const unsigned char> seed);
+
+// Compute the key image I = x · H_p(P) for a (P, x) keypair. Used by
+// wallet-side bookkeeping to determine whether one of our recovered
+// outputs has been spent on chain (its KI would appear in the global
+// committed-KI set). Returns nullopt on cryptographic failure.
+std::optional<Point> ComputeKeyImage(const Point& P, const Scalar& x);
 
 // Multi-layer (RingCT-style) ring with commitment-offset row.
 // Each ring member has a spend pubkey P_i and a commitment-offset W_i.

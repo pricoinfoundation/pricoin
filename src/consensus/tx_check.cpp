@@ -106,6 +106,12 @@ bool CheckTransaction(const CTransaction& tx, TxValidationState& state)
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-fee-toolarge");
         }
     } else {
+        // Pricoin: privacy is mandatory. The only allowed non-v4 transactions
+        // are coinbases (subsidy is auditable; coinbase stays transparent).
+        // Any other transparent transfer is rejected at consensus.
+        if (!tx.IsCoinBase()) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-non-pct-non-coinbase");
+        }
         // Non-CT versions must not carry a CT bundle.
         if (!tx.ct_bundle.input_commitments.empty() ||
             !tx.ct_bundle.outputs.empty() ||

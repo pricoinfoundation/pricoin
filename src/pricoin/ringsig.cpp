@@ -163,6 +163,18 @@ Scalar StepChallenge(
 
 } // namespace
 
+std::optional<Point> ComputeKeyImage(const Point& P, const Scalar& x)
+{
+    LOCK(g_mutex);
+    Point Hp = HashToPointInternal(std::span<const unsigned char>{P.data(), P.size()});
+    secp256k1_pubkey Hp_pub;
+    if (!ParsePoint(Hp, Hp_pub)) return std::nullopt;
+    if (!secp256k1_ec_pubkey_tweak_mul(Ctx(), &Hp_pub, x.data())) return std::nullopt;
+    Point ki;
+    if (!SerializePoint(Hp_pub, ki)) return std::nullopt;
+    return ki;
+}
+
 Point HashToPoint(std::span<const unsigned char> seed)
 {
     LOCK(g_mutex);
@@ -282,9 +294,13 @@ bool Verify(
 namespace {
 
 // Compute μ-weights for the multi-layer aggregation: μ_P, μ_C are scalars
-// derived from a hash of all (P_i, W_i) pairs. Distinct prefixes for the
-// two rows ensure they're independent.
-std::pair<Scalar, Scalar> MultiLayerMu(std::span<const MultiLayerMember> ring)
+// derived from a hash of all (P_i, W_i) pairs **plus** the (KI, D) pair.
+// Binding μ to (KI, D) prevents an attacker from substituting fake KIs after
+// the fact. Distinct tag prefixes for the two rows ensure they're independent.
+std::pair<Scalar, Scalar> MultiLayerMu(
+    std::span<const MultiLayerMember> ring,
+    const Point& KI,
+    const Point& D)
     EXCLUSIVE_LOCKS_REQUIRED(g_mutex)
 {
     std::vector<unsigned char> ring_blob;
@@ -294,13 +310,44 @@ std::pair<Scalar, Scalar> MultiLayerMu(std::span<const MultiLayerMember> ring)
         ring_blob.insert(ring_blob.end(), m.W.begin(), m.W.end());
     }
     auto mu = [&](const char* tag) {
-        std::span<const unsigned char> chunks_arr[2]{
+        std::span<const unsigned char> chunks_arr[4]{
             std::span<const unsigned char>{reinterpret_cast<const unsigned char*>(tag), std::strlen(tag)},
             std::span<const unsigned char>{ring_blob},
+            std::span<const unsigned char>{KI.data(), KI.size()},
+            std::span<const unsigned char>{D.data(),  D.size()},
         };
-        return HashToScalar(std::span<const std::span<const unsigned char>>{chunks_arr, 2});
+        return HashToScalar(std::span<const std::span<const unsigned char>>{chunks_arr, 4});
     };
-    return {mu("agg/P/v1"), mu("agg/C/v1")};
+    return {mu("pricoin/clsag/agg/P/v2"), mu("pricoin/clsag/agg/C/v2")};
+}
+
+// Multi-layer step challenge: c_{i+1} = H(ring_full || msg || L_i || R_i || KI || D).
+// Distinct from single-layer StepChallenge so the two domains can't collide.
+Scalar StepChallengeML(
+    std::span<const MultiLayerMember> ring,
+    const uint256& msg,
+    const Point& L_i,
+    const Point& R_i,
+    const Point& KI,
+    const Point& D) EXCLUSIVE_LOCKS_REQUIRED(g_mutex)
+{
+    std::vector<unsigned char> ring_blob;
+    ring_blob.reserve(ring.size() * (kPointBytes * 2));
+    for (const auto& m : ring) {
+        ring_blob.insert(ring_blob.end(), m.P.begin(), m.P.end());
+        ring_blob.insert(ring_blob.end(), m.W.begin(), m.W.end());
+    }
+    static constexpr char tag[] = "pricoin/clsag/step/v2";
+    std::span<const unsigned char> chunks_arr[7]{
+        std::span<const unsigned char>{reinterpret_cast<const unsigned char*>(tag), sizeof(tag) - 1},
+        std::span<const unsigned char>{ring_blob},
+        std::span<const unsigned char>{msg.data(), msg.size()},
+        std::span<const unsigned char>{L_i.data(), L_i.size()},
+        std::span<const unsigned char>{R_i.data(), R_i.size()},
+        std::span<const unsigned char>{KI.data(), KI.size()},
+        std::span<const unsigned char>{D.data(),  D.size()},
+    };
+    return HashToScalar(std::span<const std::span<const unsigned char>>{chunks_arr, 7});
 }
 
 // Aggregate a single ring member: out = μ_P*P + μ_C*W
@@ -332,6 +379,12 @@ bool AggregateScalar(const Scalar& x, const Scalar& z, const Scalar& mu_P, const
 
 } // namespace
 
+// Phase 4d (2026-04-27): proper multi-layer CLSAG. KI = x_pi · H_p(P_pi) and
+// D = z_pi · H_p(P_pi) are both based on H_p(P_pi) — *tx-invariant*. The
+// signing walks an "aggregated ring" T_i = μ_P·P_i + μ_C·W_i with priv
+// a = μ_P·x_pi + μ_C·z_pi and image I_agg = μ_P·KI + μ_C·D = a·H_p(P_pi),
+// but the R term in each step uses H_p(P_i) (the spend pubkey hash), so the
+// published KI stays standard.
 std::optional<Signature> SignMultiLayer(
     std::span<const MultiLayerMember> ring,
     size_t pi,
@@ -340,18 +393,105 @@ std::optional<Signature> SignMultiLayer(
     const uint256& msg)
 {
     if (ring.empty() || pi >= ring.size()) return std::nullopt;
+    LOCK(g_mutex);
 
-    std::vector<Point> agg_ring(ring.size());
-    Scalar agg_priv;
+    // Sanity: x_pi · G == ring[pi].P, z_pi · G == ring[pi].W.
     {
-        LOCK(g_mutex);
-        const auto [mu_P, mu_C] = MultiLayerMu(ring);
-        for (size_t i = 0; i < ring.size(); ++i) {
-            if (!AggregateMember(ring[i], mu_P, mu_C, agg_ring[i])) return std::nullopt;
-        }
-        if (!AggregateScalar(x_pi, z_pi, mu_P, mu_C, agg_priv)) return std::nullopt;
+        secp256k1_pubkey pk;
+        Point bytes;
+        if (!secp256k1_ec_pubkey_create(Ctx(), &pk, x_pi.data())) return std::nullopt;
+        if (!SerializePoint(pk, bytes)) return std::nullopt;
+        if (bytes != ring[pi].P) return std::nullopt;
+        if (!secp256k1_ec_pubkey_create(Ctx(), &pk, z_pi.data())) return std::nullopt;
+        if (!SerializePoint(pk, bytes)) return std::nullopt;
+        if (bytes != ring[pi].W) return std::nullopt;
     }
-    return Sign(std::span<const Point>{agg_ring}, pi, agg_priv, msg);
+
+    Signature sig;
+    sig.s.resize(ring.size());
+
+    // Hp_P_pi = H_p(P_pi). Used for both KIs (KI, D) and for R_pi.
+    Point Hp_P_pi = HashToPointInternal(std::span<const unsigned char>{ring[pi].P.data(), ring[pi].P.size()});
+
+    // KI = x_pi · Hp_P_pi
+    {
+        secp256k1_pubkey hp;
+        if (!ParsePoint(Hp_P_pi, hp)) return std::nullopt;
+        if (!secp256k1_ec_pubkey_tweak_mul(Ctx(), &hp, x_pi.data())) return std::nullopt;
+        if (!SerializePoint(hp, sig.key_image)) return std::nullopt;
+    }
+    // D = z_pi · Hp_P_pi
+    {
+        secp256k1_pubkey hp;
+        if (!ParsePoint(Hp_P_pi, hp)) return std::nullopt;
+        if (!secp256k1_ec_pubkey_tweak_mul(Ctx(), &hp, z_pi.data())) return std::nullopt;
+        if (!SerializePoint(hp, sig.commitment_image)) return std::nullopt;
+    }
+
+    // μ_P, μ_C bind to (ring, KI, D)
+    const auto [mu_P, mu_C] = MultiLayerMu(ring, sig.key_image, sig.commitment_image);
+
+    // T_i = μ_P · P_i + μ_C · W_i for each i; aggregated public ring.
+    std::vector<Point> T(ring.size());
+    for (size_t i = 0; i < ring.size(); ++i) {
+        if (!AggregateMember(ring[i], mu_P, mu_C, T[i])) return std::nullopt;
+    }
+    // I_agg = μ_P · KI + μ_C · D = a · Hp_P_pi
+    Point I_agg;
+    {
+        MultiLayerMember imgs{sig.key_image, sig.commitment_image};
+        if (!AggregateMember(imgs, mu_P, mu_C, I_agg)) return std::nullopt;
+    }
+    // a = μ_P · x_pi + μ_C · z_pi (mod n) — aggregated priv at pi.
+    Scalar a;
+    if (!AggregateScalar(x_pi, z_pi, mu_P, mu_C, a)) return std::nullopt;
+
+    // alpha random; L_pi = alpha · G, R_pi = alpha · Hp_P_pi.
+    Scalar alpha;
+    do { GetRandBytes(alpha); } while (!secp256k1_ec_seckey_verify(Ctx(), alpha.data()));
+    Point L_pi, R_pi;
+    {
+        secp256k1_pubkey aG;
+        if (!secp256k1_ec_pubkey_create(Ctx(), &aG, alpha.data())) return std::nullopt;
+        if (!SerializePoint(aG, L_pi)) return std::nullopt;
+        secp256k1_pubkey aHp;
+        if (!ParsePoint(Hp_P_pi, aHp)) return std::nullopt;
+        if (!secp256k1_ec_pubkey_tweak_mul(Ctx(), &aHp, alpha.data())) return std::nullopt;
+        if (!SerializePoint(aHp, R_pi)) return std::nullopt;
+    }
+
+    const size_t N = ring.size();
+    std::vector<Scalar> c(N);
+    c[(pi + 1) % N] = StepChallengeML(ring, msg, L_pi, R_pi, sig.key_image, sig.commitment_image);
+
+    // Walk the ring forward from pi+1 back to pi.
+    for (size_t step = 1; step < N; ++step) {
+        const size_t i = (pi + step) % N;
+        do { GetRandBytes(sig.s[i]); } while (!secp256k1_ec_seckey_verify(Ctx(), sig.s[i].data()));
+        // L_i = s_i · G + c_i · T_i
+        Point L_i;
+        {
+            secp256k1_pubkey T_pub;
+            if (!ParsePoint(T[i], T_pub)) return std::nullopt;
+            if (!LinComb_sG_plus_cP(sig.s[i], c[i], T_pub, L_i)) return std::nullopt;
+        }
+        // R_i = s_i · H_p(P_i) + c_i · I_agg
+        Point Hp_P_i = HashToPointInternal(std::span<const unsigned char>{ring[i].P.data(), ring[i].P.size()});
+        Point R_i;
+        if (!LinComb_sQ_plus_cR(sig.s[i], Hp_P_i, c[i], I_agg, R_i)) return std::nullopt;
+
+        c[(i + 1) % N] = StepChallengeML(ring, msg, L_i, R_i, sig.key_image, sig.commitment_image);
+    }
+
+    // Close: s_pi = alpha - c_pi · a (mod n).
+    Scalar s_pi = a;
+    if (!secp256k1_ec_seckey_tweak_mul(Ctx(), s_pi.data(), c[pi].data())) return std::nullopt;
+    if (!secp256k1_ec_seckey_negate(Ctx(), s_pi.data())) return std::nullopt;
+    if (!secp256k1_ec_seckey_tweak_add(Ctx(), s_pi.data(), alpha.data())) return std::nullopt;
+    if (!secp256k1_ec_seckey_verify(Ctx(), s_pi.data())) return std::nullopt;
+    sig.s[pi] = s_pi;
+    sig.c0 = c[0];
+    return sig;
 }
 
 bool VerifyMultiLayer(
@@ -360,15 +500,49 @@ bool VerifyMultiLayer(
     const uint256& msg)
 {
     if (ring.empty()) return false;
-    std::vector<Point> agg_ring(ring.size());
+    if (sig.s.size() != ring.size()) return false;
+    LOCK(g_mutex);
+
+    // Validate KI and D parse.
     {
-        LOCK(g_mutex);
-        const auto [mu_P, mu_C] = MultiLayerMu(ring);
-        for (size_t i = 0; i < ring.size(); ++i) {
-            if (!AggregateMember(ring[i], mu_P, mu_C, agg_ring[i])) return false;
-        }
+        secp256k1_pubkey tmp;
+        if (!ParsePoint(sig.key_image, tmp)) return false;
+        if (!ParsePoint(sig.commitment_image, tmp)) return false;
     }
-    return Verify(std::span<const Point>{agg_ring}, sig, msg);
+
+    // Recompute μ_P, μ_C from ring + KI + D.
+    const auto [mu_P, mu_C] = MultiLayerMu(ring, sig.key_image, sig.commitment_image);
+
+    // Recompute T_i and I_agg.
+    std::vector<Point> T(ring.size());
+    for (size_t i = 0; i < ring.size(); ++i) {
+        if (!AggregateMember(ring[i], mu_P, mu_C, T[i])) return false;
+    }
+    Point I_agg;
+    {
+        MultiLayerMember imgs{sig.key_image, sig.commitment_image};
+        if (!AggregateMember(imgs, mu_P, mu_C, I_agg)) return false;
+    }
+
+    const size_t N = ring.size();
+    Scalar c = sig.c0;
+    for (size_t i = 0; i < N; ++i) {
+        // L_i = s_i · G + c_i · T_i
+        Point L_i;
+        {
+            secp256k1_pubkey T_pub;
+            if (!ParsePoint(T[i], T_pub)) return false;
+            if (!LinComb_sG_plus_cP(sig.s[i], c, T_pub, L_i)) return false;
+        }
+        // R_i = s_i · H_p(P_i) + c_i · I_agg
+        Point Hp_P_i = HashToPointInternal(std::span<const unsigned char>{ring[i].P.data(), ring[i].P.size()});
+        Point R_i;
+        if (!LinComb_sQ_plus_cR(sig.s[i], Hp_P_i, c, I_agg, R_i)) return false;
+
+        c = StepChallengeML(ring, msg, L_i, R_i, sig.key_image, sig.commitment_image);
+    }
+    // Ring closes when the recomputed c after N steps matches the published c0.
+    return c == sig.c0;
 }
 
 void RunSelfTest()
@@ -466,6 +640,43 @@ void RunSelfTest()
     auto wrong2 = SignMultiLayer(std::span<const MultiLayerMember>{ring2}, pi, privs[pi], zs[(pi + 1) % N], msg);
     if (wrong2) {
         throw std::runtime_error("ringsig multi-layer self-test: SignMultiLayer should reject wrong z");
+    }
+
+    // Phase 4d invariant: the published key image is x_pi · H_p(P_pi) and
+    // does NOT depend on z_pi or W_pi. Sign the same (P_pi, x_pi) under a
+    // *different* W_pi (different z_pi) — sig.key_image must match.
+    {
+        std::vector<Scalar> zs_alt(N);
+        std::vector<MultiLayerMember> ring3 = ring2;
+        for (size_t i = 0; i < N; ++i) {
+            while (true) {
+                GetRandBytes(zs_alt[i]);
+                LOCK(g_mutex);
+                if (secp256k1_ec_seckey_verify(Ctx(), zs_alt[i].data())) break;
+            }
+            secp256k1_pubkey W_pk;
+            {
+                LOCK(g_mutex);
+                if (!secp256k1_ec_pubkey_create(Ctx(), &W_pk, zs_alt[i].data())) {
+                    throw std::runtime_error("ringsig 4d self-test: pubkey_create alt W failed");
+                }
+                if (!SerializePoint(W_pk, ring3[i].W)) {
+                    throw std::runtime_error("ringsig 4d self-test: serialize alt W failed");
+                }
+            }
+        }
+        auto sig3 = SignMultiLayer(std::span<const MultiLayerMember>{ring3}, pi, privs[pi], zs_alt[pi], msg);
+        if (!sig3) throw std::runtime_error("ringsig 4d self-test: SignMultiLayer returned nullopt for alt W");
+        if (sig3->key_image != sig2->key_image) {
+            throw std::runtime_error("ringsig 4d self-test: KI is not tx-invariant");
+        }
+        // D should differ (depends on z), but KI must match.
+        if (sig3->commitment_image == sig2->commitment_image) {
+            throw std::runtime_error("ringsig 4d self-test: D should depend on z but didn't");
+        }
+        if (!VerifyMultiLayer(std::span<const MultiLayerMember>{ring3}, *sig3, msg)) {
+            throw std::runtime_error("ringsig 4d self-test: alt-W sig should still verify");
+        }
     }
 }
 

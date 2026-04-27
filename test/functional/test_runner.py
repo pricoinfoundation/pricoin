@@ -98,6 +98,8 @@ TOOL_BENCH_SANITY_CHECK = "tool_bench_sanity_check.py"
 BASE_SCRIPTS = [
     # Special scripts that are "expanded" later
     TOOL_BENCH_SANITY_CHECK,
+    # Pricoin-specific tests.
+    'feature_pricoin_ct.py',
     # Scripts that are run by default.
     # Longest test should go first, to favor running tests in parallel
     # vv Tests less than 5m vv
@@ -395,6 +397,101 @@ BASE_SCRIPTS = [
 # Place EXTENDED_SCRIPTS first since it has the 3 longest running tests
 ALL_SCRIPTS = EXTENDED_SCRIPTS + BASE_SCRIPTS
 
+# Pricoin: tests that are incompatible with privacy-mandatory consensus
+# (only v4 confidential txs are valid for non-coinbase). Added to --exclude
+# automatically when --pricoin is passed. Each entry should carry a one-
+# line reason in the comment so future maintainers know whether a test was
+# disabled by mistake vs. intentionally.
+PRICOIN_KNOWN_BROKEN = [
+    # Wallet send paths that build transparent v2 txs (stubbed RPCs).
+    'wallet_basic.py',                   # sendtoaddress / sendmany backbone
+    'wallet_balance.py',                 # asserts transparent balance accounting
+    'wallet_address_types.py',           # exercises sendtoaddress to each addr type
+    'wallet_avoid_mixing_output_types.py',
+    'wallet_avoidreuse.py',
+    'wallet_backup.py',                  # restore + sendtoaddress flow
+    'wallet_backwards_compatibility.py',
+    'wallet_bumpfee.py',                 # bumpfee stubbed
+    'wallet_change_address.py',
+    'wallet_conflicts.py',
+    'wallet_create_tx.py',
+    'wallet_descriptor.py',
+    'wallet_fallbackfee.py',
+    'wallet_fundrawtransaction.py',      # fundrawtransaction stubbed
+    'wallet_groups.py',
+    'wallet_hd.py',
+    'wallet_import_rescan.py',
+    'wallet_importdescriptors.py',
+    'wallet_importprunedfunds.py',
+    'wallet_keypool.py',
+    'wallet_keypool_topup.py',
+    'wallet_listreceivedby.py',
+    'wallet_listsinceblock.py',
+    'wallet_listtransactions.py',
+    'wallet_migration.py',
+    'wallet_miniscript.py',
+    'wallet_multiwallet.py',
+    'wallet_orphanedreward.py',
+    'wallet_pruning.py',                 # -prune is rejected
+    'wallet_reorgsrestore.py',
+    'wallet_reset.py',
+    'wallet_resendwallettransactions.py',
+    'wallet_send.py',                    # `send` RPC stubbed
+    'wallet_sendall.py',                 # `sendall` RPC stubbed
+    'wallet_signer.py',
+    'wallet_signmessagewithaddress.py',
+    'wallet_signrawtransactionwithwallet.py',
+    'wallet_simulaterawtransaction.py',
+    'wallet_startup.py',
+    'wallet_taproot.py',
+    'wallet_timestamps.py',
+    'wallet_transactiontime_rescan.py',
+    'wallet_txn_clone.py',
+    'wallet_txn_doublespend.py',
+    'wallet_upgradewallet.py',
+    'wallet_watchonly.py',
+    'wallet_zapwallettxes.py',
+    # Mempool / fee / RBF tests built around transparent tx flow.
+    'feature_rbf.py',
+    'feature_fee_estimation.py',
+    'feature_segwit.py',
+    'feature_taproot.py',
+    'feature_block.py',                  # constructs v1 txs directly
+    'feature_dersig.py',
+    'feature_cltv.py',
+    'feature_csv_activation.py',
+    'feature_nulldummy.py',
+    'feature_assumevalid.py',
+    'feature_bip68_sequence.py',
+    'feature_versionbits_warning.py',
+    'mempool_accept.py',
+    'mempool_dust.py',
+    'mempool_ephemeral_dust.py',
+    'mempool_packages.py',
+    'mempool_package_limits.py',
+    'mempool_package_onemore.py',
+    'mempool_persist.py',
+    'mempool_reorg.py',
+    'mempool_replace_by_fee.py',
+    'mempool_resurrect.py',
+    'mempool_sigoplimit.py',
+    'mempool_spend_coinbase.py',
+    'mempool_truc.py',
+    'mempool_unbroadcast.py',
+    'mempool_updatefromblock.py',
+    # PSBT / sign-with-key tests.
+    'rpc_psbt.py',                        # uses fundrawtransaction + walletcreatefundedpsbt
+    'rpc_signrawtransaction.py',
+    'rpc_signrawtransactionwithkey.py',
+    'rpc_rawtransaction.py',
+    # CLI / interface flows that exercise transparent send.
+    'interface_bitcoin_cli.py',
+    'interface_http.py',
+    'interface_zmq.py',
+    'tool_wallet.py',
+    'tool_signet_miner.py',
+]
+
 NON_SCRIPTS = [
     # These are python files that live in the functional tests directory, but are not test scripts.
     "combine_logs.py",
@@ -414,6 +511,7 @@ def main():
     parser.add_argument('--combinedlogslen', '-c', type=int, default=0, metavar='n', help='On failure, print a log (of length n lines) to the console, combined from the test framework and all test nodes.')
     parser.add_argument('--coverage', action='store_true', help='generate a basic coverage report for the RPC interface')
     parser.add_argument('--exclude', '-x', action='append', help='specify a script to exclude. Can be specified multiple times. The .py extension is optional.')
+    parser.add_argument('--pricoin', action='store_true', help='Pricoin: skip Bitcoin Core tests known to be incompatible with privacy-mandatory consensus (see PRICOIN_KNOWN_BROKEN). Implicitly adds the broken set to --exclude.')
     parser.add_argument('--extended', action='store_true', help='run the extended test suite in addition to the basic tests')
     parser.add_argument('--help', '-h', '-?', action='store_true', help='print help text and exit')
     parser.add_argument('--jobs', '-j', type=int, default=4, help='how many test scripts to run in parallel. Default=4.')
@@ -502,6 +600,15 @@ def main():
     else:
         # Run base tests only
         test_list += BASE_SCRIPTS
+
+    # Pricoin: fold the privacy-mandatory denylist into --exclude. Only add
+    # entries that actually exist in test_list to avoid spurious warnings
+    # when a denylist entry isn't part of the active script set.
+    if args.pricoin:
+        if not args.exclude:
+            args.exclude = []
+        existing = {t.split()[0] for t in test_list}
+        args.exclude.extend(t for t in PRICOIN_KNOWN_BROKEN if t in existing)
 
     # Remove the test cases that the user has explicitly asked to exclude.
     # The user can specify a test case with or without the .py extension.
