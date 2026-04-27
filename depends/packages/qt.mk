@@ -213,6 +213,14 @@ ifeq ($(host_os),linux)
 # https://qt-project.atlassian.net/browse/QTBUG-144864
 $(package)_cmake_opts += -DINPUT_dbus=runtime
 endif
+ifeq ($(host_os),mingw32)
+# Pricoin: Qt 6.8 enables Intel CET (-fcf-protection=full -mshstk) by default
+# when the compiler advertises support, but mingw-w64 GCC 10/11 (which ships
+# in Ubuntu 22.04 and is what GHA uses for the Windows cross-build) ICEs in
+# i386_pe_seh_unwind_emit on certain PCRE2 sources with that combination.
+# Disabling the intelcet feature forces Qt to skip those flags.
+$(package)_cmake_opts += -DFEATURE_intelcet=OFF
+endif
 ifeq ($(host_os),darwin)
 $(package)_cmake_opts += -DCMAKE_INSTALL_NAME_TOOL=true
 $(package)_cmake_opts += -DCMAKE_FRAMEWORK_PATH=$(OSX_SDK)/System/Library/Frameworks

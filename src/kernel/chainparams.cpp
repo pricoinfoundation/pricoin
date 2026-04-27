@@ -70,7 +70,7 @@ static CBlock CreateGenesisBlock(const char* pszTimestamp, const CScript& genesi
 // PRICOIN_MINE_GENESIS=1 — without it, the daemon assumes the asserts
 // are accurate and skips mining.
 namespace {
-void MineGenesisIfRequested(CBlock& genesis, std::string_view chain_name)
+void MineGenesisIfRequested(CBlock& genesis, std::string_view chain_name, const uint256& pow_limit)
 {
     if (std::getenv("PRICOIN_MINE_GENESIS") == nullptr) return;
 
@@ -80,6 +80,18 @@ void MineGenesisIfRequested(CBlock& genesis, std::string_view chain_name)
     if (fNegative || fOverflow || target == 0) {
         LogInfo("Pricoin genesis miner: invalid nBits %08x for %s",
                  genesis.nBits, chain_name);
+        std::exit(1);
+    }
+    // Catch the specific footgun where `nBits` decodes to a target above the
+    // chain's powLimit: the miner happily finds a hash under that target, but
+    // CheckProofOfWork rejects every such block at validation. Bail with a
+    // loud error so the operator picks a stricter nBits or relaxes powLimit.
+    if (target > UintToArith256(pow_limit)) {
+        std::fprintf(stderr,
+            "Pricoin genesis miner: target derived from nBits=%08x exceeds "
+            "consensus.powLimit for %s; CheckProofOfWork would reject every "
+            "mined block. Tighten nBits or relax powLimit.\n",
+            genesis.nBits, std::string(chain_name).c_str());
         std::exit(1);
     }
 
@@ -155,7 +167,13 @@ public:
         consensus.CSVHeight = 419328; // 000000000000000004a1b34462cb8aeebd5799177f7a29cf28f2d1961716b5b5
         consensus.SegwitHeight = 481824; // 0000000000000000001c8018d9cb3b742ef25114f27563e3fc4a1902167f9893
         consensus.MinBIP9WarningHeight = 711648; // taproot activation height + miner confirmation window
-        consensus.powLimit = uint256{"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+        // Pricoin: brand-new chain with a small initial network. We start with
+        // the maximum-permissive limit (regtest-style `7fff…`) so the genesis
+        // can be mined cheaply and difficulty retargeting can pull nBits up
+        // from there as real hashrate arrives. This is a deliberate launch
+        // choice for a toy/educational fork — Bitcoin-mainnet's much tighter
+        // limit (`00000000ffff…`) wouldn't allow the easy launch nBits.
+        consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 302400; // 3.5 days (Pricoin: 2016 blocks per retarget at 150s spacing)
         consensus.nPowTargetSpacing = 150; // 2.5 minutes
         consensus.fPowAllowMinDifficultyBlocks = false;
@@ -182,15 +200,18 @@ public:
         pchMessageStart[3] = 0xda;
         nDefaultPort = 9543;
         nPruneAfterHeight = 100000;
-        m_assumed_blockchain_size = 856;
-        m_assumed_chain_state_size = 14;
+        // Pricoin: brand-new chain. Update these as the network grows; they
+        // only drive the disk-space warning at startup and the GUI's
+        // "approximate size" hint, not consensus.
+        m_assumed_blockchain_size = 1;
+        m_assumed_chain_state_size = 1;
 
         // Pricoin mainnet genesis.
         genesis = CreateGenesisBlock(
             "Pricoin main 2026/04/27 confidential amounts stealth ring",
             CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
             /*nTime=*/1735689600, /*nNonce=*/7, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
-        MineGenesisIfRequested(genesis, "main");
+        MineGenesisIfRequested(genesis, "main", consensus.powLimit);
         consensus.hashGenesisBlock = genesis.GetHash();
         if (!ShouldSkipGenesisAssert()) {
             assert(consensus.hashGenesisBlock == uint256{"74d901710791d97a44d75c9d066a712e79dec2857de3433bbf496548c2012e75"});
@@ -287,7 +308,8 @@ public:
         consensus.CSVHeight = 770112; // 00000000025e930139bac5c6c31a403776da130831ab85be56578f3fa75369bb
         consensus.SegwitHeight = 834624; // 00000000002b980fcd729daaa248fd9316a5200e9b367f4ff2c42453e84201ca
         consensus.MinBIP9WarningHeight = 2013984; // taproot activation height + miner confirmation window
-        consensus.powLimit = uint256{"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+        // Pricoin: see CMainParams — relaxed to allow nBits=0x207fffff genesis.
+        consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 302400; // 3.5 days
         consensus.nPowTargetSpacing = 150; // 2.5 minutes
         consensus.fPowAllowMinDifficultyBlocks = true;
@@ -309,8 +331,9 @@ public:
         pchMessageStart[3] = 0x08;
         nDefaultPort = 19543;
         nPruneAfterHeight = 1000;
-        m_assumed_blockchain_size = 245;
-        m_assumed_chain_state_size = 19;
+        // Pricoin: brand-new chain — see CMainParams.
+        m_assumed_blockchain_size = 1;
+        m_assumed_chain_state_size = 1;
 
         // Pricoin testnet3 genesis. Same low-difficulty target as mainnet
         // genesis under our RandomX scheme; DAA takes over after.
@@ -318,7 +341,7 @@ public:
             "Pricoin test 2026/04/27 confidential amounts stealth ring",
             CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
             /*nTime=*/1735689600, /*nNonce=*/1, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
-        MineGenesisIfRequested(genesis, "test");
+        MineGenesisIfRequested(genesis, "test", consensus.powLimit);
         consensus.hashGenesisBlock = genesis.GetHash();
         if (!ShouldSkipGenesisAssert()) {
             assert(consensus.hashGenesisBlock == uint256{"efc39ecb553fe8086145e8d6454c03ccccfd9b691a64335a2042d11ebab69390"});
@@ -389,7 +412,8 @@ public:
         consensus.CSVHeight = 1;
         consensus.SegwitHeight = 1;
         consensus.MinBIP9WarningHeight = 0;
-        consensus.powLimit = uint256{"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+        // Pricoin: see CMainParams — relaxed to allow nBits=0x207fffff genesis.
+        consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 302400; // 3.5 days
         consensus.nPowTargetSpacing = 150; // 2.5 minutes
         consensus.fPowAllowMinDifficultyBlocks = true;
@@ -412,15 +436,16 @@ public:
         pchMessageStart[3] = 0x29;
         nDefaultPort = 49543;
         nPruneAfterHeight = 1000;
-        m_assumed_blockchain_size = 31;
-        m_assumed_chain_state_size = 2;
+        // Pricoin: brand-new chain — see CMainParams.
+        m_assumed_blockchain_size = 1;
+        m_assumed_chain_state_size = 1;
 
         // Pricoin testnet4 genesis.
         genesis = CreateGenesisBlock(
             "Pricoin testnet4 2026/04/27 confidential amounts stealth ring",
             CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
             /*nTime=*/1735689600, /*nNonce=*/2, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
-        MineGenesisIfRequested(genesis, "testnet4");
+        MineGenesisIfRequested(genesis, "testnet4", consensus.powLimit);
         consensus.hashGenesisBlock = genesis.GetHash();
         if (!ShouldSkipGenesisAssert()) {
             assert(consensus.hashGenesisBlock == uint256{"175b25f5b16e37c7b483c266285e279c728960883d674c6984e5feab0b031248"});
@@ -492,8 +517,9 @@ public:
 
             consensus.nMinimumChainWork = uint256{"00000000000000000000000000000000000000000000000000000b463ea0a4b8"};
             consensus.defaultAssumeValid = uint256{"00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329"}; // 293175
-            m_assumed_blockchain_size = 24;
-            m_assumed_chain_state_size = 4;
+            // Pricoin: brand-new chain — see CMainParams.
+            m_assumed_blockchain_size = 1;
+            m_assumed_chain_state_size = 1;
             chainTxData = ChainTxData{
                 // Data from RPC: getchaintxstats 4096 00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329
                 .nTime    = 1772055248,
@@ -534,7 +560,8 @@ public:
         consensus.enforce_BIP94 = false;
         consensus.fPowNoRetargeting = false;
         consensus.MinBIP9WarningHeight = 0;
-        consensus.powLimit = uint256{"00000377ae000000000000000000000000000000000000000000000000000000"};
+        // Pricoin: see CMainParams — relaxed to allow nBits=0x207fffff genesis.
+        consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
@@ -556,7 +583,7 @@ public:
             "Pricoin signet 2026/04/27 confidential amounts stealth ring",
             CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
             /*nTime=*/1735689600, /*nNonce=*/3, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
-        MineGenesisIfRequested(genesis, "signet");
+        MineGenesisIfRequested(genesis, "signet", consensus.powLimit);
         consensus.hashGenesisBlock = genesis.GetHash();
         if (!ShouldSkipGenesisAssert()) {
             assert(consensus.hashGenesisBlock == uint256{"ff5426ed83e4392cff094d8027699ba7812947ad4619078c3f51f2e1dc5896e3"});
@@ -674,7 +701,7 @@ public:
             "Pricoin regtest 2026/04/27 confidential amounts stealth ring",
             CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
             /*nTime=*/1735689600, /*nNonce=*/1, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
-        MineGenesisIfRequested(genesis, "regtest");
+        MineGenesisIfRequested(genesis, "regtest", consensus.powLimit);
         consensus.hashGenesisBlock = genesis.GetHash();
         if (!ShouldSkipGenesisAssert()) {
             assert(consensus.hashGenesisBlock == uint256{"bf1e5c0d41c4a20ee7b99f99ace476e67b17a9d5abd188a1aac424361550b3d8"});

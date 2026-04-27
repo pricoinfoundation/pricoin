@@ -192,7 +192,10 @@ jobs:
           # needs the hint. The prefix differs by arch (/opt/homebrew on arm64,
           # /usr/local on Intel).
           CMAKE_PREFIX_PATH: ${{ matrix.brew_prefix }}/opt/qt@6:${{ matrix.brew_prefix }}/opt/sqlite:${{ matrix.brew_prefix }}/opt/libevent:${{ matrix.brew_prefix }}/opt/zeromq:${{ matrix.brew_prefix }}/opt/boost
-        run: cmake -S . -B build -G Ninja -DBUILD_GUI=ON -DWITH_QRENCODE=OFF -DCMAKE_BUILD_TYPE=Release
+        # Disable IPC (multiprocess) support — would require Cap'n Proto and
+        # we don't ship the separated bitcoin-node/bitcoin-wallet binaries
+        # for macOS. Linux builds get capnp through depends/.
+        run: cmake -S . -B build -G Ninja -DBUILD_GUI=ON -DWITH_QRENCODE=OFF -DENABLE_IPC=OFF -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build -j "$(sysctl -n hw.ncpu)"
