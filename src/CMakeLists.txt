@@ -74,6 +74,7 @@ add_library(bitcoin_consensus STATIC EXCLUDE_FROM_ALL
   hash.cpp
   primitives/block.cpp
   primitives/transaction.cpp
+  pricoin/cttx_hash.cpp
   pubkey.cpp
   script/interpreter.cpp
   script/script.cpp

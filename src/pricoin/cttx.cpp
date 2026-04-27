@@ -117,14 +117,9 @@ std::optional<CTBuildResult> BuildBundle(
     return result;
 }
 
-uint256 HashBundle(const CTBundle& bundle)
-{
-    HashWriter hw{};
-    hw << bundle;
-    // Plain SHA-256 (single, not double) — matches Bitcoin's HashWriter::GetSHA256
-    // pattern used for sighash subhashes.
-    return hw.GetSHA256();
-}
+// HashBundle moved to pricoin/cttx_hash.cpp so it can live in
+// bitcoin_consensus (script/interpreter.cpp's sighash path needs it),
+// without dragging the rest of cttx.cpp's Pedersen helpers along.
 
 namespace {
 

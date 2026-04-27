@@ -1,9 +1,9 @@
 Pricoin
 =======
 
-> **Status: experimental / educational fork.** Bugs in confidential
-> transactions or ring signatures break privacy *silently* without breaking
-> consensus. Do not use this code with real money.
+> **Status: experimental fork.** Bugs in confidential
+> transactions or ring signatures can break privacy *silently* without breaking
+> consensus. Pricoin is a fork of Bitcoin Core 31.0.
 
 Pricoin (ticker **PRIC**) is a Bitcoin Core fork that swaps Bitcoin's
 transparent transactions for a privacy-mandatory model inspired by Monero:

@@ -45,6 +45,7 @@ add_library(bitcoinkernel
   ../pow/randomx_pricoin.cpp
   ../pricoin/ct.cpp
   ../pricoin/cttx.cpp
+  ../pricoin/cttx_hash.cpp
   ../pricoin/validation.cpp
   ../primitives/block.cpp
   ../primitives/transaction.cpp
