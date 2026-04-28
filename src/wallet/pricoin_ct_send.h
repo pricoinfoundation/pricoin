@@ -9,19 +9,38 @@
 #include <uint256.h>
 #include <util/result.h>
 
+#include <span>
 #include <string>
+#include <vector>
 
 namespace wallet {
 
 class CWallet;
 
-// Build, sign, and broadcast a Pricoin v4 confidential transaction:
-//   - Funds from a P2WPKH wallet UTXO with value >= amount + fee
-//   - Sends `amount` to `dest_address` (stealth or transparent bech32)
-//   - Sends change to the wallet's own stealth identity
-//   - Pays a transparent `fee`
-// Returns the broadcast txid on success. Used by both the JSON-RPC layer
-// (`walletsendct`) and the Qt GUI's interfaces::Wallet::sendConfidential.
+// One destination in a multi-recipient Pricoin Confidential Transaction.
+struct PricoinCTRecipient {
+    std::string address;  // stealth (H6...) or transparent bech32
+    CAmount amount;       // in satoshis; must be > 0
+};
+
+// Build, sign, and broadcast a Pricoin v4 confidential transaction with
+// arbitrarily many recipients in a single bundle:
+//   - Funds from N P2WPKH wallet UTXOs covering Σamounts + fee
+//   - Each recipient gets its own one-time stealth output
+//   - Single change output back to the wallet's own stealth identity
+//   - Pays a single transparent `fee`
+// All recipients are co-anonymized inside one tx, which both saves wire
+// bytes (one rangeproof set, one signature set per input) and prevents
+// the "N sequential pool payouts" fingerprint from leaking who paid whom.
+util::Result<uint256> SendConfidentialTxMulti(
+    CWallet& wallet,
+    std::span<const PricoinCTRecipient> recipients,
+    CAmount fee);
+
+// Single-recipient convenience wrapper. Identical behavior to the multi
+// form with recipients={(dest_address, amount)}. Used by both the
+// JSON-RPC layer (`walletsendct`) and the Qt GUI's
+// interfaces::Wallet::sendConfidential.
 util::Result<uint256> SendConfidentialTx(
     CWallet& wallet,
     const std::string& dest_address,

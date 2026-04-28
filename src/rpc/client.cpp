@@ -170,6 +170,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "pricoin_ct_send", 6, "fee" },
     { "walletsendct", 1, "dest_amount" },
     { "walletsendct", 2, "fee" },
+    { "walletsendct_multi", 0, "recipients" },
+    { "walletsendct_multi", 1, "fee" },
     { "walletsendct_from_ct", 1, "dest_amount" },
     { "walletsendct_from_ct", 2, "fee" },
     { "walletsendct_ring", 1, "dest_amount" },

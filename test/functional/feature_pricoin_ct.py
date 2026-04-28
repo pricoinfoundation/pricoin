@@ -129,6 +129,50 @@ class PricoinCTTest(BitcoinTestFramework):
                      if abs(float(o["value"]) - 7.0) < 1e-8]
         assert len(bob_seven) == 1, "bob should have recovered one 7 PRIC CT output"
 
+        # ---- 2c. multi-recipient (walletsendct_multi) ----
+        # One bundle pays bob, carol, and alice (own stealth — exercises the
+        # self-receive scan path) in a single v4 tx. Three recipients +
+        # one change = four outputs. Pool payout code path; replaces what
+        # would otherwise be three separate v4 txs (~3× rangeproofs, ~3×
+        # input-signature sets).
+        bob_pre   = bob.getbalances()["mine"]["confidential"]
+        carol_pre = carol.getbalances()["mine"]["confidential"]
+        alice_pre = alice.getbalances()["mine"]["confidential"]
+
+        multi_pay = alice.walletsendct_multi(
+            [{"address": bob_stealth,   "amount": 2.0},
+             {"address": carol_stealth, "amount": 3.0},
+             {"address": alice_stealth, "amount": 4.0}],
+            0.0001)
+        assert_equal(multi_pay["recipients"], 3)
+        assert_equal(multi_pay["outputs"], 4)              # 3 dest + 1 change
+        assert_equal(float(multi_pay["total_sent"]), 9.0)
+        assert_equal(float(multi_pay["fee"]), 0.0001)
+
+        multi_pay_raw = node.decoderawtransaction(node.getrawtransaction(multi_pay["txid"]))
+        assert_equal(multi_pay_raw["version"], 4)
+        assert_equal(len(multi_pay_raw["vout"]), 4)        # consensus vout matches bundle
+
+        self.generatetoaddress(node, 1, alice_addr)
+
+        # All three recipients recover their respective amounts.
+        # Bob and carol gain exactly their dest amount (no change accrues to them).
+        assert_equal(bob.getbalances()["mine"]["confidential"]   - bob_pre,   2.0)
+        assert_equal(carol.getbalances()["mine"]["confidential"] - carol_pre, 3.0)
+        # Alice gains her 4 PRIC dest **plus** the change (alice is the sender,
+        # change goes back to her own stealth). So the balance delta is >4 by
+        # exactly the change amount; the dest leg shows up as a distinct
+        # 4-PRIC output in her listownct set.
+        alice_post = alice.getbalances()["mine"]["confidential"]
+        assert_greater_than(alice_post - alice_pre, 4.0)
+        alice_4 = [o for o in alice.pricoin_listownct(0)["outputs"]
+                   if abs(float(o["value"]) - 4.0) < 1e-8]
+        assert_equal(len(alice_4), 1)
+
+        # Empty recipients array must be rejected.
+        assert_raises_rpc_error(-8, "recipients array is empty",
+                                alice.walletsendct_multi, [], 0.0001)
+
         # ---- 3. KI persistence + reject-after-restart ----
         self.restart_node(0, extra_args=["-txindex=1"])
         node = self.nodes[0]
