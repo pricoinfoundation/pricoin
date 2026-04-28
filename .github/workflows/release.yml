@@ -212,6 +212,10 @@ jobs:
         # Bitcoin Core's bitcoin.icns is left over and has the wrong
         # branding; macdeployqtplus already copied that file in. Regenerate
         # in-place from the master Pricoin logo before DMG'ing.
+        # macdeployqtplus writes the deployed bundle (with bundled Qt
+        # frameworks and rewritten install_names) to build/dist/, leaving
+        # build/Pricoin-Qt.app un-deployed — patch the icns in the deployed
+        # copy.
         run: |
           ICONSET=icon.iconset
           rm -rf "$ICONSET"; mkdir "$ICONSET"
@@ -226,7 +230,19 @@ jobs:
           cp "$ICONSET/icon_512x512.png"   "$ICONSET/icon_256x256@2x.png"
           cp "$ICONSET/icon_1024x1024.png" "$ICONSET/icon_512x512@2x.png"
           rm -f "$ICONSET/icon_64x64.png" "$ICONSET/icon_1024x1024.png"
-          iconutil -c icns "$ICONSET" -o build/Pricoin-Qt.app/Contents/Resources/bitcoin.icns
+          iconutil -c icns "$ICONSET" -o build/dist/Pricoin-Qt.app/Contents/Resources/bitcoin.icns
+
+      - name: Verify Qt frameworks are bundled
+        # Catches future regressions where the deploy step silently produces
+        # a bundle pointing at the host's Homebrew Qt — the symptom users
+        # see is a dyld "Library not loaded: /opt/homebrew/..." crash.
+        run: |
+          APP=build/dist/Pricoin-Qt.app
+          test -d "$APP/Contents/Frameworks/QtWidgets.framework" \
+            || { echo "ERROR: QtWidgets.framework missing from bundle"; exit 1; }
+          if otool -L "$APP/Contents/MacOS/Pricoin-Qt" | grep -E '/opt/homebrew|/usr/local/Cellar'; then
+            echo "ERROR: binary still references host Qt paths"; exit 1
+          fi
 
       - name: Build .dmg
         run: |
@@ -234,8 +250,9 @@ jobs:
           DMG="dist/pricoin-${{ needs.resolve-tag.outputs.tag }}-arm64-macos.dmg"
           # Stage the .app + a Drag-to-Applications symlink so the user can
           # install with one drag. UDZO = compressed read-only DMG.
+          # macdeployqtplus writes the bundled .app to build/dist/.
           STAGE=$(mktemp -d)
-          cp -R build/Pricoin-Qt.app "$STAGE/"
+          cp -R build/dist/Pricoin-Qt.app "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
           hdiutil create \
             -volname "Pricoin-Qt ${{ needs.resolve-tag.outputs.tag }}" \
