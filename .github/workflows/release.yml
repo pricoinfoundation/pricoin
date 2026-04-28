@@ -311,6 +311,16 @@ jobs:
             echo "- **Windows (x86_64)** — pricoin-qt.exe"
             echo "- **macOS (arm64)** — Pricoin-Qt.app inside a .dmg; runs on x86_64 Macs via Rosetta 2"
             echo ""
+            echo "## macOS: clear Gatekeeper quarantine"
+            echo ""
+            echo "The .dmg is unsigned and not notarized, so on first launch macOS will block the app with \"Pricoin-Qt is damaged and can't be opened\" or a similar Gatekeeper warning. After dragging Pricoin-Qt.app into /Applications, strip the quarantine xattr:"
+            echo ""
+            echo '```bash'
+            echo "xattr -cr /Applications/Pricoin-Qt.app"
+            echo '```'
+            echo ""
+            echo "Then double-click as normal."
+            echo ""
             echo "Toy/educational fork of Bitcoin Core. Privacy-mandatory: only v4 confidential transactions are valid. See README.md for build prerequisites and CLI usage."
           } > release_body.md
 
