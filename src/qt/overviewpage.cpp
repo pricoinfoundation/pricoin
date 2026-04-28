@@ -233,10 +233,14 @@ void OverviewPage::setBalance(const interfaces::WalletBalances& balances)
     ui->labelImmature->setVisible(showImmature);
     ui->labelImmatureText->setVisible(showImmature);
 
-    if (m_pricoin_ct_label && walletModel) {
-        const CAmount ct = walletModel->wallet().confidentialBalance();
+    if (m_pricoin_ct_label) {
+        // Read from the snapshot so the displayed CT balance always
+        // matches the transparent figures from the same poll. Calling
+        // wallet().confidentialBalance() separately re-locks the wallet
+        // and could race against an in-flight scan.
         m_pricoin_ct_label->setText(BitcoinUnits::formatWithPrivacy(
-            unit, ct, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
+            unit, balances.confidential_balance,
+            BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
     }
 }
 

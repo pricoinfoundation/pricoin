@@ -391,12 +391,14 @@ struct WalletBalances
     CAmount immature_balance = 0;
     CAmount used_balance = 0;
     CAmount nonmempool_balance = 0;
+    CAmount confidential_balance = 0;   // Pricoin: sum of recovered v4 CT outputs
 
     bool balanceChanged(const WalletBalances& prev) const
     {
         return balance != prev.balance || unconfirmed_balance != prev.unconfirmed_balance ||
                immature_balance != prev.immature_balance ||
-               used_balance != prev.used_balance || nonmempool_balance != prev.nonmempool_balance;
+               used_balance != prev.used_balance || nonmempool_balance != prev.nonmempool_balance ||
+               confidential_balance != prev.confidential_balance;
     }
 };
 

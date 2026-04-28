@@ -19,12 +19,10 @@
 namespace node {
 Warnings::Warnings()
 {
-    // Pre-release build warning
-    if (!CLIENT_VERSION_IS_RELEASE) {
-        m_warnings.insert(
-            {Warning::PRE_RELEASE_TEST_BUILD,
-             _("This is a pre-release test build - use at your own risk - do not use for mining or merchant applications")});
-    }
+    // Pricoin: pre-release banner intentionally suppressed. Toy/educational
+    // status is documented in the README; surfacing it as a top-of-window
+    // warning makes the GUI feel like a beta build to end users without
+    // adding any actionable information.
 }
 bool Warnings::Set(warning_type id, bilingual_str message)
 {

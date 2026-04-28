@@ -110,6 +110,24 @@ QString TransactionDesc::toHTML(interfaces::Node& node, interfaces::Wallet& wall
     int64_t nTime = wtx.time;
     CAmount nCredit = wtx.credit;
     CAmount nDebit = wtx.debit;
+
+    // Pricoin: for v4 confidential transactions, IsMine returns false on
+    // every stealth one-time output, so wtx.credit is always 0 even when
+    // we recovered value via the rangeproof rewind. Mirror the fast-path
+    // in qt/transactionrecord.cpp::decomposeTransaction by reading the
+    // recovered values stashed in value_map under "pct_v<i>".
+    if (wtx.tx->version == PRICOIN_CT_VERSION) {
+        CAmount ct_credit = 0;
+        for (size_t i = 0; i < wtx.tx->vout.size(); ++i) {
+            const std::string vk = "pct_v" + std::to_string(i);
+            auto it = wtx.value_map.find(vk);
+            if (it == wtx.value_map.end()) continue;
+            const CAmount v = std::strtoll(it->second.c_str(), nullptr, 10);
+            if (v > 0) ct_credit += v;
+        }
+        nCredit = ct_credit;
+    }
+
     CAmount nNet = nCredit - nDebit;
 
     strHTML += "<b>" + tr("Status") + ":</b> " + FormatTxStatus(status, inMempool);
