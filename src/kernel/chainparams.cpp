@@ -180,7 +180,7 @@ public:
         // choice for a toy/educational fork — Bitcoin-mainnet's much tighter
         // limit (`00000000ffff…`) wouldn't allow the easy launch nBits.
         consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
-        consensus.nPowTargetTimespan = 302400; // 3.5 days (Pricoin: 2016 blocks per retarget at 150s spacing)
+        consensus.nPowTargetTimespan = 43200; // 12 hours (Pricoin: 288 blocks per retarget at 150s spacing)
         consensus.nPowTargetSpacing = 150; // 2.5 minutes
         consensus.fPowAllowMinDifficultyBlocks = false;
         consensus.enforce_BIP94 = false;
@@ -218,14 +218,14 @@ public:
 
         // Pricoin mainnet genesis.
         genesis = CreateGenesisBlock(
-            "Pricoin main 2026/04/27 confidential amounts stealth ring",
+            "Pricoin main 2026/04/29 confidential amounts stealth ring",
             CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
-            /*nTime=*/1735689600, /*nNonce=*/7, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
+            /*nTime=*/1777420800, /*nNonce=*/0, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
         MineGenesisIfRequested(genesis, "main", consensus.powLimit);
         consensus.hashGenesisBlock = genesis.GetHash();
         if (!ShouldSkipGenesisAssert()) {
-            assert(consensus.hashGenesisBlock == uint256{"74d901710791d97a44d75c9d066a712e79dec2857de3433bbf496548c2012e75"});
-            assert(genesis.hashMerkleRoot == uint256{"3b82c1782f70fc6a1318dcbbd0b9513db2c7e38d38a2a5973ecdc5f205a33794"});
+            assert(consensus.hashGenesisBlock == uint256{"24e422e08dde75fe0f0016d9170bb6724d6970dc6df6adbcdd220225d06a827f"});
+            assert(genesis.hashMerkleRoot == uint256{"bf3f2fce2d30fbd874bd703fd5502c2abce1dde9aac21d871aaea9febb16db8b"});
         }
 
         // Note that of those which support the service bits prefix, most only support a subset of
@@ -321,7 +321,7 @@ public:
         consensus.MinBIP9WarningHeight = 0;
         // Pricoin: see CMainParams — relaxed to allow nBits=0x207fffff genesis.
         consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
-        consensus.nPowTargetTimespan = 302400; // 3.5 days
+        consensus.nPowTargetTimespan = 43200; // 12 hours
         consensus.nPowTargetSpacing = 150; // 2.5 minutes
         consensus.fPowAllowMinDifficultyBlocks = true;
         consensus.enforce_BIP94 = false;
@@ -350,14 +350,14 @@ public:
         // Pricoin testnet3 genesis. Same low-difficulty target as mainnet
         // genesis under our RandomX scheme; DAA takes over after.
         genesis = CreateGenesisBlock(
-            "Pricoin test 2026/04/27 confidential amounts stealth ring",
+            "Pricoin test 2026/04/29 confidential amounts stealth ring",
             CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
-            /*nTime=*/1735689600, /*nNonce=*/1, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
+            /*nTime=*/1777420800, /*nNonce=*/6, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
         MineGenesisIfRequested(genesis, "test", consensus.powLimit);
         consensus.hashGenesisBlock = genesis.GetHash();
         if (!ShouldSkipGenesisAssert()) {
-            assert(consensus.hashGenesisBlock == uint256{"efc39ecb553fe8086145e8d6454c03ccccfd9b691a64335a2042d11ebab69390"});
-            assert(genesis.hashMerkleRoot == uint256{"58bc5f91f6f7c59fb3dec348d6ec517a61f5d46fbbec237a4333e0219b2c2dad"});
+            assert(consensus.hashGenesisBlock == uint256{"5570e9dc66c242b7c0d5c5acd42b5ff811fdee0618adfad1860b7df4ade1048a"});
+            assert(genesis.hashMerkleRoot == uint256{"071164c03d7fc7815728ea793a52e9f02005f15a9e3ab57c1b9ead7a0948d06f"});
         }
 
         vFixedSeeds.clear();
@@ -426,7 +426,7 @@ public:
         consensus.MinBIP9WarningHeight = 0;
         // Pricoin: see CMainParams — relaxed to allow nBits=0x207fffff genesis.
         consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
-        consensus.nPowTargetTimespan = 302400; // 3.5 days
+        consensus.nPowTargetTimespan = 43200; // 12 hours
         consensus.nPowTargetSpacing = 150; // 2.5 minutes
         consensus.fPowAllowMinDifficultyBlocks = true;
         consensus.enforce_BIP94 = true;
@@ -455,14 +455,14 @@ public:
 
         // Pricoin testnet4 genesis.
         genesis = CreateGenesisBlock(
-            "Pricoin testnet4 2026/04/27 confidential amounts stealth ring",
+            "Pricoin testnet4 2026/04/29 confidential amounts stealth ring",
             CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
-            /*nTime=*/1735689600, /*nNonce=*/2, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
+            /*nTime=*/1777420800, /*nNonce=*/0, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
         MineGenesisIfRequested(genesis, "testnet4", consensus.powLimit);
         consensus.hashGenesisBlock = genesis.GetHash();
         if (!ShouldSkipGenesisAssert()) {
-            assert(consensus.hashGenesisBlock == uint256{"175b25f5b16e37c7b483c266285e279c728960883d674c6984e5feab0b031248"});
-            assert(genesis.hashMerkleRoot == uint256{"65336f76a25ac3f179768ab4d1b40d5ef85ebce567c1cbe34811e76a5262c9a0"});
+            assert(consensus.hashGenesisBlock == uint256{"095b0cf5917cfa4ad80e8d616d82537f2fadcc15a6157f1569d9b0db8ca92216"});
+            assert(genesis.hashMerkleRoot == uint256{"ca62b62b09c62bb3790c2bf4917040f46052b9a194b13ef11da6a963526b7c34"});
         }
 
         vFixedSeeds.clear();
@@ -568,7 +568,7 @@ public:
         consensus.BIP66Height = 1;
         consensus.CSVHeight = 1;
         consensus.SegwitHeight = 1;
-        consensus.nPowTargetTimespan = 302400; // 3.5 days
+        consensus.nPowTargetTimespan = 43200; // 12 hours
         consensus.nPowTargetSpacing = 150; // 2.5 minutes
         consensus.fPowAllowMinDifficultyBlocks = false;
         consensus.enforce_BIP94 = false;
@@ -594,14 +594,14 @@ public:
 
         // Pricoin signet genesis.
         genesis = CreateGenesisBlock(
-            "Pricoin signet 2026/04/27 confidential amounts stealth ring",
+            "Pricoin signet 2026/04/29 confidential amounts stealth ring",
             CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
-            /*nTime=*/1735689600, /*nNonce=*/3, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
+            /*nTime=*/1777420800, /*nNonce=*/0, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
         MineGenesisIfRequested(genesis, "signet", consensus.powLimit);
         consensus.hashGenesisBlock = genesis.GetHash();
         if (!ShouldSkipGenesisAssert()) {
-            assert(consensus.hashGenesisBlock == uint256{"ff5426ed83e4392cff094d8027699ba7812947ad4619078c3f51f2e1dc5896e3"});
-            assert(genesis.hashMerkleRoot == uint256{"2d87ce085f268c0c5a9b44dcef4baefdf041bfd6e31bfc6e0cbe28cc5d214fa3"});
+            assert(consensus.hashGenesisBlock == uint256{"c1d41765c6c996f9241a8934f48b3e3058266f84754fe479fcd26f3d6fa9f6a4"});
+            assert(genesis.hashMerkleRoot == uint256{"e817b7fdfab9f0c54cbbd85870c9eca4d97887953d5b6e0628863ca39fda9cf4"});
         }
 
         m_assumeutxo_data = {
@@ -712,14 +712,14 @@ public:
 
         // Pricoin regtest genesis.
         genesis = CreateGenesisBlock(
-            "Pricoin regtest 2026/04/27 confidential amounts stealth ring",
+            "Pricoin regtest 2026/04/29 confidential amounts stealth ring",
             CScript() << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f"_hex << OP_CHECKSIG,
-            /*nTime=*/1735689600, /*nNonce=*/1, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
+            /*nTime=*/1777420800, /*nNonce=*/0, /*nBits=*/0x207fffff, /*nVersion=*/1, 50 * COIN);
         MineGenesisIfRequested(genesis, "regtest", consensus.powLimit);
         consensus.hashGenesisBlock = genesis.GetHash();
         if (!ShouldSkipGenesisAssert()) {
-            assert(consensus.hashGenesisBlock == uint256{"bf1e5c0d41c4a20ee7b99f99ace476e67b17a9d5abd188a1aac424361550b3d8"});
-            assert(genesis.hashMerkleRoot == uint256{"d4b91bdbd25f7fbc249b18e9845b7f5346c07cf8f5a4db0d556d834976b24ba0"});
+            assert(consensus.hashGenesisBlock == uint256{"445625a5f05fc13ea721fdefb34390a480d23ad71ea84da4bd25d33288d35588"});
+            assert(genesis.hashMerkleRoot == uint256{"59944c60f655b87306f460e622f053f1dd245b56b91f14fcab0a0dfc16ec4d81"});
         }
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.
