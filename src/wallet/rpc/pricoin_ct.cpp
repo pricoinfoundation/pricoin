@@ -669,10 +669,34 @@ std::optional<RecoveredOutput> TryRecoverCTOutput(
 // practice (and that v4 chains may even reject — invalidateblock at
 // depth doesn't compose well with the KI committed-set).
 //
-// In-memory only for this commit — a daemon restart pays one full scan
-// cost. Persisting the cache to wallet.dat is a follow-up; for now,
-// the warm-cache benefit alone takes the cost from "O(chain) per call"
-// to "O(chain) once per session".
+// Persisted as DBKeys::PRICOIN_RECOVERY_CACHE. Restoring the cache on
+// startup avoids re-walking the full chain after every daemon restart
+// — for a wallet with many recoveries on a long chain that's the
+// difference between "wait several seconds for the first balance call"
+// and "immediate".
+//
+// On-disk format (inside the encrypted wallet blob — see
+// pricoin_stealth::EncryptWalletBlob, which gives the same at-rest
+// posture as the stealth seed: encrypted + HMAC if the wallet is
+// encrypted, plaintext-with-version-byte otherwise):
+//
+//   [INNER_VER:1]              version of THIS payload format
+//   [last_scanned_height:i32]  little-endian
+//   [last_scanned_hash:32]
+//   [num_entries:varint]       compact size
+//   [entry]*
+//
+// Each entry (85 bytes):
+//   [txid:32][vout:u32 LE][output_index:u32 LE]
+//   [value:i64 LE][key_image:33][height:i32 LE]
+//
+// Reorg detection still fires on load — if the chain at last_scanned_height
+// no longer hashes to last_scanned_hash, the deserialised cache is
+// dropped and a full fresh scan runs. The persisted cache is best-effort:
+// missing it (corruption, wrong key, or wallet locked at scan time) just
+// means a one-time full rescan on next access.
+constexpr unsigned char kRecoveryCacheInnerVer = 0x01;
+
 struct CachedRecovery {
     uint32_t output_index{0};
     CAmount value{0};
@@ -683,6 +707,7 @@ struct CTRecoveryIndex {
     std::map<COutPoint, CachedRecovery> entries;
     int last_scanned_height{-1};
     uint256 last_scanned_hash{};
+    bool persisted_load_attempted{false};
     btcsignals::scoped_connection unload_conn{btcsignals::connection{}};
 };
 Mutex g_recovery_index_mutex;
@@ -692,6 +717,107 @@ struct SyncStats {
     int new_blocks_scanned{0};
     bool reorg_detected{false};
 };
+
+// Serialise the in-memory index to the inner-payload format documented
+// above. Caller passes through EncryptWalletBlob to get the encrypted
+// DB blob.
+std::vector<unsigned char> SerializeRecoveryIndex(const CTRecoveryIndex& index)
+{
+    DataStream ds;
+    ds << kRecoveryCacheInnerVer;
+    ds << static_cast<int32_t>(index.last_scanned_height);
+    ds << index.last_scanned_hash;
+    WriteCompactSize(ds, index.entries.size());
+    for (const auto& [outpoint, rec] : index.entries) {
+        ds << outpoint;
+        ds << rec.output_index;
+        ds << static_cast<int64_t>(rec.value);
+        ds.write(std::as_bytes(std::span{rec.key_image.data(), rec.key_image.size()}));
+        ds << static_cast<int32_t>(rec.height);
+    }
+    return std::vector<unsigned char>(
+        reinterpret_cast<const unsigned char*>(ds.data()),
+        reinterpret_cast<const unsigned char*>(ds.data()) + ds.size());
+}
+
+bool DeserializeRecoveryIndex(std::span<const unsigned char> bytes,
+                              CTRecoveryIndex& index)
+{
+    DataStream ds;
+    ds.write(std::as_bytes(std::span{bytes.data(), bytes.size()}));
+    try {
+        uint8_t inner_ver;
+        ds >> inner_ver;
+        if (inner_ver != kRecoveryCacheInnerVer) return false;
+        int32_t last_height;
+        ds >> last_height;
+        index.last_scanned_height = last_height;
+        ds >> index.last_scanned_hash;
+        const uint64_t n = ReadCompactSize(ds);
+        // Sanity bound: a wallet on a busy chain might accumulate
+        // tens of thousands of recoveries, but a million in one wallet
+        // is implausible and would bloat the encrypted blob unhelpfully.
+        if (n > 1'000'000) return false;
+        for (uint64_t i = 0; i < n; ++i) {
+            COutPoint outpoint;
+            ds >> outpoint;
+            CachedRecovery cr;
+            ds >> cr.output_index;
+            int64_t value;
+            ds >> value;
+            cr.value = value;
+            ds.read(std::as_writable_bytes(
+                std::span{cr.key_image.data(), cr.key_image.size()}));
+            int32_t height;
+            ds >> height;
+            cr.height = height;
+            index.entries[outpoint] = cr;
+        }
+        return true;
+    } catch (const std::exception&) {
+        // Malformed payload — likely a partial / wrong-format read.
+        // Caller drops the cache and rebuilds via fresh scan.
+        index.entries.clear();
+        index.last_scanned_height = -1;
+        index.last_scanned_hash = uint256{};
+        return false;
+    }
+}
+
+void PersistRecoveryIndex(CWallet& wallet, const CTRecoveryIndex& index)
+{
+    std::vector<unsigned char> payload = SerializeRecoveryIndex(index);
+    std::vector<unsigned char> blob;
+    if (!::wallet::pricoin_stealth::EncryptWalletBlob(wallet, payload, blob)) {
+        // Wallet locked, or other transient encryption failure. Skip
+        // the persistence — in-memory cache still works; we'll retry
+        // on the next sync that actually scans new blocks.
+        return;
+    }
+    WalletBatch batch(wallet.GetDatabase());
+    batch.WritePricoinRecoveryCache(blob);
+}
+
+bool LoadPersistedRecoveryIndex(CWallet& wallet, CTRecoveryIndex& index)
+{
+    std::vector<unsigned char> blob;
+    {
+        WalletBatch batch(wallet.GetDatabase());
+        if (!batch.ReadPricoinRecoveryCache(blob) || blob.empty()) return false;
+    }
+    std::vector<unsigned char> payload;
+    try {
+        if (!::wallet::pricoin_stealth::DecryptWalletBlob(wallet, blob, payload)) {
+            // Bad-MAC / wrong key / corrupt. Fall through to full rescan.
+            return false;
+        }
+    } catch (const std::exception&) {
+        // Wallet locked: can't decrypt now. Caller treats as
+        // "no cache available" and will retry once unlocked.
+        return false;
+    }
+    return DeserializeRecoveryIndex(payload, index);
+}
 
 // Caller MUST hold g_recovery_index_mutex.
 CTRecoveryIndex& SyncRecoveryIndexLocked(CWallet& wallet, SyncStats* stats = nullptr)
@@ -710,6 +836,16 @@ CTRecoveryIndex& SyncRecoveryIndexLocked(CWallet& wallet, SyncStats* stats = nul
         });
     }
     auto& index = it->second;
+
+    // First call against this wallet (in-process): try to restore the
+    // persisted cache from wallet.dat. If it loads cleanly, skip the
+    // expensive full-chain rescan that would otherwise run. Treat any
+    // failure (no record, corrupt, locked, etc.) as "no cache" — the
+    // scan loop below will rebuild from genesis.
+    if (!index.persisted_load_attempted) {
+        index.persisted_load_attempted = true;
+        LoadPersistedRecoveryIndex(wallet, index);
+    }
 
     interfaces::Chain& chain = wallet.chain();
     const int tip_height = chain.getHeight().value_or(-1);
@@ -766,6 +902,12 @@ CTRecoveryIndex& SyncRecoveryIndexLocked(CWallet& wallet, SyncStats* stats = nul
     if (new_blocks > 0) {
         LogDebug(BCLog::WALLETDB, "Pricoin: scanned %d new block(s) for wallet %s; %u total recoveries cached\n",
                  new_blocks, wallet.GetName(), (unsigned)index.entries.size());
+        // Persist the freshly-extended index so the next daemon
+        // startup doesn't have to re-walk the whole chain. Best-effort:
+        // a write failure (wallet locked at this moment, etc.) is
+        // logged but doesn't fail the sync — the in-memory cache still
+        // serves this session.
+        PersistRecoveryIndex(wallet, index);
     }
     if (stats) stats->new_blocks_scanned = new_blocks;
     return index;
@@ -847,6 +989,30 @@ RPCMethod pricoin_listownct()
             return out;
         }
     };
+}
+
+// Given an outpoint that's known to be a recovered own output (per
+// the recovery cache), fetch the underlying transaction and re-derive
+// the full RecoveredOutput — including the blind and one_time_priv
+// that the cache deliberately omits (cache stores enough to identify
+// "is this mine? has it been spent?" but not enough to spend; signing
+// material is rederived on demand). Returns nullopt if the tx is no
+// longer on the active chain at the cached height (reorg-induced
+// stale entry — caller drops the cache and resyncs).
+std::optional<RecoveredOutput> RehydrateRecovery(
+    const ::wallet::pricoin_stealth::Identity& id,
+    interfaces::Chain& chain,
+    const COutPoint& outpoint,
+    int height)
+{
+    const uint256 block_hash = chain.getBlockHash(height);
+    CBlock block;
+    if (!chain.findBlock(block_hash, interfaces::FoundBlock().data(block))) return std::nullopt;
+    for (const auto& tx_ref : block.vtx) {
+        if (tx_ref->GetHash() != outpoint.hash) continue;
+        return TryRecoverCTOutput(id, *tx_ref, outpoint.n);
+    }
+    return std::nullopt;
 }
 
 // Helper: collect all v4 stealth outputs in confirmed blocks. Returns
@@ -1011,31 +1177,30 @@ RPCMethod walletsendct_ring()
             const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
             interfaces::Chain& chain = wallet.chain();
 
-            // 1. Find our recovered CT output with sufficient value.
+            // 1. Find our recovered CT output with sufficient value via
+            //    the per-wallet recovery cache. First call after a fresh
+            //    daemon start pays the chain rescan; subsequent calls
+            //    only walk the new tip-extension. We rehydrate the
+            //    full RecoveredOutput (blind + one_time_priv) for the
+            //    one entry we actually pick.
             std::optional<RecoveredOutput> picked;
             COutPoint picked_outpoint;
-            const int tip = chain.getHeight().value_or(-1);
+            int picked_height = -1;
             const CAmount target = dest_amount + fee;
-            for (int h = 0; h <= tip && !picked; ++h) {
-                const uint256 block_hash = chain.getBlockHash(h);
-                CBlock block;
-                if (!chain.findBlock(block_hash, interfaces::FoundBlock().data(block))) continue;
-                for (const auto& tx_ref : block.vtx) {
-                    if (tx_ref->version != PRICOIN_CT_VERSION) continue;
-                    for (uint32_t i = 0; i < tx_ref->vout.size(); ++i) {
-                        auto rec = TryRecoverCTOutput(id, *tx_ref, i);
-                        if (!rec || rec->value < target) continue;
-                        // Phase 3a: skip outputs whose KI is already on chain.
-                        if (pricoin::IsKeyImageCommitted(rec->key_image)) continue;
-                        // Read output_index before the move (and to silence
-                        // a -Wmaybe-uninitialized false positive on GCC,
-                        // which loses track of the optional's engaged state).
-                        picked_outpoint = COutPoint(tx_ref->GetHash(), rec->output_index);
-                        picked = std::move(rec);
-                        break;
-                    }
-                    if (picked) break;
+            const int tip = chain.getHeight().value_or(-1);
+            {
+                LOCK(g_recovery_index_mutex);
+                CTRecoveryIndex& index = SyncRecoveryIndexLocked(wallet);
+                for (const auto& [outpoint, rec] : index.entries) {
+                    if (rec.value < target) continue;
+                    if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
+                    picked_outpoint = outpoint;
+                    picked_height = rec.height;
+                    break;
                 }
+            }
+            if (picked_height >= 0) {
+                picked = RehydrateRecovery(id, chain, picked_outpoint, picked_height);
             }
             if (!picked) throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No recovered CT output of sufficient value");
 
@@ -1297,35 +1462,33 @@ RPCMethod walletsendct_from_ct()
             const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
             interfaces::Chain& chain = wallet.chain();
 
-            // Scan blocks for ALL own CT outputs that aren't already spent
-            // (KI not committed). Skip ones whose blind is dummy (zero — these
-            // are transparent-input commitments, not recovered receives).
-            // Then pick greedy biggest-first until the sum covers `target`.
+            // Pick own spendable CT outputs via the recovery cache,
+            // greedy biggest-first. The cache only stores
+            // (outpoint, value, key_image, height); we rehydrate the
+            // full RecoveredOutput (blind + one_time_priv) on demand
+            // for just the entries we end up spending.
             struct PickedCT { RecoveredOutput rec; COutPoint outpoint; };
-            std::vector<PickedCT> candidates;
-            const int tip = chain.getHeight().value_or(-1);
-            for (int h = 0; h <= tip; ++h) {
-                const uint256 block_hash = chain.getBlockHash(h);
-                CBlock block;
-                if (!chain.findBlock(block_hash, interfaces::FoundBlock().data(block))) continue;
-                for (const auto& tx_ref : block.vtx) {
-                    if (tx_ref->version != PRICOIN_CT_VERSION) continue;
-                    for (uint32_t i = 0; i < tx_ref->vout.size(); ++i) {
-                        auto rec = TryRecoverCTOutput(id, *tx_ref, i);
-                        if (!rec) continue;
-                        if (pricoin::IsKeyImageCommitted(rec->key_image)) continue;
-                        candidates.push_back({std::move(*rec), COutPoint(tx_ref->GetHash(), i)});
-                    }
+            struct CacheCandidate { COutPoint outpoint; CAmount value; int height; };
+            std::vector<CacheCandidate> sorted;
+            {
+                LOCK(g_recovery_index_mutex);
+                CTRecoveryIndex& index = SyncRecoveryIndexLocked(wallet);
+                sorted.reserve(index.entries.size());
+                for (const auto& [outpoint, rec] : index.entries) {
+                    if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
+                    sorted.push_back({outpoint, rec.value, rec.height});
                 }
             }
-            std::sort(candidates.begin(), candidates.end(),
-                      [](const auto& a, const auto& b) { return a.rec.value > b.rec.value; });
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const auto& a, const auto& b) { return a.value > b.value; });
 
             std::vector<PickedCT> picked_list;
             CAmount input_total = 0;
-            for (auto& c : candidates) {
-                input_total += c.rec.value;
-                picked_list.push_back(std::move(c));
+            for (const auto& cand : sorted) {
+                auto rehydrated = RehydrateRecovery(id, chain, cand.outpoint, cand.height);
+                if (!rehydrated) continue;  // stale cache entry; skip
+                input_total += rehydrated->value;
+                picked_list.push_back({std::move(*rehydrated), cand.outpoint});
                 if (input_total >= target) break;
             }
             if (input_total < target) {
@@ -1724,6 +1887,13 @@ void DropCTRecoveryCache(CWallet& wallet)
 {
     LOCK(g_recovery_index_mutex);
     g_recovery_indices.erase(&wallet);
+    // Also erase the persisted copy — keeping it would let the OLD
+    // identity's recoveries leak back into the cache at the next
+    // startup (LoadPersistedRecoveryIndex would silently restore them
+    // before any sync runs). Same correctness reason as the in-memory
+    // drop in SetSeed.
+    WalletBatch batch(wallet.GetDatabase());
+    batch.ErasePricoinRecoveryCache();
 }
 
 void RunWithCTRecoveryCacheCleared(CWallet& wallet,
@@ -1733,6 +1903,8 @@ void RunWithCTRecoveryCacheCleared(CWallet& wallet,
     const bool drop = inner();
     if (drop) {
         g_recovery_indices.erase(&wallet);
+        WalletBatch batch(wallet.GetDatabase());
+        batch.ErasePricoinRecoveryCache();
     }
 }
 

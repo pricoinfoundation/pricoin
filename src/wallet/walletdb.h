@@ -81,8 +81,14 @@ extern const std::string POOL;
 //   PRICOIN_STEALTH       — legacy v0.1.11: 64 bytes view||spend material.
 //   PRICOIN_STEALTH_SEED  — v0.1.12+: 32-byte seed; view/spend derived
 //                           deterministically. Single secret to back up.
+//   PRICOIN_RECOVERY_CACHE — serialised CT-recovery scan index (last
+//                           scanned block + recovered outpoint→value
+//                           map). Avoids a full chain rescan on every
+//                           daemon restart. Format documented in
+//                           wallet/rpc/pricoin_ct.cpp.
 extern const std::string PRICOIN_STEALTH;
 extern const std::string PRICOIN_STEALTH_SEED;
+extern const std::string PRICOIN_RECOVERY_CACHE;
 extern const std::string PURPOSE;
 extern const std::string SETTINGS;
 extern const std::string TX;
@@ -289,6 +295,9 @@ public:
     bool WritePricoinStealthSeed(const std::vector<unsigned char>& blob);
     bool ReadPricoinStealthSeed(std::vector<unsigned char>& blob);
     bool ErasePricoinStealthSeed();
+    bool WritePricoinRecoveryCache(const std::vector<unsigned char>& blob);
+    bool ReadPricoinRecoveryCache(std::vector<unsigned char>& blob);
+    bool ErasePricoinRecoveryCache();
     //! Begin a new transaction
     bool TxnBegin();
     //! Commit current transaction

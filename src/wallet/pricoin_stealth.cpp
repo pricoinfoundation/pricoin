@@ -701,6 +701,24 @@ SetSeedResult SetSeed(CWallet& wallet,
     return result;
 }
 
+bool EncryptWalletBlob(CWallet& wallet,
+                       std::span<const unsigned char> plain,
+                       std::vector<unsigned char>& blob_out)
+{
+    return EncodeBlob(wallet, plain, blob_out);
+}
+
+bool DecryptWalletBlob(CWallet& wallet,
+                       std::span<const unsigned char> blob,
+                       std::vector<unsigned char>& plain_out)
+{
+    bool unused_upgrade = false;
+    // accept_no_mac defaults to false — DB-record callers don't accept
+    // v1 legacy ciphertexts. Throws on locked-encrypted; returns false
+    // on corruption / wrong-key / unrecognised format.
+    return DecodeBlob(wallet, blob, plain_out, unused_upgrade);
+}
+
 void Shutdown()
 {
     LOCK(g_mutex);

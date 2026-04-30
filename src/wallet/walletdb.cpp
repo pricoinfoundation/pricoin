@@ -51,6 +51,7 @@ const std::string ORDERPOSNEXT{"orderposnext"};
 const std::string POOL{"pool"};
 const std::string PRICOIN_STEALTH{"pct_stealth"};
 const std::string PRICOIN_STEALTH_SEED{"pct_stealth_seed"};
+const std::string PRICOIN_RECOVERY_CACHE{"pct_recovery_cache"};
 const std::string PURPOSE{"purpose"};
 const std::string SETTINGS{"settings"};
 const std::string TX{"tx"};
@@ -1275,6 +1276,21 @@ bool WalletBatch::ReadPricoinStealthSeed(std::vector<unsigned char>& blob)
 bool WalletBatch::ErasePricoinStealthSeed()
 {
     return EraseIC(DBKeys::PRICOIN_STEALTH_SEED);
+}
+
+bool WalletBatch::WritePricoinRecoveryCache(const std::vector<unsigned char>& blob)
+{
+    return WriteIC(DBKeys::PRICOIN_RECOVERY_CACHE, blob);
+}
+
+bool WalletBatch::ReadPricoinRecoveryCache(std::vector<unsigned char>& blob)
+{
+    return m_batch->Read(DBKeys::PRICOIN_RECOVERY_CACHE, blob);
+}
+
+bool WalletBatch::ErasePricoinRecoveryCache()
+{
+    return EraseIC(DBKeys::PRICOIN_RECOVERY_CACHE);
 }
 
 bool WalletBatch::EraseRecords(const std::unordered_set<std::string>& types)

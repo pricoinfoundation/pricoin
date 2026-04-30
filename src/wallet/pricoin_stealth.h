@@ -38,6 +38,26 @@ const Identity& GetOrCreate(CWallet& wallet);
 // GetOrCreate (it primes the cache). Thread-safe.
 std::optional<std::array<unsigned char, 32>> GetSeedIfAvailable(CWallet& wallet);
 
+// Encrypt a payload blob using the wallet's at-rest encryption posture
+// — encrypted+HMAC if the wallet has encryption keys (and is unlocked),
+// plaintext-with-version-byte otherwise. Returns false if the wallet is
+// encrypted-but-locked. Used by other wallet-private records (e.g. the
+// CT-recovery scan cache) that want the same at-rest protection as the
+// stealth identity itself.
+bool EncryptWalletBlob(CWallet& wallet,
+                       std::span<const unsigned char> plain,
+                       std::vector<unsigned char>& blob_out);
+
+// Inverse of EncryptWalletBlob. Throws std::runtime_error if the blob
+// is encrypted and the wallet is currently locked (matches GetOrCreate's
+// posture). Returns false on corruption, wrong key, or unrecognised
+// format. Refuses the legacy v1 (no-MAC) format on this path — DB-record
+// callers were never written in that format, so seeing it here is
+// necessarily a downgrade-attack attempt.
+bool DecryptWalletBlob(CWallet& wallet,
+                       std::span<const unsigned char> blob,
+                       std::vector<unsigned char>& plain_out);
+
 // Reason a SetSeed call rejected.
 enum class SetSeedResult {
     Ok,

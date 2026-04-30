@@ -106,6 +106,26 @@ class PricoinCTTest(BitcoinTestFramework):
         assert_equal(bob_ct_2["scanned_blocks"], 0)
         assert_equal(len(bob_ct_2["outputs"]), 4)
 
+        # The cache also persists to wallet.dat across daemon restart.
+        # Without this, every restart pays the full-chain rescan cost
+        # again. After restart + reload, the first listownct call must
+        # still report scanned_blocks == 0 (loaded from disk, no fresh
+        # scan). Tagged here because section 1's small chain is the
+        # cleanest place to validate it.
+        self.restart_node(0, extra_args=["-txindex=1"])
+        node = self.nodes[0]
+        node.loadwallet("bob")
+        bob = node.get_wallet_rpc("bob")
+        bob_ct_after_restart = bob.pricoin_listownct(0)
+        assert_equal(bob_ct_after_restart["scanned_blocks"], 0)
+        assert_equal(len(bob_ct_after_restart["outputs"]), 4)
+        # Reload the other wallets the restart unloaded so later
+        # sections see their expected state.
+        node.loadwallet("alice")
+        alice = node.get_wallet_rpc("alice")
+        node.loadwallet("carol")
+        carol = node.get_wallet_rpc("carol")
+
         # ---- 2. CT → CT (ring) ----
         ring_tx = bob.walletsendct_ring(carol_stealth, 5.0, 0.0001, 4)
         ring_txid = ring_tx["txid"]
