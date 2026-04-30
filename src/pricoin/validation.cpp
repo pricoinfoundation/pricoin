@@ -404,6 +404,20 @@ void InitKeyImageStore(const std::string& datadir_path)
 {
     LOCK(g_ki_mutex);
     g_ki_path = fs::PathFromString(datadir_path) / "pricoin_keyimages.dat";
+    // Clean up any orphaned .tmp left behind by an interrupted RewriteFile
+    // (we write to <path>.tmp then rename; a crash between the two leaves
+    // the partial file behind). Always-safe to remove: by definition the
+    // real file at <path> is the one we successfully renamed last, and
+    // .tmp can only be a write-in-progress that never completed.
+    fs::path tmp_path = g_ki_path;
+    tmp_path += ".tmp";
+    if (fs::exists(tmp_path)) {
+        std::error_code ec;
+        if (fs::remove(tmp_path, ec) && !ec) {
+            LogWarning("Pricoin: removed orphaned KI store tmp file %s",
+                       fs::PathToString(tmp_path));
+        }
+    }
     std::ifstream f(fs::PathToString(g_ki_path), std::ios::binary);
     if (!f) {
         LogInfo("Pricoin: key-image store empty at startup (%s)", fs::PathToString(g_ki_path));

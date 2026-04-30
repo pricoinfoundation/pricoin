@@ -578,6 +578,27 @@ class PricoinCTTest(BitcoinTestFramework):
                                 frank.pricoin_getstealthaddress)
         node.unloadwallet("frank")
 
+        # ---- 12. Orphaned KI-store .tmp must be cleaned up on startup ----
+        # If RewriteFile is interrupted between "open .tmp + write" and
+        # the subsequent rename, an orphan pricoin_keyimages.dat.tmp can
+        # accumulate. InitKeyImageStore should remove it on the next
+        # daemon startup (the real file at <path> is the last
+        # successfully-renamed copy; .tmp is necessarily an interrupted
+        # write).
+        ki_dir = node.datadir_path / node.chain
+        ki_tmp = ki_dir / "pricoin_keyimages.dat.tmp"
+        # Plant an orphan tmp.
+        with open(ki_tmp, "wb") as f:
+            f.write(b"orphaned write in progress")
+        assert ki_tmp.exists()
+        self.restart_node(0, extra_args=["-txindex=1"])
+        node = self.nodes[0]
+        # Cleanup must have removed the orphan.
+        assert not ki_tmp.exists(), "InitKeyImageStore should remove orphaned .tmp"
+        # Real file is unaffected and the chain is still functional.
+        # Reload wallets the restart unloaded.
+        node.loadwallet("alice")
+
         self.log.info("Pricoin CT/ring/KI/RPC-parity/encryption smoke test OK")
 
     def _find_spent_signer(self, node, ring_txid):

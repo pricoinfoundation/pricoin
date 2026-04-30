@@ -1489,6 +1489,12 @@ RPCMethod pricoin_getstealthseed()
             }
             UniValue out{UniValue::VOBJ};
             out.pushKV("seed", HexStr(*seed));
+            // Wipe the stack copy of the seed before we return. The hex
+            // string going through UniValue / the JSON serialiser is
+            // out of our hands (and inevitably ends up on the wire), but
+            // the raw 32-byte buffer in `seed` doesn't need to keep
+            // sitting in memory longer than necessary.
+            memory_cleanse(seed->data(), seed->size());
             return out;
         }
     };
@@ -1527,14 +1533,20 @@ RPCMethod pricoin_setstealthseed()
         [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
             auto wallet_sp = GetWalletForJSONRPCRequest(request);
             if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
-            const std::string seed_hex = request.params[0].get_str();
+            // The hex string itself comes from request.params, which
+            // sits inside UniValue's default-allocator storage — we
+            // can't cleanse that. The PARSED bytes are local; cleanse
+            // them on every exit path.
+            const std::string& seed_hex = request.params[0].get_str();
             const bool confirm = !request.params[1].isNull() && request.params[1].get_bool();
             if (!IsHex(seed_hex) || seed_hex.size() != 64) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER,
                     "seed_hex must be exactly 64 hex characters (32 bytes)");
             }
-            const std::vector<unsigned char> seed = ParseHex(seed_hex);
+            std::vector<unsigned char> seed = ParseHex(seed_hex);
             const auto result = wallet::pricoin_stealth::SetSeed(*wallet_sp, seed, confirm);
+            // Wipe our local seed copy now that SetSeed has consumed it.
+            memory_cleanse(seed.data(), seed.size());
             switch (result) {
                 case wallet::pricoin_stealth::SetSeedResult::Ok:
                     break;
