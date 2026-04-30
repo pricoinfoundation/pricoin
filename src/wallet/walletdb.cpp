@@ -49,6 +49,7 @@ const std::string NAME{"name"};
 const std::string OLD_KEY{"wkey"};
 const std::string ORDERPOSNEXT{"orderposnext"};
 const std::string POOL{"pool"};
+const std::string PRICOIN_STEALTH{"pct_stealth"};
 const std::string PURPOSE{"purpose"};
 const std::string SETTINGS{"settings"};
 const std::string TX{"tx"};
@@ -1243,6 +1244,21 @@ bool WalletBatch::EraseAddressData(const CTxDestination& dest)
 bool WalletBatch::WriteWalletFlags(const uint64_t flags)
 {
     return WriteIC(DBKeys::FLAGS, flags);
+}
+
+bool WalletBatch::WritePricoinStealth(const std::vector<unsigned char>& blob)
+{
+    return WriteIC(DBKeys::PRICOIN_STEALTH, blob);
+}
+
+bool WalletBatch::ReadPricoinStealth(std::vector<unsigned char>& blob)
+{
+    return m_batch->Read(DBKeys::PRICOIN_STEALTH, blob);
+}
+
+bool WalletBatch::ErasePricoinStealth()
+{
+    return EraseIC(DBKeys::PRICOIN_STEALTH);
 }
 
 bool WalletBatch::EraseRecords(const std::unordered_set<std::string>& types)

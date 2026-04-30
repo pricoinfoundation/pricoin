@@ -788,8 +788,11 @@ RPCMethod walletsendct_ring()
                         if (!rec || rec->value < target) continue;
                         // Phase 3a: skip outputs whose KI is already on chain.
                         if (pricoin::IsKeyImageCommitted(rec->key_image)) continue;
+                        // Read output_index before the move (and to silence
+                        // a -Wmaybe-uninitialized false positive on GCC,
+                        // which loses track of the optional's engaged state).
+                        picked_outpoint = COutPoint(tx_ref->GetHash(), rec->output_index);
                         picked = std::move(rec);
-                        picked_outpoint = COutPoint(tx_ref->GetHash(), picked->output_index);
                         break;
                     }
                     if (picked) break;

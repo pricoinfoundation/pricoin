@@ -38,18 +38,6 @@ secp256k1_context* SecpCtx() EXCLUSIVE_LOCKS_REQUIRED(g_secp_mu)
     return g_secp_ctx;
 }
 
-bool ParseCommitToPubkey(secp256k1_context* ctx, const Commitment& C, secp256k1_pubkey& out)
-{
-    secp256k1_pedersen_commitment pc;
-    if (!secp256k1_pedersen_commitment_parse(ctx, &pc, C.bytes.data())) return false;
-    unsigned char ser[33];
-    if (!secp256k1_pedersen_commitment_serialize(ctx, ser, &pc)) return false;
-    // Pedersen commitment serialization uses 0x08/0x09 prefixes; convert to
-    // pubkey-compressed 0x02/0x03.
-    ser[0] = (ser[0] == 8) ? 2 : 3;
-    return secp256k1_ec_pubkey_parse(ctx, &out, ser, 33) == 1;
-}
-
 } // namespace
 
 std::optional<std::array<unsigned char, 33>> SubtractCommitments(

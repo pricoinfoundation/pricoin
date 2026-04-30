@@ -200,22 +200,18 @@ class PricoinCTTest(BitcoinTestFramework):
                                 alice.sendmany, "", {a_other: 1.0})
 
         # ---- 5. Stealth keys are encrypted at rest with the wallet master key ----
-        # Encrypting the wallet must persist the stealth side-file in the
-        # encrypted format (version byte 0x01). After lock, send/scan paths
-        # that depend on the stealth identity must fail; after unlock they
-        # must work end-to-end.
+        # Stealth identity now lives inside wallet.dat (so backupwallet covers
+        # it). Side-file should NOT be created. After lock + restart, scan
+        # without unlocking must fail; after walletpassphrase it must succeed
+        # end-to-end.
         node.createwallet("dave", passphrase="dave-passphrase")
         dave = node.get_wallet_rpc("dave")
         dave.walletpassphrase("dave-passphrase", 60)
         dave_stealth = dave.pricoin_getstealthaddress()["address"]
-        # File must be the current encrypted-with-MAC format (version 0x02).
-        import os
         wallet_dir = node.datadir_path / node.chain / "wallets" / "dave"
-        stealth_file = wallet_dir / "pricoin_stealth.dat"
-        assert stealth_file.exists(), "stealth side-file should exist after first stealth-address use"
-        with open(stealth_file, "rb") as f:
-            header = f.read(1)
-        assert_equal(header, b"\x02")  # encrypted+MAC version byte
+        legacy_side_file = wallet_dir / "pricoin_stealth.dat"
+        assert not legacy_side_file.exists(), \
+            "fresh wallets must not create the legacy side-file"
 
         # Send to dave; he scans and recovers (wallet still unlocked).
         alice.walletsendct(dave_stealth, 7.0, 0.0001)
@@ -224,7 +220,7 @@ class PricoinCTTest(BitcoinTestFramework):
         assert_equal(dave_ct["total_recovered"], 7.0)
 
         # Lock the wallet. Drop our cached identity by restarting so the
-        # next scan must reload from the encrypted file under a locked wallet.
+        # next scan must reload from the wallet DB under a locked wallet.
         dave.walletlock()
         self.restart_node(0, extra_args=["-txindex=1"])
         node = self.nodes[0]
@@ -243,50 +239,130 @@ class PricoinCTTest(BitcoinTestFramework):
         node.loadwallet("alice")
         alice = node.get_wallet_rpc("alice")
 
-        # ---- 6. Unload-then-reload must not leak stealth identity across wallets ----
+        # ---- 6. backupwallet must carry stealth identity end-to-end ----
+        # The whole point of moving the keys into wallet.dat: a routine
+        # `backupwallet` now copies them. Before this change, restoring a
+        # wallet.dat backup left the user without their stealth keys and
+        # bricked recovery of every CT payment they'd ever received.
+        dave_addr_before = dave.pricoin_getstealthaddress()["address"]
+        backup_path = node.datadir_path / "dave_backup.dat"
+        dave.backupwallet(str(backup_path))
+        # Restore as a different wallet name from the same backup file.
+        restored_dir = node.datadir_path / node.chain / "wallets" / "dave_restored"
+        restored_dir.mkdir(parents=True, exist_ok=False)
+        import shutil
+        shutil.copy(str(backup_path), str(restored_dir / "wallet.dat"))
+        node.loadwallet("dave_restored", load_on_startup=False)
+        restored = node.get_wallet_rpc("dave_restored")
+        restored.walletpassphrase("dave-passphrase", 60)
+        assert_equal(restored.pricoin_getstealthaddress()["address"], dave_addr_before)
+        # Also: the restored wallet recognises the 7-PRIC payment, since the
+        # stealth identity it scans with is the same one alice paid to.
+        assert_equal(restored.pricoin_listownct(0)["total_recovered"], 7.0)
+        node.unloadwallet("dave_restored")
+
+        # ---- 7. Unload-then-reload must not leak stealth identity across wallets ----
         # The in-memory cache used to be keyed by raw CWallet*; unload + new
         # wallet at the same heap address would silently inherit the old
-        # identity. After the fix, the cache entry is dropped on unload, so
-        # the same wallet name reloaded gives the SAME on-disk identity (loaded
-        # from its own pricoin_stealth.dat) — never some other wallet's keys.
-        dave_addr_before = dave.pricoin_getstealthaddress()["address"]
+        # identity. The cache entry is now dropped on NotifyUnload.
         node.unloadwallet("dave")
-        # Churn allocations so the next CWallet is unlikely to land at the same
-        # address even by coincidence — but the cache must be wallet-private
-        # regardless.
         node.createwallet("erin")
         erin = node.get_wallet_rpc("erin")
         erin_addr = erin.pricoin_getstealthaddress()["address"]
         assert dave_addr_before != erin_addr, "fresh wallet must get fresh identity"
-        # Reload dave and confirm we recover dave's own keys, not erin's.
         node.loadwallet("dave")
         dave = node.get_wallet_rpc("dave")
         dave.walletpassphrase("dave-passphrase", 60)
         assert_equal(dave.pricoin_getstealthaddress()["address"], dave_addr_before)
 
-        # ---- 7. Tampered stealth file must fail to load (HMAC integrity) ----
-        # AES-CBC alone is malleable: flipping a ciphertext byte yields a
-        # plaintext that's still 64 bytes of valid-looking key material, so
-        # the wallet would silently start using a *different* stealth identity
-        # and lose track of every payment already received. The HMAC catches
-        # this. Flip one byte in the ciphertext region and confirm the load
-        # rejects rather than silently substituting garbage keys.
+        # ---- 8. Legacy side-file (pre-v0.1.11) must migrate into wallet.dat ----
+        # Existing installs upgrading from v0.1.10 have a `pricoin_stealth.dat`
+        # next to wallet.dat. On first GetOrCreate, the wallet must adopt that
+        # identity (so users don't lose access to their keys), and subsequent
+        # loads must come from the migrated DB record.
+        #
+        # Bitcoin Core wallets are SQLite databases. The simplest way to
+        # exercise the "DB has no stealth record but a side-file exists" path
+        # from a functional test is to create a wallet, then directly delete
+        # the stealth row from the SQLite file while it's unloaded.
+        import os
+        import sqlite3
+        node.createwallet("george")
+        george = node.get_wallet_rpc("george")
+        # Touching the address forces the DB record to be written.
+        george_native_addr = george.pricoin_getstealthaddress()["address"]
+        node.unloadwallet("george")
+        george_dir = node.datadir_path / node.chain / "wallets" / "george"
+        george_db = george_dir / "wallet.dat"
+        # Bitcoin Core's SQLite keys are varint-prefixed serialised strings.
+        # "pct_stealth" is 11 bytes, varint prefix is 0x0b.
+        stealth_key = b"\x0b" + b"pct_stealth"
+        with sqlite3.connect(str(george_db)) as conn:
+            conn.execute("DELETE FROM main WHERE key = ?", (stealth_key,))
+            conn.commit()
+        # Drop a legacy unencrypted blob (version 0x00) with known content.
+        import secrets
+        view_priv = secrets.token_bytes(32)
+        spend_priv = secrets.token_bytes(32)
+        legacy_blob = b"\x00" + view_priv + spend_priv
+        with open(george_dir / "pricoin_stealth.dat", "wb") as f:
+            f.write(legacy_blob)
+        # Reload — migration must adopt the legacy identity, not regenerate.
+        node.loadwallet("george", load_on_startup=False)
+        george = node.get_wallet_rpc("george")
+        george_migrated_addr = george.pricoin_getstealthaddress()["address"]
+        assert george_migrated_addr != george_native_addr, \
+            "migration should adopt the legacy side-file identity, not the empty DB"
+        # Unload so we can poke the DB directly, then confirm the migration
+        # wrote a DB row.
+        node.unloadwallet("george")
+        with sqlite3.connect(str(george_db)) as conn:
+            row = conn.execute("SELECT value FROM main WHERE key = ?",
+                               (stealth_key,)).fetchone()
+        assert row is not None, "migration must persist the identity into wallet.dat"
+        # Side-file becomes a downgrade safety net — no longer authoritative.
+        # Delete it and confirm the wallet still returns the same address from
+        # the now-DB-only record.
+        os.remove(george_dir / "pricoin_stealth.dat")
+        node.loadwallet("george", load_on_startup=False)
+        george = node.get_wallet_rpc("george")
+        assert_equal(george.pricoin_getstealthaddress()["address"], george_migrated_addr)
+
+        # ---- 9. Tampered DB record must fail to load (HMAC integrity) ----
+        # AES-CBC alone is malleable: flipping a ciphertext byte in an
+        # encrypted-but-no-MAC blob would silently substitute different keys
+        # (~99% of random 64-byte plaintexts decode as valid secp256k1 keys),
+        # bricking recovery of every payment received under the original
+        # identity. The HMAC catches that. Tamper with dave's DB record and
+        # confirm the load surfaces the corruption rather than substituting
+        # garbage.
         node.unloadwallet("dave")
-        with open(stealth_file, "rb") as f:
-            blob = bytearray(f.read())
-        # Header (1) + IV (32). Flip the first ciphertext byte.
-        blob[33] ^= 0x01
-        with open(stealth_file, "wb") as f:
-            f.write(blob)
-        node.loadwallet("dave")
+        dave_dir = node.datadir_path / node.chain / "wallets" / "dave"
+        dave_db = dave_dir / "wallet.dat"
+        with sqlite3.connect(str(dave_db)) as conn:
+            row = conn.execute("SELECT value FROM main WHERE key = ?",
+                               (stealth_key,)).fetchone()
+            assert row is not None, "dave should have a stealth DB record"
+            # The raw value is the on-the-wire serialised blob: a varint
+            # length prefix followed by the bytes EncodeBlob produced. For a
+            # 145-byte blob the varint prefix is one byte (0x91 — actually
+            # 145 < 0xfd so it's just 0x91). Skip past it.
+            assert len(row[0]) >= 2, "value too short"
+            assert row[0][1] == 0x02, \
+                f"expected version 0x02 at offset 1, got {hex(row[0][1])}"
+            blob = bytearray(row[0])
+            # ciphertext starts at byte 2 (varint) + 1 (ver) + 32 (iv) = 35.
+            blob[35] ^= 0x01
+            conn.execute("UPDATE main SET value = ? WHERE key = ?",
+                         (bytes(blob), stealth_key))
+            conn.commit()
+        node.loadwallet("dave", load_on_startup=False)
         dave = node.get_wallet_rpc("dave")
         dave.walletpassphrase("dave-passphrase", 60)
-        # GetOrCreate now sees a corrupt file (LoadFromDisk returns false) and
-        # generates fresh keys, so the address differs from dave's original.
-        # The previous behavior would have returned a deterministic-but-wrong
-        # address derived from the corrupted ciphertext.
-        dave_addr_after = dave.pricoin_getstealthaddress()["address"]
-        assert dave_addr_after != dave_addr_before, "tampered file must not yield original identity"
+        # Touching the stealth address must surface the corruption rather
+        # than silently returning a different (garbage-derived) one.
+        assert_raises_rpc_error(-1, "failed to decode",
+                                dave.pricoin_getstealthaddress)
 
         self.log.info("Pricoin CT/ring/KI/RPC-parity/encryption smoke test OK")
 

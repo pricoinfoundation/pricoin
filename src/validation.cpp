@@ -911,9 +911,25 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         }
         // Reject if any of this tx's key images is already pending in the
         // mempool (committed-set conflicts are caught above; this catches
-        // intra-mempool collisions before either side has been mined).
-        if (!pricoin::CheckMempoolKeyImageConflict(tx, m_pool, state)) {
-            return false;
+        // intra-mempool collisions before either side has been mined). Inlined
+        // here rather than living in pricoin/validation.cpp because that file
+        // compiles into bitcoin_common, which doesn't link against the boost
+        // headers txmempool.h pulls in. PreChecks already holds m_pool.cs
+        // (see signature) so the iteration is safe without an extra LOCK.
+        if (!tx.ct_bundle.ring_inputs.empty()) {
+            for (const auto& entry : m_pool.mapTx) {
+                const CTransaction& mtx = entry.GetTx();
+                if (mtx.version != PRICOIN_CT_VERSION) continue;
+                if (mtx.ct_bundle.ring_inputs.empty()) continue;
+                for (const auto& mri : mtx.ct_bundle.ring_inputs) {
+                    for (const auto& nri : tx.ct_bundle.ring_inputs) {
+                        if (mri.sig.key_image == nri.sig.key_image) {
+                            return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+                                                 "txn-mempool-pct-keyimage-conflict");
+                        }
+                    }
+                }
+            }
         }
     } else if (!Consensus::CheckTxInputs(tx, state, m_view, spend_height, ws.m_base_fees)) {
         return false; // state filled in by CheckTxInputs

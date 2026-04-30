@@ -75,6 +75,10 @@ extern const std::string NAME;
 extern const std::string OLD_KEY;
 extern const std::string ORDERPOSNEXT;
 extern const std::string POOL;
+// Pricoin: encrypted-or-plain blob holding the wallet's stealth identity
+// (view+spend privkeys). One row per wallet. Format documented in
+// wallet/pricoin_stealth.cpp.
+extern const std::string PRICOIN_STEALTH;
 extern const std::string PURPOSE;
 extern const std::string SETTINGS;
 extern const std::string TX;
@@ -271,6 +275,13 @@ public:
     bool EraseRecords(const std::unordered_set<std::string>& types);
 
     bool WriteWalletFlags(uint64_t flags);
+
+    // Pricoin: read/write/erase the stealth-identity blob. Caller is
+    // responsible for the encoding (see wallet/pricoin_stealth.cpp); the
+    // DB layer just stores opaque bytes.
+    bool WritePricoinStealth(const std::vector<unsigned char>& blob);
+    bool ReadPricoinStealth(std::vector<unsigned char>& blob);
+    bool ErasePricoinStealth();
     //! Begin a new transaction
     bool TxnBegin();
     //! Commit current transaction

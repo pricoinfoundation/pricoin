@@ -125,37 +125,35 @@ bool MaterializeIdentity(const std::array<unsigned char, kPlaintextSize>& plain,
     return true;
 }
 
-// Throws std::runtime_error if the file is encrypted and the wallet is
-// currently locked. Sets `needs_resave` to true if the on-disk format is
-// not what we'd write today (legacy 64-byte file, or plaintext-on-disk
-// while the wallet is encrypted) — the caller should re-save to upgrade.
-bool LoadFromDisk(CWallet& wallet, Identity& out, bool& needs_resave)
+// Decode a stealth-identity blob (any of the supported versions) into the
+// 64-byte plaintext (view||spend). Throws std::runtime_error if the blob
+// is encrypted and the wallet is currently locked. Sets `needs_upgrade`
+// when the blob's format is older than what we'd write today, so the
+// caller can re-save to migrate.
+bool DecodeBlob(CWallet& wallet,
+                std::span<const unsigned char> buf,
+                std::array<unsigned char, kPlaintextSize>& plain,
+                bool& needs_upgrade)
 {
-    needs_resave = false;
-    const std::string path_str = fs::PathToString(StealthFilePath(wallet));
-    std::ifstream f(path_str, std::ios::binary);
-    if (!f) return false;
-    std::vector<unsigned char> buf((std::istreambuf_iterator<char>(f)),
-                                    std::istreambuf_iterator<char>());
+    needs_upgrade = false;
     if (buf.empty()) return false;
-
-    std::array<unsigned char, kPlaintextSize> plain{};
-    bool plaintext_on_disk = false;
+    bool plaintext = false;
 
     if (buf.size() == kPlaintextSize) {
-        // Legacy unversioned plaintext.
+        // Legacy unversioned 64-byte plaintext (file-only; never written
+        // to the DB). Always upgrade.
         std::memcpy(plain.data(), buf.data(), kPlaintextSize);
-        plaintext_on_disk = true;
-        needs_resave = true;
+        plaintext = true;
+        needs_upgrade = true;
     } else if (buf[0] == kVersionPlain) {
         if (buf.size() != 1 + kPlaintextSize) return false;
         std::memcpy(plain.data(), buf.data() + 1, kPlaintextSize);
-        plaintext_on_disk = true;
+        plaintext = true;
     } else if (buf[0] == kVersionEncryptedNoMac || buf[0] == kVersionEncrypted) {
         const bool has_mac = (buf[0] == kVersionEncrypted);
         const size_t min_size = has_mac
-            ? (1 + kIVSize + 1 + kMacSize)  // ver + iv + ≥1 byte ct + mac
-            : (1 + kIVSize + 1);            // ver + iv + ≥1 byte ct
+            ? (1 + kIVSize + 1 + kMacSize)
+            : (1 + kIVSize + 1);
         if (buf.size() < min_size) return false;
         if (wallet.IsLocked()) {
             throw std::runtime_error(
@@ -178,9 +176,8 @@ bool LoadFromDisk(CWallet& wallet, Identity& out, bool& needs_resave)
                                       ciphertext, expected);
                 const unsigned char* on_disk = buf.data() + ct_end;
                 if (!ConstantTimeEqual(expected, on_disk, kMacSize)) {
-                    // Either wrong key or tampered file. Don't try to
-                    // decrypt — AES-CBC has no built-in integrity, so a
-                    // bad-MAC plaintext is meaningless garbage.
+                    // Wrong key, or tampered ciphertext. AES-CBC has no
+                    // built-in integrity; a bad-MAC plaintext is garbage.
                     return false;
                 }
             }
@@ -191,48 +188,37 @@ bool LoadFromDisk(CWallet& wallet, Identity& out, bool& needs_resave)
         if (!ok) return false;
         std::memcpy(plain.data(), decrypted.data(), kPlaintextSize);
         memory_cleanse(decrypted.data(), decrypted.size());
-        // Legacy no-MAC ciphertext loaded successfully → upgrade on next save.
-        if (!has_mac) needs_resave = true;
+        if (!has_mac) needs_upgrade = true;
     } else {
         return false;
     }
 
-    // Plaintext on disk + wallet is now encrypted → upgrade.
-    if (plaintext_on_disk && wallet.HasEncryptionKeys() && !wallet.IsLocked()) {
-        needs_resave = true;
+    // Plaintext loaded under an encrypted wallet → upgrade so the next
+    // write encrypts the keys at rest.
+    if (plaintext && wallet.HasEncryptionKeys() && !wallet.IsLocked()) {
+        needs_upgrade = true;
     }
-
-    bool ok = MaterializeIdentity(plain, out);
-    memory_cleanse(plain.data(), plain.size());
-    return ok;
+    return true;
 }
 
-bool SaveToDisk(CWallet& wallet, const Identity& id)
+// Encode a 64-byte plaintext into a versioned blob ready for storage.
+// Returns false if the wallet is encrypted-but-locked (caller retries
+// later — see SaveIdentity comment for why we won't write plaintext
+// under an encrypted wallet).
+bool EncodeBlob(CWallet& wallet,
+                std::span<const unsigned char> plain,
+                std::vector<unsigned char>& blob)
 {
-    // Refuse to persist while the wallet is encrypted-but-locked: writing
-    // the plaintext branch would break the wallet's encryption invariant
-    // (every other secret in the wallet is encrypted at rest). The
-    // caller keeps the keys in memory and retries the save once the
-    // wallet is unlocked. This matters because rescans triggered by
-    // `createwallet` with a passphrase fire ScanTxForCTReceives, which
-    // calls GetOrCreate while the freshly-encrypted wallet is still locked.
+    if (plain.size() != kPlaintextSize) return false;
+
     if (wallet.HasEncryptionKeys() && wallet.IsLocked()) {
         return false;
     }
-
-    const std::string path_str = fs::PathToString(StealthFilePath(wallet));
-    std::ofstream f(path_str, std::ios::binary | std::ios::trunc);
-    if (!f) return false;
-
-    std::array<unsigned char, kPlaintextSize> plain{};
-    std::memcpy(plain.data(),      id.view.data(),  32);
-    std::memcpy(plain.data() + 32, id.spend.data(), 32);
 
     if (wallet.HasEncryptionKeys() && !wallet.IsLocked()) {
         uint256 iv;
         GetRandBytes(iv);
         CKeyingMaterial pt(plain.begin(), plain.end());
-        memory_cleanse(plain.data(), plain.size());
         std::vector<unsigned char> ciphertext;
         unsigned char mac[kMacSize]{};
         const unsigned char ver = kVersionEncrypted;
@@ -248,23 +234,73 @@ bool SaveToDisk(CWallet& wallet, const Identity& id)
         });
         memory_cleanse(pt.data(), pt.size());
         if (!ok) return false;
-        f.write(reinterpret_cast<const char*>(&ver), 1);
-        f.write(reinterpret_cast<const char*>(iv.begin()), kIVSize);
-        f.write(reinterpret_cast<const char*>(ciphertext.data()), ciphertext.size());
-        f.write(reinterpret_cast<const char*>(mac), kMacSize);
-        return f.good();
+        blob.clear();
+        blob.reserve(1 + kIVSize + ciphertext.size() + kMacSize);
+        blob.push_back(ver);
+        blob.insert(blob.end(), iv.begin(), iv.begin() + kIVSize);
+        blob.insert(blob.end(), ciphertext.begin(), ciphertext.end());
+        blob.insert(blob.end(), mac, mac + kMacSize);
+        return true;
     }
 
-    // Unencrypted wallet: matches the encryption status of every other
-    // seckey in the wallet (transparent privkeys, etc., are also plaintext
-    // on disk in this case). One-byte version prefix distinguishes the new
-    // format from legacy 64-byte files.
-    const unsigned char ver = kVersionPlain;
-    f.write(reinterpret_cast<const char*>(&ver), 1);
-    f.write(reinterpret_cast<const char*>(plain.data()), plain.size());
-    bool good = f.good();
+    // Unencrypted wallet: store plaintext alongside the wallet's other
+    // plaintext secrets.
+    blob.clear();
+    blob.reserve(1 + kPlaintextSize);
+    blob.push_back(kVersionPlain);
+    blob.insert(blob.end(), plain.begin(), plain.end());
+    return true;
+}
+
+// Read the stealth blob from the wallet's DB. Returns false if absent or
+// the read failed.
+bool ReadBlobFromDB(CWallet& wallet, std::vector<unsigned char>& blob)
+{
+    WalletBatch batch(wallet.GetDatabase());
+    return batch.ReadPricoinStealth(blob);
+}
+
+bool WriteBlobToDB(CWallet& wallet, const std::vector<unsigned char>& blob)
+{
+    WalletBatch batch(wallet.GetDatabase());
+    return batch.WritePricoinStealth(blob);
+}
+
+// Legacy: read the raw side-file blob. Used only for one-time migration
+// into the wallet DB so existing wallets keep their identity after upgrade.
+bool ReadBlobFromLegacyFile(CWallet& wallet, std::vector<unsigned char>& blob)
+{
+    const std::string path_str = fs::PathToString(StealthFilePath(wallet));
+    std::ifstream f(path_str, std::ios::binary);
+    if (!f) return false;
+    blob.assign(std::istreambuf_iterator<char>(f),
+                std::istreambuf_iterator<char>());
+    return !blob.empty();
+}
+
+// Wrap DecodeBlob to fill an Identity, cleansing the intermediate plaintext.
+bool DecodeBlobIntoIdentity(CWallet& wallet,
+                            std::span<const unsigned char> blob,
+                            Identity& out,
+                            bool& needs_upgrade)
+{
+    std::array<unsigned char, kPlaintextSize> plain{};
+    if (!DecodeBlob(wallet, blob, plain, needs_upgrade)) return false;
+    bool ok = MaterializeIdentity(plain, out);
     memory_cleanse(plain.data(), plain.size());
-    return good;
+    return ok;
+}
+
+bool SaveIdentity(CWallet& wallet, const Identity& id)
+{
+    std::array<unsigned char, kPlaintextSize> plain{};
+    std::memcpy(plain.data(),      id.view.data(),  32);
+    std::memcpy(plain.data() + 32, id.spend.data(), 32);
+    std::vector<unsigned char> blob;
+    bool ok = EncodeBlob(wallet, plain, blob);
+    memory_cleanse(plain.data(), plain.size());
+    if (!ok) return false;
+    return WriteBlobToDB(wallet, blob);
 }
 
 } // namespace
@@ -278,39 +314,74 @@ const Identity& GetOrCreate(CWallet& wallet)
         // try again now — by the time the user calls into us a second
         // time, walletpassphrase has typically been called.
         if (!it->second.saved_in_target_format) {
-            if (SaveToDisk(wallet, it->second.id)) {
+            if (SaveIdentity(wallet, it->second.id)) {
                 it->second.saved_in_target_format = true;
-                LogInfo("Pricoin: persisted previously-in-memory stealth identity at %s",
-                        fs::PathToString(StealthFilePath(wallet)));
+                LogInfo("Pricoin: persisted previously-in-memory stealth identity for wallet %s",
+                        wallet.GetName());
             }
         }
         return it->second.id;
     }
 
     Identity id;
+    bool loaded = false;
     bool needs_resave = false;
-    const bool loaded = LoadFromDisk(wallet, id, needs_resave);  // may throw on locked
+    const char* origin = nullptr;
+
+    // 1. Wallet DB (current home — what `backupwallet` covers).
+    std::vector<unsigned char> blob;
+    if (ReadBlobFromDB(wallet, blob)) {
+        if (!DecodeBlobIntoIdentity(wallet, blob, id, needs_resave)) {
+            // DB record exists but we can't decode it. Don't silently
+            // overwrite — the user may have wallet-locked state or a
+            // genuinely corrupt entry. Surface the failure.
+            throw std::runtime_error(
+                "Pricoin stealth record in wallet.dat failed to decode "
+                "(wallet locked, wrong passphrase, or corrupt entry)");
+        }
+        loaded = true;
+        origin = "wallet.dat";
+    }
+
+    // 2. Legacy side file (pre-this-commit installs). Migrate into the DB
+    //    on first read so future backups carry the identity. The file is
+    //    intentionally left in place as a downgrade safety net — it's no
+    //    longer the source of truth, but reverting to an older binary
+    //    will still find it.
+    if (!loaded && ReadBlobFromLegacyFile(wallet, blob)) {
+        if (DecodeBlobIntoIdentity(wallet, blob, id, needs_resave)) {
+            loaded = true;
+            origin = "legacy pricoin_stealth.dat (migrating to wallet.dat)";
+            needs_resave = true;  // always migrate format-wise too
+        }
+    }
+
+    // 3. Nothing on disk — generate a fresh identity.
     if (!loaded) {
         id.view = FreshKey();
         id.spend = FreshKey();
         id.public_address.view = id.view.GetPubKey();
         id.public_address.spend = id.spend.GetPubKey();
         needs_resave = true;
+        origin = "generated";
     }
+
     bool saved = false;
     if (needs_resave) {
-        saved = SaveToDisk(wallet, id);
+        saved = SaveIdentity(wallet, id);
         if (saved) {
-            LogInfo("Pricoin: %s stealth identity at %s",
-                    loaded ? "re-saved (upgraded)" : "generated and saved",
-                    fs::PathToString(StealthFilePath(wallet)));
+            LogInfo("Pricoin: stealth identity for wallet %s — %s, persisted to wallet.dat",
+                    wallet.GetName(), origin);
         } else if (!loaded) {
             LogWarning("Pricoin: stealth identity not yet persisted (wallet locked); will retry on next access");
+        } else {
+            LogWarning("Pricoin: loaded stealth identity for wallet %s from %s but couldn't re-save (wallet locked)",
+                       wallet.GetName(), origin);
         }
     } else {
-        // File on disk already matches what we'd write — no save needed.
         saved = true;
-        LogInfo("Pricoin: loaded stealth identity from %s", fs::PathToString(StealthFilePath(wallet)));
+        LogInfo("Pricoin: loaded stealth identity for wallet %s from %s",
+                wallet.GetName(), origin);
     }
     auto [inserted, _] = g_identities.emplace(&wallet, CacheEntry{std::move(id), saved});
     // Drop our cache entry the moment the wallet is unloaded, so a future
