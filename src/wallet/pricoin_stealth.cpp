@@ -177,6 +177,15 @@ Identity DeriveIdentityFromSeed(std::span<const unsigned char> seed)
 // is encrypted and the wallet is currently locked. Sets `needs_upgrade`
 // when the on-disk format is older than what we'd write today.
 //
+// `accept_no_mac` controls whether the legacy v0.1.x kVersionEncryptedNoMac
+// (0x01, AES-CBC without HMAC) format is honoured. DB-record callers
+// must set this to false: those records were never written in the
+// no-MAC format, so seeing 0x01 in a DB record is necessarily a
+// downgrade-attack attempt against a v0.2 ciphertext (strip MAC, flip
+// version byte → AES-CBC malleability lets an attacker silently swap
+// the wallet's identity). Side-file callers may set true for
+// migration of pre-HMAC wallets, but log a deprecation warning.
+//
 // Note: `buf.size() == kKeyBlobSize` (a raw 64-byte buffer with no
 // version byte) is intentionally NOT supported here — that legacy form
 // only ever existed in the side file. The caller handles that case
@@ -184,7 +193,8 @@ Identity DeriveIdentityFromSeed(std::span<const unsigned char> seed)
 bool DecodeBlob(CWallet& wallet,
                 std::span<const unsigned char> buf,
                 std::vector<unsigned char>& plain,
-                bool& needs_upgrade)
+                bool& needs_upgrade,
+                bool accept_no_mac = false)
 {
     needs_upgrade = false;
     plain.clear();
@@ -199,6 +209,14 @@ bool DecodeBlob(CWallet& wallet,
         return true;
     }
 
+    if (buf[0] == kVersionEncryptedNoMac && !accept_no_mac) {
+        // Refuse: a v0.1.x no-MAC record showing up where we only ever
+        // write v0.2 (DB records) means someone's writing to that file.
+        // Even if the original ciphertext was authentic, AES-CBC alone
+        // is malleable; without the MAC we'd silently decrypt to
+        // attacker-controlled garbage and adopt wrong keys.
+        return false;
+    }
     if (buf[0] != kVersionEncryptedNoMac && buf[0] != kVersionEncrypted) {
         return false;
     }
@@ -370,33 +388,55 @@ bool LoadFromKeyBlobRecord(CWallet& wallet, Identity& out, bool& needs_upgrade)
 }
 
 // Try to read & decode the legacy side-file (pre-v0.1.11). Handles the
-// even-older 64-byte unversioned form too.
+// even-older 64-byte unversioned form too. Returns false if the file
+// is absent. Throws if the file is present but doesn't decode — silently
+// regenerating fresh keys over a corrupt-but-present legacy file would
+// brick recovery of every payment received under the original identity
+// (same hazard the seed/key-blob DB records guard against).
 bool LoadFromLegacyFile(CWallet& wallet, Identity& out)
 {
     std::vector<unsigned char> blob;
-    if (!ReadBlobFromLegacyFile(wallet, blob)) return false;
+    if (!ReadBlobFromLegacyFile(wallet, blob)) return false;  // not present
 
+    bool decoded = false;
     if (blob.size() == kKeyBlobSize) {
         // Pre-versioning: raw 64 bytes (view||spend), no header.
         std::array<unsigned char, kKeyBlobSize> arr{};
         std::memcpy(arr.data(), blob.data(), kKeyBlobSize);
-        bool ok = MaterializeIdentity(arr, out);
+        decoded = MaterializeIdentity(arr, out);
         memory_cleanse(arr.data(), arr.size());
-        return ok;
+    } else {
+        bool unused_upgrade = false;
+        std::vector<unsigned char> plain;
+        // accept_no_mac=true: side files predate the HMAC-on-stealth
+        // change. Migration of an authentic v0.1.x ciphertext into the
+        // v0.2 DB format is the legitimate use case here. The
+        // downgrade-attack threat (MEDIUM-2) doesn't apply to side
+        // files: an attacker rewriting the side file *as 0x01* gains
+        // nothing they couldn't already do by overwriting the file
+        // outright (no DB record exists yet to downgrade).
+        if (DecodeBlob(wallet, blob, plain, unused_upgrade, /*accept_no_mac=*/true) &&
+            plain.size() == kKeyBlobSize) {
+            std::array<unsigned char, kKeyBlobSize> arr{};
+            std::memcpy(arr.data(), plain.data(), kKeyBlobSize);
+            memory_cleanse(plain.data(), plain.size());
+            decoded = MaterializeIdentity(arr, out);
+            memory_cleanse(arr.data(), arr.size());
+        } else {
+            memory_cleanse(plain.data(), plain.size());
+        }
     }
-    bool unused_upgrade = false;
-    std::vector<unsigned char> plain;
-    if (!DecodeBlob(wallet, blob, plain, unused_upgrade)) return false;
-    if (plain.size() != kKeyBlobSize) {
-        memory_cleanse(plain.data(), plain.size());
-        return false;
+
+    if (!decoded) {
+        throw std::runtime_error(strprintf(
+            "Pricoin legacy stealth file %s exists but failed to decode "
+            "(corrupt blob, unrecognised version, or wrong size). Refusing "
+            "to silently regenerate — that would discard every CT payment "
+            "ever received under the original identity. Inspect or remove "
+            "the file manually if it is genuinely garbage.",
+            fs::PathToString(StealthFilePath(wallet))));
     }
-    std::array<unsigned char, kKeyBlobSize> arr{};
-    std::memcpy(arr.data(), plain.data(), kKeyBlobSize);
-    memory_cleanse(plain.data(), plain.size());
-    bool ok = MaterializeIdentity(arr, out);
-    memory_cleanse(arr.data(), arr.size());
-    return ok;
+    return true;
 }
 
 bool SaveSeed(CWallet& wallet, std::span<const unsigned char> seed)

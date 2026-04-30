@@ -504,6 +504,80 @@ class PricoinCTTest(BitcoinTestFramework):
         assert_raises_rpc_error(-1, "failed to decode",
                                 dave.pricoin_getstealthaddress)
 
+        # ---- 10. Downgrade attack on DB record must be refused ----
+        # An attacker with file-write access could rewrite a v2 record
+        # (0x02, MAC-authenticated) as a v1 record (0x01, no MAC) by
+        # stripping the trailing MAC and flipping the version byte.
+        # AES-CBC alone is malleable, so without MAC verification the
+        # decrypt would produce attacker-controlled garbage and the
+        # wallet would silently adopt different keys. DecodeBlob now
+        # refuses 0x01 in DB-record paths (the no-MAC format was only
+        # ever used in the legacy side file).
+        #
+        # Restart dave to a clean encrypted state so we have a fresh v2
+        # record to attack.
+        node.unloadwallet("dave")
+        # Wipe + re-create dave so we get an uncorrupted seed record.
+        import shutil
+        shutil.rmtree(dave_dir)
+        node.createwallet("dave", passphrase="dave-passphrase")
+        dave = node.get_wallet_rpc("dave")
+        dave.walletpassphrase("dave-passphrase", 60)
+        dave.pricoin_getstealthaddress()
+        node.unloadwallet("dave")
+        # Strip the MAC (last 32 bytes of the 113-byte blob) and flip
+        # the version byte from 0x02 to 0x01. The varint prefix shrinks
+        # from 0x71 (113) to 0x51 (81 = 1+32+48).
+        with sqlite3.connect(str(dave_db)) as conn:
+            row = conn.execute("SELECT value FROM main WHERE key = ?",
+                               (seed_key,)).fetchone()
+            assert row is not None
+            assert_equal(row[0][0], 0x71)  # varint = 113
+            assert_equal(row[0][1], 0x02)  # ver = encrypted+MAC
+            payload = bytearray(row[0][1:])  # ver + iv + ct + mac
+            ver_iv_ct = payload[:-32]        # drop the MAC
+            ver_iv_ct[0] = 0x01              # downgrade to no-MAC
+            assert_equal(len(ver_iv_ct), 81)
+            new_value = bytes([0x51]) + bytes(ver_iv_ct)
+            conn.execute("UPDATE main SET value = ? WHERE key = ?",
+                         (new_value, seed_key))
+            conn.commit()
+        node.loadwallet("dave", load_on_startup=False)
+        dave = node.get_wallet_rpc("dave")
+        dave.walletpassphrase("dave-passphrase", 60)
+        # The 0x01 record is rejected → no decode → corruption guard
+        # fires (record present but undecodable).
+        assert_raises_rpc_error(-1, "failed to decode",
+                                dave.pricoin_getstealthaddress)
+        node.unloadwallet("dave")
+
+        # ---- 11. Corrupt legacy side-file must throw, not regenerate ----
+        # MEDIUM-3 from the post-v0.1.14 review. Without the guard, a
+        # garbled side file (file present, decode fails) would silently
+        # fall through to fresh-key generation — same "discard every
+        # already-received payment" pitfall the DB-record guards exist
+        # to prevent.
+        node.createwallet("frank")
+        frank_dir = node.datadir_path / node.chain / "wallets" / "frank"
+        frank_db = frank_dir / "wallet.dat"
+        # Wipe both DB records so the load path will fall through to
+        # the legacy side-file branch.
+        node.unloadwallet("frank")
+        with sqlite3.connect(str(frank_db)) as conn:
+            conn.execute("DELETE FROM main WHERE key = ?", (stealth_key,))
+            conn.execute("DELETE FROM main WHERE key = ?", (seed_key,))
+            conn.commit()
+        # Drop a deliberately-corrupt blob: 100 random bytes (no
+        # version-prefix match, not 64-byte legacy size).
+        corrupt = b"\x99" * 100
+        with open(frank_dir / "pricoin_stealth.dat", "wb") as f:
+            f.write(corrupt)
+        node.loadwallet("frank", load_on_startup=False)
+        frank = node.get_wallet_rpc("frank")
+        assert_raises_rpc_error(-1, "failed to decode",
+                                frank.pricoin_getstealthaddress)
+        node.unloadwallet("frank")
+
         self.log.info("Pricoin CT/ring/KI/RPC-parity/encryption smoke test OK")
 
     def _find_spent_signer(self, node, ring_txid):
