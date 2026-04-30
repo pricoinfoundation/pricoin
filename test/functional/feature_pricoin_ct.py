@@ -147,6 +147,45 @@ class PricoinCTTest(BitcoinTestFramework):
         # padding from the single-recipient ring path) = 5 outputs.
         assert_equal(len(bob_ct["outputs"]), 5)
 
+        # ---- 2a. RBF for v4 ring txs ----
+        # Pre-fix (and pre this commit), the mempool rejected ANY second
+        # ring tx that overlapped key images with a pending one — meaning
+        # a stuck low-fee ring spend could never be fee-bumped. Now the
+        # KI overlap maps onto Bitcoin Core's standard ReplacementChecks
+        # path: same-KI + higher fee replaces; same-KI + lower fee
+        # rejects with "insufficient fee".
+        rbf_low = bob.walletsendct_ring(carol_stealth, 1.0, 0.0001, 4)
+        assert rbf_low["txid"] in node.getrawmempool()
+        # Higher-fee replacement spending the same own output (same KI)
+        # must replace the original. The wallet picks the same own UTXO
+        # for both calls because the original tx hasn't confirmed (its
+        # KI isn't yet in the global committed set, so the recovery
+        # cache still shows that output as unspent).
+        rbf_high = bob.walletsendct_ring(carol_stealth, 1.0, 0.01, 4)
+        mempool_after_bump = node.getrawmempool()
+        assert rbf_high["txid"] in mempool_after_bump, "replacement must be accepted"
+        assert rbf_low["txid"] not in mempool_after_bump, "original must be evicted"
+        # A LOWER-fee attempt against the same own output must be
+        # rejected (Rule #3 / #4 in the BIP125 logic). We can't use
+        # walletsendct_ring directly here — it would auto-broadcast and
+        # the wallet's send pipeline would fail noisily; instead verify
+        # the replacement that's already in mempool can't itself be
+        # downgraded.
+        # walletsendct_ring wraps the mempool rejection in RPC_WALLET_ERROR
+        # (-4) rather than re-throwing the underlying TX_REJECT (-26).
+        # The message still carries the "insufficient fee" string from
+        # PaysForRBF — that's the bit we actually want to assert.
+        assert_raises_rpc_error(-4, "insufficient fee",
+                                bob.walletsendct_ring,
+                                carol_stealth, 1.0, 0.00005, 4)
+        # Confirm the high-fee replacement and mine forward so subsequent
+        # sections see a clean mempool + the expected balances.
+        self.generatetoaddress(node, 1, alice_addr)
+        assert rbf_high["txid"] not in node.getrawmempool(), \
+            "replacement should have been mined"
+        rbf_high_hex = node.getrawtransaction(rbf_high["txid"])
+        del rbf_low, rbf_high, mempool_after_bump, rbf_high_hex
+
         # Phase 3a: spent ring member's chainstate entry is still present.
         spent_signer = self._find_spent_signer(node, ring_txid)
         # gettxout returns null (not spent) only if removed; we expect a result.

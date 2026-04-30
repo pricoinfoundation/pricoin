@@ -828,16 +828,30 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return state.Invalid(TxValidationResult::TX_CONFLICT, "txn-same-nonwitness-data-in-mempool");
     }
 
-    // Check for conflicts with in-memory transactions
-    for (const CTxIn &txin : tx.vin)
-    {
-        const CTransaction* ptxConflicting = m_pool.GetConflictTx(txin.prevout);
-        if (ptxConflicting) {
-            if (!args.m_allow_replacement) {
-                // Transaction conflicts with a mempool tx, but we're not allowing replacements in this context.
-                return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "bip125-replacement-disallowed");
+    // Check for conflicts with in-memory transactions.
+    //
+    // Pricoin: for v4 ring-input txs, vin[i].prevout is just a *marker*
+    // pointing at one of the ring members (a fixed convention so the
+    // wire format has somewhere sane to put a prevout). It's NOT the
+    // output being spent — the actual spend is identified by the
+    // CLSAG key image. Two unrelated ring txs that happen to pick the
+    // same decoy would otherwise be treated as prevout-conflicting,
+    // which is a false positive (they spend different outputs). Skip
+    // the prevout-conflict scan for v4 ring vins; the KI-overlap
+    // check below handles the actual conflict semantics.
+    const bool is_v4_ring_tx = (tx.version == PRICOIN_CT_VERSION) &&
+                               !tx.ct_bundle.ring_inputs.empty();
+    if (!is_v4_ring_tx) {
+        for (const CTxIn &txin : tx.vin)
+        {
+            const CTransaction* ptxConflicting = m_pool.GetConflictTx(txin.prevout);
+            if (ptxConflicting) {
+                if (!args.m_allow_replacement) {
+                    // Transaction conflicts with a mempool tx, but we're not allowing replacements in this context.
+                    return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "bip125-replacement-disallowed");
+                }
+                ws.m_conflicts.insert(ptxConflicting->GetHash());
             }
-            ws.m_conflicts.insert(ptxConflicting->GetHash());
         }
     }
 
@@ -909,25 +923,44 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         if (!pricoin::VerifyConfidentialContextual(tx, m_view, spend_height, state, ws.m_base_fees)) {
             return false;
         }
-        // Reject if any of this tx's key images is already pending in the
-        // mempool (committed-set conflicts are caught above; this catches
-        // intra-mempool collisions before either side has been mined). Inlined
-        // here rather than living in pricoin/validation.cpp because that file
-        // compiles into bitcoin_common, which doesn't link against the boost
-        // headers txmempool.h pulls in. PreChecks already holds m_pool.cs
-        // (see signature) so the iteration is safe without an extra LOCK.
+        // Detect mempool ring-txs whose key-image set overlaps ours.
+        // Each such mempool tx is the v4 equivalent of a prevout
+        // conflict: we're trying to spend at least one output the
+        // other tx already covers. Feed conflicts into ws.m_conflicts
+        // so Bitcoin Core's existing ReplacementChecks path takes
+        // over — Rules 3/4 (fee bumps), Rule 5 (eviction limit),
+        // descendant accounting, and changeset staging all apply
+        // unchanged. (Rules 1 / 2 have no equivalent for v4: there's
+        // no nSequence-signaling gate in modern Bitcoin Core, and
+        // there are no in-mempool unconfirmed v4 inputs to "introduce"
+        // — ring members reference confirmed outpoints only.)
+        //
+        // PreChecks already holds m_pool.cs (see signature), so the
+        // iteration is safe without an extra LOCK. Inlined here rather
+        // than in pricoin/validation.cpp because that file compiles
+        // into bitcoin_common, which doesn't link against the boost
+        // headers txmempool.h pulls in.
         if (!tx.ct_bundle.ring_inputs.empty()) {
             for (const auto& entry : m_pool.mapTx) {
                 const CTransaction& mtx = entry.GetTx();
                 if (mtx.version != PRICOIN_CT_VERSION) continue;
                 if (mtx.ct_bundle.ring_inputs.empty()) continue;
+                bool overlap = false;
                 for (const auto& mri : mtx.ct_bundle.ring_inputs) {
                     for (const auto& nri : tx.ct_bundle.ring_inputs) {
                         if (mri.sig.key_image == nri.sig.key_image) {
-                            return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
-                                                 "txn-mempool-pct-keyimage-conflict");
+                            overlap = true;
+                            break;
                         }
                     }
+                    if (overlap) break;
+                }
+                if (overlap) {
+                    if (!args.m_allow_replacement) {
+                        return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+                                             "bip125-replacement-disallowed");
+                    }
+                    ws.m_conflicts.insert(mtx.GetHash());
                 }
             }
         }
