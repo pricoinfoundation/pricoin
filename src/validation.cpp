@@ -2695,11 +2695,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             }
         }
     }
-    // Single block-level commit (key images get bucketed under
-    // pindex->GetBlockHash() so DisconnectBlock can undo cleanly).
-    if (!fJustCheck && !block_kis.empty()) {
-        pricoin::CommitBlockKIs(pindex->GetBlockHash(), block_kis);
-    }
+    // Note: KI commit is deferred until AFTER the post-loop validity
+    // gate. Committing here would persist the block's key images into
+    // the consensus set before bad-cb-amount / parallel-script-verify
+    // can mark the block invalid; if those fire, we'd be stuck with KIs
+    // from a block that never connects, blocking legitimate spends.
     const auto time_3{SteadyClock::now()};
     m_chainman.time_connect += time_3 - time_2;
     LogDebug(BCLog::BENCH, "      - Connect %u transactions: %.2fms (%.3fms/tx, %.3fms/txin) [%.2fs (%.2fms/blk)]\n", (unsigned)block.vtx.size(),
@@ -2769,6 +2769,15 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         nSigOpsCost,
         Ticks<std::chrono::nanoseconds>(time_5 - time_start)
     );
+
+    // Pricoin: commit ring-input key images now that the block has
+    // passed every validity gate. This is the latest possible moment
+    // — any error path above returns false without touching the KI
+    // store, so a block that doesn't actually connect can't leave
+    // residue in the consensus spent-set.
+    if (!block_kis.empty()) {
+        pricoin::CommitBlockKIs(pindex->GetBlockHash(), block_kis);
+    }
 
     return true;
 }

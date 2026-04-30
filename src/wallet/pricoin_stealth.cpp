@@ -18,6 +18,7 @@
 #include <util/fs.h>
 #include <wallet/crypter.h>
 #include <wallet/db.h>
+#include <wallet/pricoin_ct_send.h>
 #include <wallet/wallet.h>
 
 #include <array>
@@ -597,41 +598,67 @@ SetSeedResult SetSeed(CWallet& wallet,
         return SetSeedResult::InvalidSeed;
     }
 
-    LOCK(g_mutex);
-    if (wallet.HasEncryptionKeys() && wallet.IsLocked()) {
-        return SetSeedResult::Locked;
-    }
+    // Lock order: g_recovery_index_mutex (outer) -> g_mutex (inner).
+    // Matches the reader path (SyncRecoveryIndexLocked → GetOrCreate),
+    // so concurrent readers can't deadlock against this writer. The
+    // recovery cache is dropped iff the inner stealth-state update
+    // succeeds — atomic w.r.t. readers, so a balance query in flight
+    // at rotation time always sees one consistent identity, never
+    // new-id paired with old-id cache entries.
+    SetSeedResult result = SetSeedResult::WriteFailed;
+    RunWithCTRecoveryCacheCleared(wallet, [&]() -> bool {
+        LOCK(g_mutex);
+        if (wallet.HasEncryptionKeys() && wallet.IsLocked()) {
+            result = SetSeedResult::Locked;
+            return false;
+        }
 
-    // Refuse to clobber an existing identity unless the caller has
-    // explicitly opted in. We check both the in-memory cache and the
-    // on-disk records, since the cache might be stale relative to disk
-    // (e.g., the user just imported via createfromdump).
-    if (!confirm_overwrite) {
+        // Refuse to clobber an existing identity unless the caller has
+        // explicitly opted in. We check both the in-memory cache and the
+        // on-disk records, since the cache might be stale relative to
+        // disk (e.g., the user just imported via createfromdump).
+        if (!confirm_overwrite) {
+            auto it = g_identities.find(&wallet);
+            if (it != g_identities.end()) {
+                result = SetSeedResult::AlreadyHasIdentity;
+                return false;
+            }
+            std::vector<unsigned char> probe;
+            if (ReadSeedFromDB(wallet, probe) && !probe.empty()) {
+                result = SetSeedResult::AlreadyHasIdentity;
+                return false;
+            }
+            if (ReadKeyBlobFromDB(wallet, probe) && !probe.empty()) {
+                result = SetSeedResult::AlreadyHasIdentity;
+                return false;
+            }
+        }
+
+        // Write the new seed and erase the legacy key-blob record (if
+        // any), so future loads come from a single source of truth.
+        if (!SaveSeed(wallet, seed)) {
+            result = SetSeedResult::WriteFailed;
+            return false;
+        }
+        {
+            WalletBatch batch(wallet.GetDatabase());
+            batch.ErasePricoinStealth();
+        }
         auto it = g_identities.find(&wallet);
-        if (it != g_identities.end()) return SetSeedResult::AlreadyHasIdentity;
-        std::vector<unsigned char> probe;
-        if (ReadSeedFromDB(wallet, probe) && !probe.empty()) {
-            return SetSeedResult::AlreadyHasIdentity;
+        if (it != g_identities.end()) {
+            memory_cleanse(it->second.seed.data(), it->second.seed.size());
+            g_identities.erase(it);
         }
-        if (ReadKeyBlobFromDB(wallet, probe) && !probe.empty()) {
-            return SetSeedResult::AlreadyHasIdentity;
-        }
-    }
-
-    // Write the new seed and erase the legacy key-blob record (if any),
-    // so future loads come from a single source of truth. Also drop the
-    // in-memory cache so GetOrCreate reloads from disk.
-    if (!SaveSeed(wallet, seed)) return SetSeedResult::WriteFailed;
-    {
-        WalletBatch batch(wallet.GetDatabase());
-        batch.ErasePricoinStealth();
-    }
-    auto it = g_identities.find(&wallet);
-    if (it != g_identities.end()) {
-        memory_cleanse(it->second.seed.data(), it->second.seed.size());
-        g_identities.erase(it);
-    }
-    return SetSeedResult::Ok;
+        result = SetSeedResult::Ok;
+        // Returning true tells the wrapper to also drop the wallet's
+        // recovery cache before releasing g_recovery_index_mutex —
+        // that cache holds entries whose key_image / value were
+        // derived under the OLD identity. Leaving them would inflate
+        // the new identity's balance and surface stale spend
+        // candidates.
+        return true;
+    });
+    return result;
 }
 
 void Shutdown()

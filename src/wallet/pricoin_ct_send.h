@@ -9,9 +9,12 @@
 #include <uint256.h>
 #include <util/result.h>
 
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
+
+class CTransaction;
 
 namespace wallet {
 
@@ -69,6 +72,28 @@ struct PricoinCTRecovery {
 std::vector<PricoinCTRecovery> ScanTxForCTReceives(
     CWallet& wallet,
     const CTransaction& tx);
+
+// Drop the wallet's per-call recovery-scan cache. Idempotent / no-op
+// for wallets that haven't scanned yet. Defined in
+// wallet/rpc/pricoin_ct.cpp next to the cache.
+void DropCTRecoveryCache(CWallet& wallet);
+
+// Atomic two-lock pattern for callers that need to update *both* the
+// recovery cache and other wallet-private state without a race window
+// where readers can see one updated and the other not.
+//
+// Acquires the recovery-cache mutex, calls `inner()` while holding it,
+// and (only if `inner()` returns true) drops the cache for this wallet
+// before releasing the mutex. `inner` may freely take its own locks
+// (e.g. pricoin_stealth's g_mutex) — the recovery-cache mutex is the
+// outer one in the project's lock-order convention.
+//
+// Used by pricoin_stealth::SetSeed: rotating the stealth identity
+// without atomically clearing the recovery cache would briefly let
+// readers see the new identity paired with the old identity's cached
+// (stale, wrong-keys) recoveries.
+void RunWithCTRecoveryCacheCleared(CWallet& wallet,
+                                   std::function<bool()> inner);
 
 } // namespace wallet
 

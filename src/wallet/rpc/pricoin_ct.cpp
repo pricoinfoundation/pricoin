@@ -1602,4 +1602,20 @@ CAmount ConfidentialBalance(CWallet& wallet)
     return total;
 }
 
+void DropCTRecoveryCache(CWallet& wallet)
+{
+    LOCK(g_recovery_index_mutex);
+    g_recovery_indices.erase(&wallet);
+}
+
+void RunWithCTRecoveryCacheCleared(CWallet& wallet,
+                                   std::function<bool()> inner)
+{
+    LOCK(g_recovery_index_mutex);
+    const bool drop = inner();
+    if (drop) {
+        g_recovery_indices.erase(&wallet);
+    }
+}
+
 } // namespace wallet

@@ -18,6 +18,13 @@
 #include <streams.h>
 #include <sync.h>
 #include <tinyformat.h>
+
+#include <cstdio>
+#ifndef WIN32
+#include <unistd.h>
+#else
+#include <io.h>
+#endif
 #include <util/fs.h>
 
 #include <fstream>
@@ -91,14 +98,45 @@ void WriteEntry(std::ofstream& f, const uint256& block_hash,
 }
 
 // Append one block's entry to the persistent file. Caller has g_ki_mutex.
+//
+// Crash safety: we explicitly flush + fsync. Without it, a power loss
+// between the std::ofstream destructor and the OS journal write would
+// land a *truncated* trailing entry on disk: the parser stops at the
+// truncation, leaving the block's KIs partially loaded after restart.
+// Subsequent double-spend of one of the missing KIs would slip through
+// IsKeyImageCommitted on this node — a node-local consensus split.
 void AppendBlockEntry(const uint256& block_hash,
                       std::span<const ringsig::Point> kis)
     EXCLUSIVE_LOCKS_REQUIRED(g_ki_mutex)
 {
     if (g_ki_path.empty()) return;
-    std::ofstream f(fs::PathToString(g_ki_path), std::ios::binary | std::ios::app);
-    if (!f) return;
-    WriteEntry(f, block_hash, kis);
+    const std::string path_str = fs::PathToString(g_ki_path);
+    // Use a low-level fd so we can fsync. std::ofstream's flush()
+    // doesn't reach the platter on its own.
+    FILE* fp = std::fopen(path_str.c_str(), "ab");
+    if (!fp) return;
+    {
+        // Small write buffer for the entry: 32 (block_hash) + 4 (count) + 33*N.
+        std::vector<unsigned char> buf;
+        buf.reserve(32 + 4 + kKISize * kis.size());
+        buf.insert(buf.end(), block_hash.begin(), block_hash.end());
+        const uint32_t n = static_cast<uint32_t>(kis.size());
+        buf.push_back(static_cast<unsigned char>(n & 0xff));
+        buf.push_back(static_cast<unsigned char>((n >> 8) & 0xff));
+        buf.push_back(static_cast<unsigned char>((n >> 16) & 0xff));
+        buf.push_back(static_cast<unsigned char>((n >> 24) & 0xff));
+        for (const auto& ki : kis) {
+            buf.insert(buf.end(), ki.data(), ki.data() + ki.size());
+        }
+        std::fwrite(buf.data(), 1, buf.size(), fp);
+    }
+    std::fflush(fp);
+#ifdef WIN32
+    _commit(_fileno(fp));
+#else
+    fsync(fileno(fp));
+#endif
+    std::fclose(fp);
 }
 
 // Rewrite the entire file from in-memory state. Used on disconnect (and

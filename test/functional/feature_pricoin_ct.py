@@ -320,6 +320,30 @@ class PricoinCTTest(BitcoinTestFramework):
                                 "deadbeef", True)
         node.unloadwallet("dave_recovered")
 
+        # Identity rotation must atomically drop the recovery cache.
+        # (HIGH-2 from the post-v0.1.14 review.) Pre-fix the recovery
+        # cache held entries whose key_image / value were derived under
+        # the OLD spend & view keys. After SetSeed switched to a NEW
+        # identity, those stale entries leaked into the post-rotation
+        # balance — old funds still showing as own.
+        node.createwallet("rotation_test")
+        rt = node.get_wallet_rpc("rotation_test")
+        rt_old_addr = rt.pricoin_getstealthaddress()["address"]
+        alice.walletsendct(rt_old_addr, 3.0, 0.0001)
+        self.generatetoaddress(node, 1, alice_addr)
+        # Cache populates with old-identity recoveries.
+        assert_equal(rt.pricoin_listownct(0)["total_recovered"], 3.0)
+        # Rotate to a fresh random seed.
+        import secrets as _secrets
+        new_seed_hex = _secrets.token_bytes(32).hex()
+        rt.pricoin_setstealthseed(new_seed_hex, True)
+        # Post-rotation cache must reflect the NEW identity (no funds).
+        # If the cache wasn't dropped, total_recovered would still be 3.0.
+        rotated = rt.pricoin_listownct(0)
+        assert_equal(rotated["total_recovered"], 0.0)
+        assert_equal(len(rotated["outputs"]), 0)
+        node.unloadwallet("rotation_test")
+
         # Send to dave; he scans and recovers (wallet still unlocked).
         alice.walletsendct(dave_stealth, 7.0, 0.0001)
         self.generatetoaddress(node, 1, alice_addr)
