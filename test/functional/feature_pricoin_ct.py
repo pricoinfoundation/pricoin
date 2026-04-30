@@ -98,6 +98,14 @@ class PricoinCTTest(BitcoinTestFramework):
         bob_ct = bob.pricoin_listownct(0)
         assert_equal(len(bob_ct["outputs"]), 4)
 
+        # The first call walked the whole chain. A second call with no
+        # new blocks must hit the cache and scan zero new blocks. Without
+        # this, every wallet-balance refresh redoes O(chain) rangeproof
+        # rewinds — the bottleneck `pricoin_listownct` was previously.
+        bob_ct_2 = bob.pricoin_listownct(0)
+        assert_equal(bob_ct_2["scanned_blocks"], 0)
+        assert_equal(len(bob_ct_2["outputs"]), 4)
+
         # ---- 2. CT → CT (ring) ----
         ring_tx = bob.walletsendct_ring(carol_stealth, 5.0, 0.0001, 4)
         ring_txid = ring_tx["txid"]

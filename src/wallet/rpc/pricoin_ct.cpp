@@ -548,6 +548,123 @@ std::optional<RecoveredOutput> TryRecoverCTOutput(
     };
 }
 
+// Per-wallet incremental scan cache. Without this, every
+// pricoin_listownct / ConfidentialBalance / GUI balance refresh
+// re-walks the entire chain and re-tries rangeproof rewind on every v4
+// output. That's O(blocks * outputs_per_block * rangeproof_cost) per
+// call — fine on a 100-block regtest, painful on a 100k-block live
+// chain. The cache walks each block at most once per daemon run; after
+// the first scan, subsequent calls only sweep the new tip-extension.
+//
+// Reorg handling: lazy. If our remembered scan-tip's hash no longer
+// matches what's on the active chain at that height, we discard the
+// cache and rescan from genesis. A more surgical "rewind to common
+// ancestor" is possible but adds complexity for a path that's rare in
+// practice (and that v4 chains may even reject — invalidateblock at
+// depth doesn't compose well with the KI committed-set).
+//
+// In-memory only for this commit — a daemon restart pays one full scan
+// cost. Persisting the cache to wallet.dat is a follow-up; for now,
+// the warm-cache benefit alone takes the cost from "O(chain) per call"
+// to "O(chain) once per session".
+struct CachedRecovery {
+    uint32_t output_index{0};
+    CAmount value{0};
+    pricoin::ringsig::Point key_image{};
+    int height{0};
+};
+struct CTRecoveryIndex {
+    std::map<COutPoint, CachedRecovery> entries;
+    int last_scanned_height{-1};
+    uint256 last_scanned_hash{};
+    btcsignals::scoped_connection unload_conn{btcsignals::connection{}};
+};
+Mutex g_recovery_index_mutex;
+std::map<const CWallet*, CTRecoveryIndex> g_recovery_indices GUARDED_BY(g_recovery_index_mutex);
+
+struct SyncStats {
+    int new_blocks_scanned{0};
+    bool reorg_detected{false};
+};
+
+// Caller MUST hold g_recovery_index_mutex.
+CTRecoveryIndex& SyncRecoveryIndexLocked(CWallet& wallet, SyncStats* stats = nullptr)
+    EXCLUSIVE_LOCKS_REQUIRED(g_recovery_index_mutex)
+{
+    auto [it, inserted] = g_recovery_indices.try_emplace(&wallet);
+    if (inserted) {
+        // Drop our cache the moment the wallet is unloaded — see the
+        // matching pattern in pricoin_stealth::GetOrCreate. Without it
+        // the raw CWallet* would dangle into the next wallet allocated
+        // at the same heap address.
+        CWallet* wallet_ptr = &wallet;
+        it->second.unload_conn = wallet.NotifyUnload.connect([wallet_ptr]() {
+            LOCK(g_recovery_index_mutex);
+            g_recovery_indices.erase(wallet_ptr);
+        });
+    }
+    auto& index = it->second;
+
+    interfaces::Chain& chain = wallet.chain();
+    const int tip_height = chain.getHeight().value_or(-1);
+    if (tip_height < 0) return index;
+
+    // Reorg detection: tip went backwards, OR our remembered scan tip's
+    // hash no longer matches the active chain at that height.
+    bool needs_full_rescan = false;
+    if (index.last_scanned_height > tip_height) {
+        needs_full_rescan = true;
+    } else if (index.last_scanned_height >= 0) {
+        const uint256 expected_hash = chain.getBlockHash(index.last_scanned_height);
+        if (expected_hash != index.last_scanned_hash) {
+            needs_full_rescan = true;
+        }
+    }
+    if (needs_full_rescan) {
+        index.entries.clear();
+        index.last_scanned_height = -1;
+        index.last_scanned_hash = uint256{};
+        if (stats) stats->reorg_detected = true;
+    }
+
+    if (index.last_scanned_height >= tip_height) return index;
+
+    // GetOrCreate primes the in-memory stealth identity if it isn't
+    // already there. May throw if the wallet is encrypted+locked — in
+    // that case we can't scan, and the exception propagates to the RPC
+    // caller (matches pre-existing pricoin_listownct semantics).
+    const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+
+    int new_blocks = 0;
+    for (int h = index.last_scanned_height + 1; h <= tip_height; ++h) {
+        const uint256 block_hash = chain.getBlockHash(h);
+        CBlock block;
+        if (!chain.findBlock(block_hash, interfaces::FoundBlock().data(block))) continue;
+        ++new_blocks;
+        for (const auto& tx_ref : block.vtx) {
+            if (tx_ref->version != PRICOIN_CT_VERSION) continue;
+            for (uint32_t i = 0; i < tx_ref->vout.size(); ++i) {
+                auto rec = TryRecoverCTOutput(id, *tx_ref, i);
+                if (!rec) continue;
+                CachedRecovery cr;
+                cr.output_index = rec->output_index;
+                cr.value = rec->value;
+                cr.key_image = rec->key_image;
+                cr.height = h;
+                index.entries[COutPoint{tx_ref->GetHash(), rec->output_index}] = cr;
+            }
+        }
+        index.last_scanned_height = h;
+        index.last_scanned_hash = block_hash;
+    }
+    if (new_blocks > 0) {
+        LogDebug(BCLog::WALLETDB, "Pricoin: scanned %d new block(s) for wallet %s; %u total recoveries cached\n",
+                 new_blocks, wallet.GetName(), (unsigned)index.entries.size());
+    }
+    if (stats) stats->new_blocks_scanned = new_blocks;
+    return index;
+}
+
 RPCMethod pricoin_listownct()
 {
     return RPCMethod{
@@ -580,56 +697,38 @@ RPCMethod pricoin_listownct()
             CWallet& wallet = *wallet_sp;
             const int startheight = request.params[0].isNull() ? 0 : request.params[0].getInt<int>();
 
-            const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
-            interfaces::Chain& chain = wallet.chain();
-
-            struct Pending {
-                COutPoint outpoint;
-                CAmount value;
-                int height;
-                pricoin::ringsig::Point key_image;
-            };
-            std::vector<Pending> pending;
-            int scanned_blocks = 0;
-            int scanned_mempool = 0;
-
-            const std::optional<int> tip_opt = chain.getHeight();
-            const int tip_height = tip_opt.value_or(-1);
-
-            for (int h = std::max(startheight, 0); h <= tip_height; ++h) {
-                const uint256 block_hash = chain.getBlockHash(h);
-                CBlock block;
-                if (!chain.findBlock(block_hash, interfaces::FoundBlock().data(block))) continue;
-                if (block.vtx.empty()) continue;
-                ++scanned_blocks;
-                for (const auto& tx_ref : block.vtx) {
-                    if (tx_ref->version != PRICOIN_CT_VERSION) continue;
-                    for (uint32_t i = 0; i < tx_ref->vout.size(); ++i) {
-                        auto rec = TryRecoverCTOutput(id, *tx_ref, i);
-                        if (!rec) continue;
-                        pending.push_back(Pending{
-                            COutPoint{tx_ref->GetHash(), rec->output_index},
-                            rec->value, h, rec->key_image});
-                    }
-                }
-            }
-
-            // Phase 3a: chainstate-erasure no longer marks v4 outputs spent
-            // (they're kept indefinitely as ring-decoy candidates). Filter
-            // by the global key-image set instead — an output is spent iff
-            // its KI has been committed.
+            // Sync the per-wallet recovery cache with the chain. First
+            // call after daemon restart pays a full scan; subsequent
+            // calls only walk the new tip-extension (and don't redo
+            // rangeproof rewinds for already-known recoveries).
             UniValue outputs{UniValue::VARR};
             CAmount total_recovered = 0;
-            for (const auto& p : pending) {
-                if (pricoin::IsKeyImageCommitted(p.key_image)) continue;
-                total_recovered += p.value;
-                UniValue entry{UniValue::VOBJ};
-                entry.pushKV("txid", p.outpoint.hash.ToString());
-                entry.pushKV("vout", (int)p.outpoint.n);
-                entry.pushKV("value", ValueFromAmount(p.value));
-                entry.pushKV("height", p.height);
-                outputs.push_back(entry);
+            int scanned_blocks = 0;
+            {
+                LOCK(g_recovery_index_mutex);
+                SyncStats sync_stats;
+                CTRecoveryIndex& index = SyncRecoveryIndexLocked(wallet, &sync_stats);
+                // Report only what was newly scanned in *this* call (0 on
+                // a warm cache). The cache itself spans 0..tip; downstream
+                // monitoring uses scanned_blocks to detect cache hits.
+                scanned_blocks = sync_stats.new_blocks_scanned;
+                // Phase 3a: chainstate-erasure no longer marks v4 outputs
+                // spent (they're kept indefinitely as ring-decoy
+                // candidates). Filter by the global key-image set —
+                // an output is spent iff its KI has been committed.
+                for (const auto& [outpoint, rec] : index.entries) {
+                    if (rec.height < startheight) continue;
+                    if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
+                    total_recovered += rec.value;
+                    UniValue entry{UniValue::VOBJ};
+                    entry.pushKV("txid", outpoint.hash.ToString());
+                    entry.pushKV("vout", (int)outpoint.n);
+                    entry.pushKV("value", ValueFromAmount(rec.value));
+                    entry.pushKV("height", rec.height);
+                    outputs.push_back(entry);
+                }
             }
+            int scanned_mempool = 0;
             // Mempool sweep is omitted in this MVP — interfaces::Chain doesn't
             // expose entry iteration. A confirmed-only scan is sufficient to
             // demonstrate Phase 5e end-to-end.
@@ -692,16 +791,33 @@ std::vector<ChainCTOutput> CollectChainCTOutputs(interfaces::Chain& chain)
 // linear-decay weighting here is a strict improvement over uniform random,
 // not a finished privacy story.
 //
-// TODO: switch to gamma(k=19.28, scale=1.61) over log(age_seconds) once the
-// chain has enough history that the empirical parameters can be measured.
+// PRIVACY: the half-life is sampled per-call from a wide band rather than
+// hardcoded. Every wallet on a fixed half-life gives an analyst a single
+// recency curve to fit, and once they have it, the real spend in each
+// ring stands out as the one whose age is best-explained by that curve.
+// Drawing a fresh half-life per ring tx — even within one wallet's
+// history — fuzzes the inference: an attacker fitting "what curve did
+// this tx use?" sees a different curve every time, with a known wide
+// prior. The band [864, 5760] blocks ≈ 1.5..10 days at 150s blocks
+// brackets a plausible range of real spend behaviour without devolving
+// into uniform-over-history (which would re-introduce the
+// pre-padding-era fingerprint of "real spend is always the recent one").
+//
+// TODO: switch to gamma(k=19.28, scale=1.61) over log(age_seconds) once
+// the chain has enough history that the empirical parameters can be
+// measured. At that point the per-call randomization can be tightened
+// (or replaced) to match the empirical curve.
 std::vector<ChainCTOutput> SampleDecoysRecencyWeighted(
     std::vector<ChainCTOutput> pool, size_t k, int tip_height,
     FastRandomContext& cprng)
 {
     if (k >= pool.size()) return pool;
 
-    // Half-life ≈ 5 days at 150s blocks. Weight halves every ~2880 blocks.
-    constexpr double kHalfLifeBlocks = 2880.0;
+    // Random half-life per call: 864..5760 blocks (1.5..10 days).
+    constexpr uint32_t kHalfLifeMin = 864;
+    constexpr uint32_t kHalfLifeMax = 5760;
+    const double half_life_blocks = static_cast<double>(
+        kHalfLifeMin + cprng.randrange(kHalfLifeMax - kHalfLifeMin + 1));
 
     // A-Res (Efraimidis-Spirakis) in log-space. The textbook formulation is
     // key_i = u_i^(1/w_i), pick top-k. Computing u^(1/w) directly underflows
@@ -716,7 +832,7 @@ std::vector<ChainCTOutput> SampleDecoysRecencyWeighted(
     keyed.reserve(pool.size());
     for (size_t i = 0; i < pool.size(); ++i) {
         const int age = std::max(0, tip_height - pool[i].height);
-        const double weight = 1.0 / (1.0 + static_cast<double>(age) / kHalfLifeBlocks);
+        const double weight = 1.0 / (1.0 + static_cast<double>(age) / half_life_blocks);
         // u in (0, 1) — strictly open to keep log well-defined.
         const double u = (static_cast<double>(cprng.rand32()) + 1.0) /
                          (static_cast<double>(UINT32_MAX) + 2.0);
@@ -1475,25 +1591,13 @@ std::vector<PricoinCTRecovery> ScanTxForCTReceives(
 
 CAmount ConfidentialBalance(CWallet& wallet)
 {
-    const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
-    interfaces::Chain& chain = wallet.chain();
-    const int tip = chain.getHeight().value_or(-1);
-
+    LOCK(g_recovery_index_mutex);
+    const CTRecoveryIndex& index = SyncRecoveryIndexLocked(wallet);
     CAmount total = 0;
-    for (int h = 0; h <= tip; ++h) {
-        const uint256 block_hash = chain.getBlockHash(h);
-        CBlock block;
-        if (!chain.findBlock(block_hash, interfaces::FoundBlock().data(block))) continue;
-        for (const auto& tx_ref : block.vtx) {
-            if (tx_ref->version != PRICOIN_CT_VERSION) continue;
-            for (uint32_t i = 0; i < tx_ref->vout.size(); ++i) {
-                auto rec = TryRecoverCTOutput(id, *tx_ref, i);
-                if (!rec) continue;
-                // Phase 3a: spentness is the KI set, not chainstate erasure.
-                if (pricoin::IsKeyImageCommitted(rec->key_image)) continue;
-                total += rec->value;
-            }
-        }
+    for (const auto& [_, rec] : index.entries) {
+        // Phase 3a: spentness is the KI set, not chainstate erasure.
+        if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
+        total += rec.value;
     }
     return total;
 }
