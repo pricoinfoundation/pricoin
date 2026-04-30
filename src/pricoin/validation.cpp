@@ -27,10 +27,32 @@ namespace pricoin {
 
 namespace {
 
-// In-memory global key-image set, mirrored to <datadir>/pricoin_keyimages.dat.
-// CommitRingKeyImages appends each new KI to the file; InitKeyImageStore
-// loads the file into memory at daemon startup so re-broadcasts of any
-// previously-confirmed ring tx hit the double-spend check.
+// On-disk key-image store. Every confirmed v4 ring spend's key image is
+// committed here; queries against the in-memory set drive forward
+// double-spend detection (mempool + ConnectBlock) and the wallet's
+// "is this output already spent?" check.
+//
+// File format (v2, magic-prefixed):
+//   bytes 0..3   : magic "PKI\x01"
+//   then a sequence of per-block entries:
+//     [block_hash : 32 little-endian-as-uint256]
+//     [num_kis    : uint32 little-endian]
+//     [ki         : 33 bytes]*num_kis
+//
+// Per-block entries let DisconnectBlock cleanly undo on a reorg: we look
+// up the block, drop its KIs from the in-memory set, and rewrite the
+// file. (The previous append-only format had no block tagging, so a
+// reorg either left stale KIs in memory or — after restart, when KIs
+// reloaded from the file — silently rejected the corrected chain as
+// "double-spend" of its own KIs.)
+//
+// Format v1 (legacy, pre-block-tagging): raw 33-byte KIs concatenated,
+// no header. Read-supported for one-time migration; on first new commit
+// the file is rewritten in v2 format. KIs read from a v1 file are
+// stored under a sentinel "unknown block" bucket — they're detected as
+// committed (forward correctness) but never removed by UncommitBlockKIs
+// (we don't know which block to attribute them to). This is no worse
+// than the prior behaviour; new activity is reorg-safe.
 struct KIHash {
     size_t operator()(const ringsig::Point& p) const noexcept {
         // First 8 bytes of the compressed pubkey are already uniformly distributed.
@@ -39,17 +61,72 @@ struct KIHash {
         return h;
     }
 };
+constexpr unsigned char kKIFileMagic[4] = {'P', 'K', 'I', 0x01};
+constexpr size_t kKISize = 33;
+
 Mutex g_ki_mutex;
 std::unordered_set<ringsig::Point, KIHash> g_key_images GUARDED_BY(g_ki_mutex);
+// block_hash → KIs that block committed. Used by UncommitBlockKIs.
+// Entries under uint256{} (the all-zero hash) are legacy KIs whose
+// containing block was lost on the v1→v2 migration; they are never
+// removed by UncommitBlockKIs because we can't attribute them.
+std::map<uint256, std::vector<ringsig::Point>> g_kis_by_block GUARDED_BY(g_ki_mutex);
 fs::path g_ki_path GUARDED_BY(g_ki_mutex);
 
-// Append a 33-byte key image to the persistent file. Called under g_ki_mutex.
-void PersistKeyImage(const ringsig::Point& ki) EXCLUSIVE_LOCKS_REQUIRED(g_ki_mutex)
+void WriteEntry(std::ofstream& f, const uint256& block_hash,
+                std::span<const ringsig::Point> kis)
 {
-    if (g_ki_path.empty()) return;  // store not initialized
-    std::ofstream f(fs::PathToString(g_ki_path), std::ios::binary | std::ios::app);
-    if (f) {
+    f.write(reinterpret_cast<const char*>(block_hash.begin()), 32);
+    const uint32_t n = static_cast<uint32_t>(kis.size());
+    unsigned char le[4]{
+        static_cast<unsigned char>(n & 0xff),
+        static_cast<unsigned char>((n >> 8) & 0xff),
+        static_cast<unsigned char>((n >> 16) & 0xff),
+        static_cast<unsigned char>((n >> 24) & 0xff),
+    };
+    f.write(reinterpret_cast<const char*>(le), 4);
+    for (const auto& ki : kis) {
         f.write(reinterpret_cast<const char*>(ki.data()), ki.size());
+    }
+}
+
+// Append one block's entry to the persistent file. Caller has g_ki_mutex.
+void AppendBlockEntry(const uint256& block_hash,
+                      std::span<const ringsig::Point> kis)
+    EXCLUSIVE_LOCKS_REQUIRED(g_ki_mutex)
+{
+    if (g_ki_path.empty()) return;
+    std::ofstream f(fs::PathToString(g_ki_path), std::ios::binary | std::ios::app);
+    if (!f) return;
+    WriteEntry(f, block_hash, kis);
+}
+
+// Rewrite the entire file from in-memory state. Used on disconnect (and
+// on first commit after a v1→v2 migration, where the file lacks the
+// magic header). Atomic-ish via tmp + rename.
+void RewriteFile() EXCLUSIVE_LOCKS_REQUIRED(g_ki_mutex)
+{
+    if (g_ki_path.empty()) return;
+    fs::path tmp = g_ki_path;
+    tmp += ".tmp";
+    {
+        std::ofstream f(fs::PathToString(tmp), std::ios::binary | std::ios::trunc);
+        if (!f) return;
+        f.write(reinterpret_cast<const char*>(kKIFileMagic), sizeof(kKIFileMagic));
+        for (const auto& [block_hash, kis] : g_kis_by_block) {
+            if (kis.empty()) continue;
+            WriteEntry(f, block_hash, kis);
+        }
+        if (!f.good()) {
+            fs::remove(tmp);
+            return;
+        }
+    }
+    std::error_code ec;
+    fs::rename(tmp, g_ki_path, ec);
+    if (ec) {
+        LogWarning("Pricoin: failed to rename %s -> %s (%s)",
+                   fs::PathToString(tmp), fs::PathToString(g_ki_path), ec.message());
     }
 }
 
@@ -65,14 +142,6 @@ uint256 ComputeRingMessage(const CTransaction& tx)
     HashWriter hw{};
     hw << TX_NO_WITNESS(CTransaction{std::move(mtx)});
     return hw.GetSHA256();
-}
-
-// Compute W_i = C_i − C_pseudo as a compressed pubkey, via the helper in
-// pricoin/cttx.cpp.
-std::optional<ringsig::Point> CommitDelta(
-    const ct::Commitment& C_i, const ct::Commitment& C_pseudo)
-{
-    return ct::SubtractCommitments(C_i, C_pseudo);
 }
 
 bool VerifyDirectInputs(
@@ -253,28 +322,38 @@ bool VerifyConfidentialContextual(
     return true;
 }
 
-void CommitRingKeyImages(const CTransaction& tx)
+void CommitBlockKIs(const uint256& block_hash,
+                    std::span<const ringsig::Point> kis)
 {
-    if (tx.version != PRICOIN_CT_VERSION) return;
+    if (kis.empty()) return;
     LOCK(g_ki_mutex);
-    for (const auto& ri : tx.ct_bundle.ring_inputs) {
-        const auto [it, inserted] = g_key_images.insert(ri.sig.key_image);
-        if (inserted) {
-            PersistKeyImage(ri.sig.key_image);
+    auto& bucket = g_kis_by_block[block_hash];
+    std::vector<ringsig::Point> newly_added;
+    newly_added.reserve(kis.size());
+    for (const auto& ki : kis) {
+        if (g_key_images.insert(ki).second) {
+            bucket.push_back(ki);
+            newly_added.push_back(ki);
         }
+    }
+    if (!newly_added.empty()) {
+        AppendBlockEntry(block_hash, newly_added);
     }
 }
 
-void UncommitRingKeyImages(const CTransaction& tx)
+void UncommitBlockKIs(const uint256& block_hash)
 {
-    if (tx.version != PRICOIN_CT_VERSION) return;
     LOCK(g_ki_mutex);
-    for (const auto& ri : tx.ct_bundle.ring_inputs) {
-        g_key_images.erase(ri.sig.key_image);
+    auto it = g_kis_by_block.find(block_hash);
+    if (it == g_kis_by_block.end()) return;
+    for (const auto& ki : it->second) {
+        g_key_images.erase(ki);
     }
-    // Persistence file is append-only and isn't rewritten on reorg.
-    // Toy scope: the slightly-stale on-disk set is acceptable since
-    // membership only matters for forward double-spend detection.
+    g_kis_by_block.erase(it);
+    // Reorg out of a confirmed block: rewrite the file so the on-disk
+    // state matches memory. A daemon restart at this point must NOT
+    // reload the disconnected block's KIs.
+    RewriteFile();
 }
 
 bool IsKeyImageCommitted(const ringsig::Point& ki)
@@ -292,14 +371,88 @@ void InitKeyImageStore(const std::string& datadir_path)
         LogInfo("Pricoin: key-image store empty at startup (%s)", fs::PathToString(g_ki_path));
         return;
     }
+
+    // Detect format: read the first 4 bytes; if they match the magic, it's
+    // a v2 file with per-block entries. Otherwise treat the entire file as
+    // a stream of raw 33-byte KIs (v1 legacy).
+    unsigned char magic_buf[4]{};
+    f.read(reinterpret_cast<char*>(magic_buf), 4);
+    const bool is_v2 = (f.gcount() == 4 &&
+                        std::memcmp(magic_buf, kKIFileMagic, 4) == 0);
+
     size_t loaded = 0;
-    ringsig::Point buf;
-    while (f.read(reinterpret_cast<char*>(buf.data()), buf.size())) {
-        if (f.gcount() != static_cast<std::streamsize>(buf.size())) break;
-        g_key_images.insert(buf);
-        ++loaded;
+    if (is_v2) {
+        // Stream per-block entries: [block_hash:32][num_kis:u32][KIs:33*N].
+        while (f) {
+            uint256 block_hash;
+            f.read(reinterpret_cast<char*>(block_hash.begin()), 32);
+            if (f.gcount() == 0) break;  // clean EOF
+            if (f.gcount() != 32) {
+                LogWarning("Pricoin: truncated block_hash in key-image store");
+                break;
+            }
+            unsigned char le[4]{};
+            f.read(reinterpret_cast<char*>(le), 4);
+            if (f.gcount() != 4) {
+                LogWarning("Pricoin: truncated num_kis in key-image store");
+                break;
+            }
+            const uint32_t n = static_cast<uint32_t>(le[0]) |
+                               (static_cast<uint32_t>(le[1]) << 8) |
+                               (static_cast<uint32_t>(le[2]) << 16) |
+                               (static_cast<uint32_t>(le[3]) << 24);
+            // Sanity bound: a single block shouldn't have more than a few
+            // thousand KIs even pathologically. 1M is a safe ceiling that
+            // also prevents trying to allocate a comically large vector
+            // on file corruption.
+            if (n > 1'000'000) {
+                LogWarning("Pricoin: implausible KI count %u in entry — stopping load", n);
+                break;
+            }
+            auto& bucket = g_kis_by_block[block_hash];
+            bucket.reserve(bucket.size() + n);
+            ringsig::Point ki;
+            for (uint32_t i = 0; i < n; ++i) {
+                f.read(reinterpret_cast<char*>(ki.data()), ki.size());
+                if (f.gcount() != static_cast<std::streamsize>(ki.size())) {
+                    LogWarning("Pricoin: truncated KI in entry — stopping load");
+                    return;
+                }
+                if (g_key_images.insert(ki).second) {
+                    bucket.push_back(ki);
+                    ++loaded;
+                }
+            }
+        }
+        LogInfo("Pricoin: loaded %u key image(s) across %u block(s) from %s",
+                (unsigned)loaded, (unsigned)g_kis_by_block.size(),
+                fs::PathToString(g_ki_path));
+    } else {
+        // v1 legacy: rewind, stream raw 33-byte KIs into the "unknown
+        // block" bucket. This bucket is forward-correctness only — KIs in
+        // it are detected as committed but can't be removed by
+        // UncommitBlockKIs (we don't know which block to attribute them
+        // to). On the next CommitBlockKIs call the file gets rewritten in
+        // v2 format with the legacy bucket preserved.
+        f.clear();
+        f.seekg(0);
+        ringsig::Point ki;
+        auto& legacy_bucket = g_kis_by_block[uint256{}];
+        while (f.read(reinterpret_cast<char*>(ki.data()), ki.size())) {
+            if (f.gcount() != static_cast<std::streamsize>(ki.size())) break;
+            if (g_key_images.insert(ki).second) {
+                legacy_bucket.push_back(ki);
+                ++loaded;
+            }
+        }
+        LogWarning("Pricoin: loaded %u legacy (untagged) key image(s) from %s — "
+                   "deep reorgs across pre-upgrade blocks may leave stale entries; "
+                   "new commits will rewrite this file in the v2 per-block format",
+                   (unsigned)loaded, fs::PathToString(g_ki_path));
+        // Rewrite immediately so the magic header lands on disk and future
+        // restarts use the v2 path.
+        RewriteFile();
     }
-    LogInfo("Pricoin: loaded %u key image(s) from %s", (unsigned)loaded, fs::PathToString(g_ki_path));
 }
 
 } // namespace pricoin

@@ -7,7 +7,9 @@
 
 #include <consensus/amount.h>
 #include <pricoin/ringsig.h>
+#include <uint256.h>
 
+#include <span>
 #include <string>
 
 class CCoinsViewCache;
@@ -39,16 +41,18 @@ namespace pricoin {
     TxValidationState& state,
     CAmount& txfee_out);
 
-// Pricoin: commit each ring-input's key image to the global in-memory set
-// AND append it to the persistent on-disk file. Called from ConnectBlock
-// after the block has fully validated. Idempotent.
-void CommitRingKeyImages(const CTransaction& tx);
+// Pricoin: commit a block's ring-input key images to the global in-memory
+// set AND append a per-block entry to the persistent file. Tagging by
+// block_hash lets DisconnectBlock undo cleanly. Called from ConnectBlock
+// after the block has fully validated. Idempotent against re-runs of the
+// same block.
+void CommitBlockKIs(const uint256& block_hash,
+                    std::span<const ringsig::Point> kis);
 
-// Remove key images committed by tx (for chain reorgs / DisconnectBlock).
-// Note: in-memory only — does not modify the persistent file. The toy
-// scope accepts that on a reorg + restart, the persistent set may be
-// slightly stale; correctness is preserved for forward operation.
-void UncommitRingKeyImages(const CTransaction& tx);
+// Remove all key images committed by `block_hash` from both the in-memory
+// set and the persistent file. Called from DisconnectBlock. No-op for a
+// block that wasn't committed (e.g. a v4-empty block).
+void UncommitBlockKIs(const uint256& block_hash);
 
 // Initialize the key-image persistent store. Loads any existing key images
 // from <datadir>/pricoin_keyimages.dat into the in-memory set, and opens

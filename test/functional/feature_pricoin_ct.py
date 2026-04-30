@@ -190,21 +190,43 @@ class PricoinCTTest(BitcoinTestFramework):
         assert_raises_rpc_error(-8, "recipients array is empty",
                                 alice.walletsendct_multi, [], 0.0001)
 
-        # ---- 3. KI persistence + reject-after-restart ----
+        # ---- 3. KI persistence + reorg-correctness ----
+        # While the ring block is still on the active chain, re-broadcast
+        # of its hex must be rejected — the tx's outputs are already in
+        # the UTXO set so mempool refuses (the KI itself is also in the
+        # committed set, but the outputs-in-utxo check fires first).
         self.restart_node(0, extra_args=["-txindex=1"])
         node = self.nodes[0]
+        assert_raises_rpc_error(-27, "already in utxo set",
+                                node.sendrawtransaction, ring_hex)
 
-        # The same hex re-broadcast should hit "txn-already-known" (chain has it).
-        # To exercise the KI rejection path specifically, invalidate the block,
-        # restart so the KI loads from disk, and try to send the tx fresh.
+        # Reorg-out the ring block, restart, and confirm the tx is
+        # accepted again. Pre-fix the KI was append-only on disk and
+        # reloaded at startup, so even after invalidateblock + restart
+        # the daemon would silently reject re-acceptance with
+        # bad-pct-double-spend-keyimage. After the per-block-bucket fix,
+        # DisconnectBlock removes the KI from both memory and disk; the
+        # tx ends up back in the mempool (Bitcoin Core auto-resubmits
+        # txs from disconnected blocks) and reconsider re-confirms it.
         node.invalidateblock(ring_block)
         self.restart_node(0, extra_args=["-txindex=1"])
         node = self.nodes[0]
-
-        # KI was loaded from pricoin_keyimages.dat at startup; the tx isn't on
-        # chain anymore (block was invalidated), but the KI still rejects.
-        assert_raises_rpc_error(-26, "bad-pct-double-spend-keyimage",
-                                node.sendrawtransaction, ring_hex)
+        # Mempool may have been persisted; either the tx is already there
+        # via mempool.dat, or we re-broadcast it. Either way the KI must
+        # NOT be in the committed set after the disconnect, so acceptance
+        # must succeed (no bad-pct-double-spend-keyimage).
+        if ring_txid not in node.getrawmempool():
+            try:
+                node.sendrawtransaction(ring_hex)
+            except Exception as e:
+                # Fee-bump style "insufficient fee, rejecting replacement"
+                # means the tx is already there (a different identity
+                # tried to replace it) — that still proves KI was removed.
+                assert "double-spend-keyimage" not in str(e), \
+                    f"KI must have been uncommitted; got: {e}"
+        # Mine the chain back to a stable shape so later sections see the
+        # balances they expect.
+        node.reconsiderblock(ring_block)
 
         # ---- 4. Transparent send RPCs are stubbed ----
         # Wallets need re-loading after restart_node().

@@ -2310,6 +2310,13 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
     // move best block pointer to prevout block
     view.SetBestBlock(pindex->pprev->GetBlockHash());
 
+    // Pricoin: drop the disconnected block's key images from both the
+    // in-memory set and the persistent file. Symmetric with
+    // CommitBlockKIs in ConnectBlock; without this, a reorg + restart
+    // reloads stale KIs and rejects the corrected chain as
+    // "double-spend" of its own (now-disconnected) entries.
+    pricoin::UncommitBlockKIs(pindex->GetBlockHash());
+
     return fClean ? DISCONNECT_OK : DISCONNECT_UNCLEAN;
 }
 
@@ -2587,6 +2594,9 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     int nInputs = 0;
     int64_t nSigOpsCost = 0;
     blockundo.vtxundo.reserve(block.vtx.size() - 1);
+    // Pricoin: accumulate this block's v4-ring-input key images so we
+    // can commit them in one block-tagged batch after the loop.
+    std::vector<pricoin::ringsig::Point> block_kis;
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
         if (!state.IsValid()) break;
@@ -2674,14 +2684,21 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             blockundo.vtxundo.emplace_back();
         }
         UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight);
-        // Pricoin: commit any ring-input key images to the global set, but
-        // only on the real (non-test) ConnectBlock pass — TestBlockValidity
-        // runs this loop with fJustCheck=true, and we must not pollute the
-        // committed set there or the actual ConnectBlock will reject as
-        // double-spend.
-        if (!fJustCheck) {
-            pricoin::CommitRingKeyImages(tx);
+        // Pricoin: collect ring-input key images for batched commit at
+        // block end. Only on the real (non-test) ConnectBlock pass —
+        // TestBlockValidity runs this loop with fJustCheck=true, and we
+        // must not pollute the committed set there or the actual
+        // ConnectBlock will reject as double-spend.
+        if (!fJustCheck && tx.version == PRICOIN_CT_VERSION) {
+            for (const auto& ri : tx.ct_bundle.ring_inputs) {
+                block_kis.push_back(ri.sig.key_image);
+            }
         }
+    }
+    // Single block-level commit (key images get bucketed under
+    // pindex->GetBlockHash() so DisconnectBlock can undo cleanly).
+    if (!fJustCheck && !block_kis.empty()) {
+        pricoin::CommitBlockKIs(pindex->GetBlockHash(), block_kis);
     }
     const auto time_3{SteadyClock::now()};
     m_chainman.time_connect += time_3 - time_2;
