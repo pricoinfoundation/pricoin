@@ -12,6 +12,7 @@
 #include <pricoin/ringsig.h>
 #include <pricoin/ct.h>
 #include <pricoin/cttx.h>
+#include <pricoin/joint_stealth.h>
 #include <pricoin/stealth.h>
 #include <pricoin/validation.h>
 #include <primitives/transaction.h>
@@ -1842,11 +1843,294 @@ RPCMethod pricoin_setstealthseed()
         }
     };
 }
+
+// ---- Atomic-swap stage 2: cooperative stealth (receive side) ----
+
+RPCMethod pricoin_buildjointstealthaddress()
+{
+    return RPCMethod{
+        "pricoin_buildjointstealthaddress",
+        "Combine this wallet's stealth identity with another party's public\n"
+        "stealth keys (view + spend pubkeys) into a joint two-party stealth\n"
+        "address. Funds sent there look like a normal stealth payment on\n"
+        "chain — but neither party alone can scan for them or spend them.\n"
+        "Both parties must run this RPC with each other's public keys to\n"
+        "obtain the SAME joint address (point addition is commutative).\n"
+        "\n"
+        "Used as the on-chain primitive for trustless atomic swaps: the\n"
+        "PRIC funder locks coins at a joint(self, counterparty) output\n"
+        "while the counterparty locks the other-chain asset at a\n"
+        "matching HTLC. Cooperative recovery uses\n"
+        "pricoin_jointscan_partial / pricoin_jointscan_recover.\n",
+        {
+            {"other_view_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Counterparty's view pubkey (33-byte compressed hex). Get this "
+             "from THEIR pricoin_getstealthaddress.view_pubkey."},
+            {"other_spend_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Counterparty's spend pubkey (33-byte compressed hex)."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR, "address", "Joint stealth address (Base58Check)"},
+                {RPCResult::Type::STR_HEX, "joint_view_pubkey", "Sum of both view pubkeys (33 bytes)"},
+                {RPCResult::Type::STR_HEX, "joint_spend_pubkey", "Sum of both spend pubkeys (33 bytes)"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("pricoin_buildjointstealthaddress",
+                "\"02abcdef...\" \"02123456...\"")
+        },
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const std::string other_view_hex = request.params[0].get_str();
+            const std::string other_spend_hex = request.params[1].get_str();
+            if (!IsHex(other_view_hex) || other_view_hex.size() != 66) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "other_view_pubkey must be 66 hex characters (33 bytes)");
+            }
+            if (!IsHex(other_spend_hex) || other_spend_hex.size() != 66) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "other_spend_pubkey must be 66 hex characters (33 bytes)");
+            }
+            const std::vector<unsigned char> other_view_bytes = ParseHex(other_view_hex);
+            const std::vector<unsigned char> other_spend_bytes = ParseHex(other_spend_hex);
+            ::pricoin::stealth::StealthAddress other;
+            other.view = CPubKey(std::span<const unsigned char>{other_view_bytes});
+            other.spend = CPubKey(std::span<const unsigned char>{other_spend_bytes});
+            if (!other.IsValid()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "other party's pubkeys are not valid compressed secp256k1 points");
+            }
+            const auto& self_id = ::wallet::pricoin_stealth::GetOrCreate(*wallet_sp);
+            auto joint = ::pricoin::joint_stealth::Combine(self_id.public_address, other);
+            if (!joint) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "joint pubkey computation failed (degenerate inputs)");
+            }
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("address", ::pricoin::stealth::Encode(*joint));
+            out.pushKV("joint_view_pubkey", HexStr(joint->view));
+            out.pushKV("joint_spend_pubkey", HexStr(joint->spend));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_jointscan_partial()
+{
+    return RPCMethod{
+        "pricoin_jointscan_partial",
+        "Compute this party's contribution to a cooperative scan of a\n"
+        "two-party joint stealth output. Returns a 33-byte compressed point\n"
+        "(self_view_priv * tx_pubkey_R) that the counterparty needs to\n"
+        "combine with their own partial in pricoin_jointscan_recover.\n"
+        "\n"
+        "Sharing the partial does NOT leak this wallet's view privkey: the\n"
+        "partial is a one-way scalar multiplication. The counterparty\n"
+        "learns the joint output's value once they recover, which is the\n"
+        "intended behaviour for a joint stealth output.\n",
+        {
+            {"tx_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Raw v4 transaction containing the joint output (hex). The "
+             "per-output tx_pubkey is read out of the embedded ct_bundle."},
+            {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Index of the joint output within the tx"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "partial", "33-byte compressed point self_view_priv*R"},
+                {RPCResult::Type::STR_HEX, "tx_pubkey", "The R that was used (echoed for caller convenience)"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("pricoin_jointscan_partial", "\"<tx hex>\" 1")
+        },
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            if (wallet_sp->HasEncryptionKeys() && wallet_sp->IsLocked()) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED,
+                    "Cooperative scan requires the wallet to be unlocked.");
+            }
+            const std::string tx_hex = request.params[0].get_str();
+            const uint32_t vout = request.params[1].getInt<uint32_t>();
+            CMutableTransaction mtx;
+            if (!DecodeHexTx(mtx, tx_hex, /*try_no_witness=*/true, /*try_witness=*/true)) {
+                throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "tx hex failed to decode");
+            }
+            CTransaction tx{std::move(mtx)};
+            if (tx.version != PRICOIN_CT_VERSION) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "tx is not a v4 confidential tx");
+            }
+            if (vout >= tx.ct_bundle.outputs.size()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "vout out of range");
+            }
+            const auto& tx_pubkey = tx.ct_bundle.outputs[vout].tx_pubkey;
+            // Reject zero (transparent / non-stealth output) — it would
+            // produce a useless partial.
+            bool all_zero = true;
+            for (auto b : tx_pubkey) { if (b != 0) { all_zero = false; break; } }
+            if (all_zero) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "vout has no tx_pubkey (not a stealth output)");
+            }
+            std::vector<unsigned char> r_bytes(tx_pubkey.begin(), tx_pubkey.end());
+            const auto& self_id = ::wallet::pricoin_stealth::GetOrCreate(*wallet_sp);
+            auto partial = ::pricoin::joint_stealth::ScanPartial(self_id.view, r_bytes);
+            if (!partial) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "ECDH partial computation failed (invalid R or invalid view priv)");
+            }
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("partial", HexStr(*partial));
+            out.pushKV("tx_pubkey", HexStr(r_bytes));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_jointscan_recover()
+{
+    return RPCMethod{
+        "pricoin_jointscan_recover",
+        "Combine this wallet's scan partial with the counterparty's\n"
+        "partial to recover the joint output's value and rangeproof blind.\n"
+        "Either of the two parties can run this RPC once they have BOTH\n"
+        "partials (their own + the other party's, exchanged off-chain).\n"
+        "\n"
+        "Caller fetches the raw tx via `getrawtransaction <txid>` and\n"
+        "passes the hex here. We verify that the recovered one-time pubkey\n"
+        "matches the v4 output's scriptPubKey at `vout` (i.e. the chain\n"
+        "output really IS the joint payment that both partials are about).\n"
+        "On match, rewinds the rangeproof to the (value, blind) pair.\n",
+        {
+            {"tx_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Raw v4 transaction containing the joint output (hex)"},
+            {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Index of the joint output within the tx"},
+            {"my_partial", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Self partial returned by pricoin_jointscan_partial"},
+            {"other_partial", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Counterparty's partial (from THEIR pricoin_jointscan_partial)"},
+            {"other_spend_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Counterparty's spend pubkey (33 bytes hex). Needed to "
+             "reconstruct B_joint = self_spend + other_spend."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_AMOUNT, "value", "Recovered amount in PRIC"},
+                {RPCResult::Type::STR_HEX, "blind", "32-byte rangeproof blind"},
+                {RPCResult::Type::NUM, "vout", "Echo of input vout (for caller convenience)"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("pricoin_jointscan_recover",
+                "\"<tx hex>\" 1 \"03...\" \"03...\" \"02...\"")
+        },
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            if (wallet.HasEncryptionKeys() && wallet.IsLocked()) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED,
+                    "Cooperative scan requires the wallet to be unlocked.");
+            }
+
+            const std::string tx_hex = request.params[0].get_str();
+            const uint32_t vout = request.params[1].getInt<uint32_t>();
+            const std::string my_partial_hex = request.params[2].get_str();
+            const std::string other_partial_hex = request.params[3].get_str();
+            const std::string other_spend_hex = request.params[4].get_str();
+            for (const auto& [name, hex] : {
+                    std::pair{"my_partial", my_partial_hex},
+                    std::pair{"other_partial", other_partial_hex},
+                    std::pair{"other_spend_pubkey", other_spend_hex}}) {
+                if (!IsHex(hex) || hex.size() != 66) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        strprintf("%s must be 66 hex characters (33 bytes)", name));
+                }
+            }
+            const std::vector<unsigned char> my_partial = ParseHex(my_partial_hex);
+            const std::vector<unsigned char> other_partial = ParseHex(other_partial_hex);
+            const std::vector<unsigned char> other_spend_bytes = ParseHex(other_spend_hex);
+            CPubKey other_spend(std::span<const unsigned char>{other_spend_bytes});
+            if (!other_spend.IsValid() || !other_spend.IsCompressed()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "other_spend_pubkey is not a valid compressed secp256k1 point");
+            }
+
+            // Decode the tx.
+            CMutableTransaction mtx;
+            if (!DecodeHexTx(mtx, tx_hex, /*try_no_witness=*/true, /*try_witness=*/true)) {
+                throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "tx hex failed to decode");
+            }
+            CTransaction tx{std::move(mtx)};
+            if (tx.version != PRICOIN_CT_VERSION) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "tx is not a v4 confidential tx");
+            }
+            if (vout >= tx.vout.size() || vout >= tx.ct_bundle.outputs.size()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "vout out of range");
+            }
+
+            // Combine partials → joint ECDH point.
+            auto shared_point = ::pricoin::joint_stealth::CombinePartials(my_partial, other_partial);
+            if (!shared_point) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "partial combine failed");
+            }
+            // Standard stealth derivations from the joint point.
+            auto shared = ::pricoin::stealth::DeriveSharedSecret(*shared_point, vout);
+
+            // Joint spend pubkey B_joint = B_self + B_other.
+            const auto& self_id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+            ::pricoin::stealth::StealthAddress other;
+            other.view = self_id.public_address.view;     // dummy; not used downstream
+            other.spend = other_spend;
+            auto joint_addr = ::pricoin::joint_stealth::Combine(self_id.public_address, other);
+            if (!joint_addr) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "joint key combine failed");
+            }
+            auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, joint_addr->spend);
+            if (!P) throw JSONRPCError(RPC_INTERNAL_ERROR, "one-time pubkey derivation failed");
+
+            const CScript expected_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
+            if (tx.vout[vout].scriptPubKey != expected_spk) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "scriptPubKey mismatch — partials don't decode to this output");
+            }
+            // Rewind the rangeproof using the joint shared secret as nonce.
+            auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*shared_point, vout);
+            ::pricoin::ct::BlindingFactor nonce_arr{};
+            std::memcpy(nonce_arr.data(), rp_nonce.data(), 32);
+            const auto& outp = tx.ct_bundle.outputs[vout];
+            const auto& script = outp.script_pubkey;
+            auto rewound = ::pricoin::ct::RewindRangeProof(
+                outp.commitment,
+                std::span<const unsigned char>{outp.rangeproof.data(), outp.rangeproof.size()},
+                std::span<const unsigned char>{script.data(), script.size()},
+                nonce_arr);
+            if (!rewound) throw JSONRPCError(RPC_INTERNAL_ERROR, "rangeproof rewind failed");
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("value", ValueFromAmount(static_cast<CAmount>(rewound->value)));
+            out.pushKV("blind", HexStr(rewound->blind));
+            out.pushKV("vout", static_cast<int>(vout));
+            return out;
+        }
+    };
+}
+
 } // namespace
 
 RPCMethod pricoin_getstealthaddress_export() { return pricoin_getstealthaddress(); }
 RPCMethod pricoin_getstealthseed_export() { return pricoin_getstealthseed(); }
 RPCMethod pricoin_setstealthseed_export() { return pricoin_setstealthseed(); }
+RPCMethod pricoin_buildjointstealthaddress_export() { return pricoin_buildjointstealthaddress(); }
+RPCMethod pricoin_jointscan_partial_export() { return pricoin_jointscan_partial(); }
+RPCMethod pricoin_jointscan_recover_export() { return pricoin_jointscan_recover(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

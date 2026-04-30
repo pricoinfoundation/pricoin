@@ -147,6 +147,81 @@ class PricoinCTTest(BitcoinTestFramework):
         # padding from the single-recipient ring path) = 5 outputs.
         assert_equal(len(bob_ct["outputs"]), 5)
 
+        # ---- 2x. Joint stealth (atomic-swap stage 2 receive primitive) ----
+        # Two parties — alice and bob — each compute the same joint
+        # stealth address from their pubkeys. A payment to that address
+        # is on-chain indistinguishable from a single-party stealth
+        # output, but neither party alone can scan or spend it. The
+        # protocol below covers receive-side (stage 2 commit 1):
+        # cooperative spend lands in a follow-up.
+        alice_keys = alice.pricoin_getstealthaddress()
+        bob_keys = bob.pricoin_getstealthaddress()
+        # Either party plugs the OTHER's pubkeys in; commutative point
+        # addition guarantees they get the same joint address.
+        joint_a = alice.pricoin_buildjointstealthaddress(
+            bob_keys["view_pubkey"], bob_keys["spend_pubkey"])
+        joint_b = bob.pricoin_buildjointstealthaddress(
+            alice_keys["view_pubkey"], alice_keys["spend_pubkey"])
+        assert_equal(joint_a["address"], joint_b["address"])
+        assert_equal(joint_a["joint_view_pubkey"], joint_b["joint_view_pubkey"])
+        assert_equal(joint_a["joint_spend_pubkey"], joint_b["joint_spend_pubkey"])
+        # The joint address must be DIFFERENT from either single-party
+        # one — otherwise the joint property is vacuous.
+        assert joint_a["address"] != alice_keys["address"]
+        assert joint_a["address"] != bob_keys["address"]
+
+        # Send PRIC to the joint address.
+        sent = alice.walletsendct(joint_a["address"], 4.2, 0.0001)
+        self.generatetoaddress(node, 1, alice_addr)
+        joint_txid = sent["txid"]
+        joint_tx_hex = node.getrawtransaction(joint_txid)
+        joint_raw = node.decoderawtransaction(joint_tx_hex)
+
+        # Find the vout paying to the joint address. The protocol
+        # expects an external coordinator to tell each party which
+        # vout to look at; for the test we brute-force across vouts.
+        joint_vout = None
+        joint_value = None
+        rec = None
+        for vidx in range(len(joint_raw["vout"])):
+            try:
+                a_partial = alice.pricoin_jointscan_partial(
+                    joint_tx_hex, vidx)["partial"]
+                b_partial = bob.pricoin_jointscan_partial(
+                    joint_tx_hex, vidx)["partial"]
+                rec = bob.pricoin_jointscan_recover(
+                    joint_tx_hex, vidx, b_partial, a_partial,
+                    alice_keys["spend_pubkey"])
+                joint_vout = vidx
+                joint_value = rec["value"]
+                break
+            except Exception:
+                continue
+        assert joint_vout is not None, "joint output should be findable via cooperative scan"
+        assert_equal(float(joint_value), 4.2)
+
+        # The opposite party (alice) recovers the same value with the
+        # same partials.
+        a_partial2 = alice.pricoin_jointscan_partial(
+            joint_tx_hex, joint_vout)["partial"]
+        b_partial2 = bob.pricoin_jointscan_partial(
+            joint_tx_hex, joint_vout)["partial"]
+        rec_alice = alice.pricoin_jointscan_recover(
+            joint_tx_hex, joint_vout, a_partial2, b_partial2,
+            bob_keys["spend_pubkey"])
+        assert_equal(float(rec_alice["value"]), 4.2)
+        # Same blind in both reconstructions — the math is deterministic.
+        assert_equal(rec["blind"], rec_alice["blind"])
+
+        # Neither party alone can recover. Verify by passing my own
+        # partial as both arguments: the partials sum to 2*a_self*R
+        # rather than (a_self + a_other)*R, so the derived P doesn't
+        # match the on-chain script.
+        assert_raises_rpc_error(-8, "scriptPubKey mismatch",
+            alice.pricoin_jointscan_recover,
+            joint_tx_hex, joint_vout, a_partial2, a_partial2,
+            bob_keys["spend_pubkey"])
+
         # ---- 2a. RBF for v4 ring txs ----
         # Pre-fix (and pre this commit), the mempool rejected ANY second
         # ring tx that overlapped key images with a pending one — meaning

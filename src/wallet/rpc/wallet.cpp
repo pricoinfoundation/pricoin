@@ -906,6 +906,9 @@ RPCMethod walletsendct_locked_export();
 RPCMethod pricoin_getstealthaddress_export();
 RPCMethod pricoin_getstealthseed_export();
 RPCMethod pricoin_setstealthseed_export();
+RPCMethod pricoin_buildjointstealthaddress_export();
+RPCMethod pricoin_jointscan_partial_export();
+RPCMethod pricoin_jointscan_recover_export();
 RPCMethod pricoin_listownct_export();
 RPCMethod walletsendct_from_ct_export();
 RPCMethod walletsendct_ring_export();
@@ -920,6 +923,9 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &pricoin_getstealthaddress_export},
         {"wallet", &pricoin_getstealthseed_export},
         {"wallet", &pricoin_setstealthseed_export},
+        {"wallet", &pricoin_buildjointstealthaddress_export},
+        {"wallet", &pricoin_jointscan_partial_export},
+        {"wallet", &pricoin_jointscan_recover_export},
         {"wallet", &pricoin_listownct_export},
         {"wallet", &walletsendct_from_ct_export},
         {"wallet", &walletsendct_ring_export},

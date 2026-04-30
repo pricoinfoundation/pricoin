@@ -830,28 +830,30 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
 
     // Check for conflicts with in-memory transactions.
     //
-    // Pricoin: for v4 ring-input txs, vin[i].prevout is just a *marker*
-    // pointing at one of the ring members (a fixed convention so the
-    // wire format has somewhere sane to put a prevout). It's NOT the
-    // output being spent — the actual spend is identified by the
-    // CLSAG key image. Two unrelated ring txs that happen to pick the
-    // same decoy would otherwise be treated as prevout-conflicting,
-    // which is a false positive (they spend different outputs). Skip
-    // the prevout-conflict scan for v4 ring vins; the KI-overlap
-    // check below handles the actual conflict semantics.
-    const bool is_v4_ring_tx = (tx.version == PRICOIN_CT_VERSION) &&
-                               !tx.ct_bundle.ring_inputs.empty();
-    if (!is_v4_ring_tx) {
-        for (const CTxIn &txin : tx.vin)
-        {
-            const CTransaction* ptxConflicting = m_pool.GetConflictTx(txin.prevout);
-            if (ptxConflicting) {
-                if (!args.m_allow_replacement) {
-                    // Transaction conflicts with a mempool tx, but we're not allowing replacements in this context.
-                    return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "bip125-replacement-disallowed");
-                }
-                ws.m_conflicts.insert(ptxConflicting->GetHash());
+    // Pricoin note: v4 ring-input txs DO go through the standard
+    // prevout-conflict scan even though their vin[0].prevout is a
+    // marker (a ring member used as a fixed-position outpoint). This
+    // matters because the mempool's mapNextTx is a unique-keyed map
+    // — two v4 ring txs that happen to pick the same decoy as
+    // ring[0] would both try to claim the same prevout key, breaking
+    // mempool consistency (the second insertion silently fails;
+    // mempool.check later asserts). Routing decoy collisions through
+    // the BIP125 path is slightly imperfect (a higher-fee unrelated
+    // ring tx will evict yours if you happen to share a decoy) but
+    // it stays consistent and the collision is rare in practice
+    // (decoys are randomly drawn from a pool of all chain v4
+    // outputs). The KI-overlap check below handles the case we
+    // actually need RBF for (legitimate fee bumps of your OWN ring
+    // tx with a different shuffle).
+    for (const CTxIn &txin : tx.vin)
+    {
+        const CTransaction* ptxConflicting = m_pool.GetConflictTx(txin.prevout);
+        if (ptxConflicting) {
+            if (!args.m_allow_replacement) {
+                // Transaction conflicts with a mempool tx, but we're not allowing replacements in this context.
+                return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "bip125-replacement-disallowed");
             }
+            ws.m_conflicts.insert(ptxConflicting->GetHash());
         }
     }
 

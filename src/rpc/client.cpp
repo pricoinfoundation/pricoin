@@ -182,6 +182,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "walletsendct_ring", 3, "ring_size" },
     { "pricoin_listownct", 0, "startheight" },
     { "pricoin_setstealthseed", 1, "confirm_overwrite" },
+    { "pricoin_jointscan_partial", 1, "vout" },
+    { "pricoin_jointscan_recover", 1, "vout" },
     { "testmempoolaccept", 0, "rawtxs" },
     { "testmempoolaccept", 1, "maxfeerate" },
     { "submitpackage", 0, "package" },
