@@ -105,6 +105,20 @@ bool CheckTransaction(const CTransaction& tx, TxValidationState& state)
         if (tx.ct_bundle.transparent_fee > static_cast<uint64_t>(MAX_MONEY)) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-fee-toolarge");
         }
+        // No two ring inputs in the same tx may share a key image — that would
+        // be a self-double-spend and is structurally invalid (independent of
+        // mempool / chain context).
+        if (has_ring) {
+            for (size_t a = 0; a < tx.ct_bundle.ring_inputs.size(); ++a) {
+                for (size_t b = a + 1; b < tx.ct_bundle.ring_inputs.size(); ++b) {
+                    if (tx.ct_bundle.ring_inputs[a].sig.key_image ==
+                        tx.ct_bundle.ring_inputs[b].sig.key_image) {
+                        return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                             "bad-pct-double-spend-keyimage-intra");
+                    }
+                }
+            }
+        }
     } else {
         // Pricoin: privacy is mandatory. The only allowed non-v4 transactions
         // are coinbases (subsidy is auditable; coinbase stays transparent).

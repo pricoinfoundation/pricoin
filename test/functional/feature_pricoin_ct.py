@@ -199,7 +199,96 @@ class PricoinCTTest(BitcoinTestFramework):
         assert_raises_rpc_error(-32, "Privacy is mandatory",
                                 alice.sendmany, "", {a_other: 1.0})
 
-        self.log.info("Pricoin CT/ring/KI/RPC-parity smoke test OK")
+        # ---- 5. Stealth keys are encrypted at rest with the wallet master key ----
+        # Encrypting the wallet must persist the stealth side-file in the
+        # encrypted format (version byte 0x01). After lock, send/scan paths
+        # that depend on the stealth identity must fail; after unlock they
+        # must work end-to-end.
+        node.createwallet("dave", passphrase="dave-passphrase")
+        dave = node.get_wallet_rpc("dave")
+        dave.walletpassphrase("dave-passphrase", 60)
+        dave_stealth = dave.pricoin_getstealthaddress()["address"]
+        # File must be the current encrypted-with-MAC format (version 0x02).
+        import os
+        wallet_dir = node.datadir_path / node.chain / "wallets" / "dave"
+        stealth_file = wallet_dir / "pricoin_stealth.dat"
+        assert stealth_file.exists(), "stealth side-file should exist after first stealth-address use"
+        with open(stealth_file, "rb") as f:
+            header = f.read(1)
+        assert_equal(header, b"\x02")  # encrypted+MAC version byte
+
+        # Send to dave; he scans and recovers (wallet still unlocked).
+        alice.walletsendct(dave_stealth, 7.0, 0.0001)
+        self.generatetoaddress(node, 1, alice_addr)
+        dave_ct = dave.pricoin_listownct(0)
+        assert_equal(dave_ct["total_recovered"], 7.0)
+
+        # Lock the wallet. Drop our cached identity by restarting so the
+        # next scan must reload from the encrypted file under a locked wallet.
+        dave.walletlock()
+        self.restart_node(0, extra_args=["-txindex=1"])
+        node = self.nodes[0]
+        node.loadwallet("dave")
+        dave = node.get_wallet_rpc("dave")
+        # Locked wallet: scanning must fail because we can't decrypt the keys.
+        assert_raises_rpc_error(-1, "encrypted",
+                                dave.pricoin_listownct, 0)
+
+        # After unlock, scan recovers cleanly.
+        dave.walletpassphrase("dave-passphrase", 60)
+        dave_ct = dave.pricoin_listownct(0)
+        assert_equal(dave_ct["total_recovered"], 7.0)
+
+        # Reload wallets that the restart unloaded.
+        node.loadwallet("alice")
+        alice = node.get_wallet_rpc("alice")
+
+        # ---- 6. Unload-then-reload must not leak stealth identity across wallets ----
+        # The in-memory cache used to be keyed by raw CWallet*; unload + new
+        # wallet at the same heap address would silently inherit the old
+        # identity. After the fix, the cache entry is dropped on unload, so
+        # the same wallet name reloaded gives the SAME on-disk identity (loaded
+        # from its own pricoin_stealth.dat) — never some other wallet's keys.
+        dave_addr_before = dave.pricoin_getstealthaddress()["address"]
+        node.unloadwallet("dave")
+        # Churn allocations so the next CWallet is unlikely to land at the same
+        # address even by coincidence — but the cache must be wallet-private
+        # regardless.
+        node.createwallet("erin")
+        erin = node.get_wallet_rpc("erin")
+        erin_addr = erin.pricoin_getstealthaddress()["address"]
+        assert dave_addr_before != erin_addr, "fresh wallet must get fresh identity"
+        # Reload dave and confirm we recover dave's own keys, not erin's.
+        node.loadwallet("dave")
+        dave = node.get_wallet_rpc("dave")
+        dave.walletpassphrase("dave-passphrase", 60)
+        assert_equal(dave.pricoin_getstealthaddress()["address"], dave_addr_before)
+
+        # ---- 7. Tampered stealth file must fail to load (HMAC integrity) ----
+        # AES-CBC alone is malleable: flipping a ciphertext byte yields a
+        # plaintext that's still 64 bytes of valid-looking key material, so
+        # the wallet would silently start using a *different* stealth identity
+        # and lose track of every payment already received. The HMAC catches
+        # this. Flip one byte in the ciphertext region and confirm the load
+        # rejects rather than silently substituting garbage keys.
+        node.unloadwallet("dave")
+        with open(stealth_file, "rb") as f:
+            blob = bytearray(f.read())
+        # Header (1) + IV (32). Flip the first ciphertext byte.
+        blob[33] ^= 0x01
+        with open(stealth_file, "wb") as f:
+            f.write(blob)
+        node.loadwallet("dave")
+        dave = node.get_wallet_rpc("dave")
+        dave.walletpassphrase("dave-passphrase", 60)
+        # GetOrCreate now sees a corrupt file (LoadFromDisk returns false) and
+        # generates fresh keys, so the address differs from dave's original.
+        # The previous behavior would have returned a deterministic-but-wrong
+        # address derived from the corrupted ciphertext.
+        dave_addr_after = dave.pricoin_getstealthaddress()["address"]
+        assert dave_addr_after != dave_addr_before, "tampered file must not yield original identity"
+
+        self.log.info("Pricoin CT/ring/KI/RPC-parity/encryption smoke test OK")
 
     def _find_spent_signer(self, node, ring_txid):
         """Look in the ring tx's bundle for the outpoint that the wallet

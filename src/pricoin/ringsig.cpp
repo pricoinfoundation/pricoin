@@ -75,19 +75,33 @@ Point HashToPointInternal(std::span<const unsigned char> seed) EXCLUSIVE_LOCKS_R
 
 // Tagged-hash style H_s: SHA256("pricoin/ringsig/H_s-v1" || data...) reduced
 // mod n. Returns a 32-byte scalar guaranteed to be a valid secp256k1 scalar.
+//
+// On the rare collision path (output ≥ n, probability ~2^-128), rehash with
+// a distinct domain tag + counter byte. The common-path hash is unchanged
+// so existing on-chain CLSAG signatures continue to verify.
 Scalar HashToScalar(std::span<const std::span<const unsigned char>> chunks)
     EXCLUSIVE_LOCKS_REQUIRED(g_mutex)
 {
-    while (true) {
+    {
         CSHA256 h;
         h.Write(reinterpret_cast<const unsigned char*>("pricoin/ringsig/H_s-v1"), 22);
         for (const auto& c : chunks) h.Write(c.data(), c.size());
         Scalar out;
         h.Finalize(out.data());
         if (secp256k1_ec_seckey_verify(Ctx(), out.data())) return out;
-        // If invalid (extremely rare), tweak by hashing again with a tag.
-        chunks = std::span<const std::span<const unsigned char>>{};
     }
+    constexpr const char* kRehashTag = "pricoin/ringsig/H_s-rehash-v1";
+    for (uint16_t counter = 0; counter <= 0xff; ++counter) {
+        CSHA256 h;
+        h.Write(reinterpret_cast<const unsigned char*>(kRehashTag), std::strlen(kRehashTag));
+        for (const auto& c : chunks) h.Write(c.data(), c.size());
+        const unsigned char ctr_byte = static_cast<unsigned char>(counter);
+        h.Write(&ctr_byte, 1);
+        Scalar out;
+        h.Finalize(out.data());
+        if (secp256k1_ec_seckey_verify(Ctx(), out.data())) return out;
+    }
+    throw std::runtime_error("HashToScalar: rehash counter exhausted (impossible)");
 }
 
 // Compute s*G + c*P, return as a Point. Used in the inner ring loop.
@@ -135,6 +149,28 @@ bool Compute_R(const Scalar& s_i, const Scalar& c_i, const Point& P_bytes, const
 {
     Point Hp = HashToPointInternal(std::span<const unsigned char>{P_bytes.data(), P_bytes.size()});
     return LinComb_sQ_plus_cR(s_i, Hp, c_i, I_bytes, out);
+}
+
+// O(N²) pairwise comparison. N is bounded by the per-tx ring size limit
+// (≤ 16 in current consensus), so the quadratic factor is negligible.
+bool HasDuplicate(std::span<const Point> ring)
+{
+    for (size_t i = 0; i < ring.size(); ++i) {
+        for (size_t j = i + 1; j < ring.size(); ++j) {
+            if (ring[i] == ring[j]) return true;
+        }
+    }
+    return false;
+}
+
+bool HasDuplicateMembers(std::span<const MultiLayerMember> ring)
+{
+    for (size_t i = 0; i < ring.size(); ++i) {
+        for (size_t j = i + 1; j < ring.size(); ++j) {
+            if (ring[i].P == ring[j].P) return true;
+        }
+    }
+    return false;
 }
 
 // Build the input chunks to H_s for the per-step challenge:
@@ -188,6 +224,7 @@ std::optional<Signature> Sign(
     const uint256& msg)
 {
     if (ring.empty() || pi >= ring.size()) return std::nullopt;
+    if (HasDuplicate(ring)) return std::nullopt;
     LOCK(g_mutex);
 
     // Verify x_pi corresponds to ring[pi].
@@ -265,6 +302,7 @@ bool Verify(
     const uint256& msg)
 {
     if (ring.empty() || sig.s.size() != ring.size()) return false;
+    if (HasDuplicate(ring)) return false;
     LOCK(g_mutex);
     // Validate ring members and key image are valid points.
     secp256k1_pubkey tmp;
@@ -393,6 +431,7 @@ std::optional<Signature> SignMultiLayer(
     const uint256& msg)
 {
     if (ring.empty() || pi >= ring.size()) return std::nullopt;
+    if (HasDuplicateMembers(ring)) return std::nullopt;
     LOCK(g_mutex);
 
     // Sanity: x_pi · G == ring[pi].P, z_pi · G == ring[pi].W.
@@ -501,6 +540,7 @@ bool VerifyMultiLayer(
 {
     if (ring.empty()) return false;
     if (sig.s.size() != ring.size()) return false;
+    if (HasDuplicateMembers(ring)) return false;
     LOCK(g_mutex);
 
     // Validate KI and D parse.

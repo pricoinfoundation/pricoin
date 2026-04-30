@@ -12,6 +12,7 @@
 
 class CCoinsViewCache;
 class CTransaction;
+class CTxMemPool;
 class TxValidationState;
 
 namespace pricoin {
@@ -28,8 +29,8 @@ namespace pricoin {
 //     Commit(prev_value, blind=0). This is what makes the privacy guarantee
 //     real: without this check, the sender could fabricate input commitments
 //     and balance the bundle against fake values, inflating supply.
-//   - pricoin::ct::VerifyBundle then checks rangeproofs (per output) and the
-//     Pedersen tally (Σin − Σout − fee*H == 0).
+//   - Per-output rangeproofs are checked, and the Pedersen tally
+//     (Σin − Σout − fee*H == 0) is verified inline here.
 //
 // On success, sets txfee_out to ct_bundle.transparent_fee.
 [[nodiscard]] bool VerifyConfidentialContextual(
@@ -38,6 +39,15 @@ namespace pricoin {
     int nSpendHeight,
     TxValidationState& state,
     CAmount& txfee_out);
+
+// Mempool-only check: reject a v4 ring tx whose key image collides with one
+// already in `pool`. Block-confirmed KI conflicts are caught by the global
+// committed-KI set in VerifyRingInputs; this catches the analogous case
+// where two competing ring txs sit in the mempool unconfirmed.
+[[nodiscard]] bool CheckMempoolKeyImageConflict(
+    const CTransaction& tx,
+    const CTxMemPool& pool,
+    TxValidationState& state);
 
 // Pricoin: commit each ring-input's key image to the global in-memory set
 // AND append it to the persistent on-disk file. Called from ConnectBlock

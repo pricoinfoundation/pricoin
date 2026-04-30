@@ -51,11 +51,17 @@ RPCMethod pricoin_ct_send()
 {
     return RPCMethod{
         "pricoin_ct_send",
-        "Build, sign, and return a hex-encoded Pricoin Confidential Transaction (tx version 4)\n"
-        "spending one P2WPKH transparent input into two confidential outputs (destination + change).\n"
-        "Two outputs are required because a single CT output cannot balance against a zero-blind\n"
-        "transparent input — see Pedersen commitment math in src/pricoin/cttx.cpp.\n"
-        "The returned hex can be submitted via sendrawtransaction.\n",
+        "Low-level CT builder. Builds, signs, and returns a hex-encoded Pricoin Confidential\n"
+        "Transaction (tx version 4) spending one P2WPKH transparent input into two confidential\n"
+        "outputs (destination + change). Two outputs are required because a single CT output\n"
+        "cannot balance against a zero-blind transparent input — see Pedersen commitment math\n"
+        "in src/pricoin/cttx.cpp. The returned hex can be submitted via sendrawtransaction.\n"
+        "\n"
+        "NOTE: This is a transparent-recipient builder. The destination address is a regular\n"
+        "Pricoin bech32 (P2WPKH/P2WSH); the recipient can spend the output but CANNOT recover\n"
+        "the hidden amount via stealth scan because no per-output tx_pubkey is published. For\n"
+        "production payments to a stealth address (which let the recipient scan and recover\n"
+        "values), use the wallet RPCs walletsendct / walletsendct_multi / walletsendct_ring.\n",
         {
             {"input_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Prev tx id of the input"},
             {"input_vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "Prev vout index"},

@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <addresstype.h>
+#include <cmath>
 #include <consensus/amount.h>
 #include <hash.h>
 #include <key.h>
@@ -317,9 +318,6 @@ util::Result<uint256> SendConfidentialTxMultiImpl(
     std::span<const PricoinCTRecipient> recipients,
     CAmount fee)
 {
-    // Resolve all recipient destinations. Output index = position in vout.
-    std::vector<ResolvedDest> dests;
-    dests.reserve(recipients.size());
     CAmount total_dest = 0;
     for (size_t i = 0; i < recipients.size(); ++i) {
         const auto& rcp = recipients[i];
@@ -330,31 +328,8 @@ util::Result<uint256> SendConfidentialTxMultiImpl(
             return util::Error{Untranslated("total recipient amount overflows MAX_MONEY")};
         }
         total_dest += rcp.amount;
-        auto rd = ResolveDest(rcp.address, static_cast<uint32_t>(i));
-        if (!rd) return util::Error{Untranslated(strprintf("recipient %u: %s", i, util::ErrorString(rd).original))};
-        dests.push_back(std::move(*rd));
     }
     const CAmount target = total_dest + fee;
-
-    // Change to wallet's own stealth identity at output index N.
-    const auto& self_id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
-    const uint32_t change_idx = static_cast<uint32_t>(recipients.size());
-    ResolvedDest change;
-    {
-        CKey r;
-        r.MakeNewKey(/*fCompressed=*/true);
-        CPubKey R = r.GetPubKey();
-        std::memcpy(change.R.data(), R.data(), 33);
-        auto S = ::pricoin::stealth::ECDHPoint(r, self_id.public_address.view);
-        if (!S) return util::Error{Untranslated("stealth ECDH failed (change)")};
-        auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, change_idx);
-        auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, self_id.public_address.spend);
-        if (!P) return util::Error{Untranslated("stealth onetime pubkey failed (change)")};
-        change.spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
-        std::memcpy(change.otp.data(), P->data(), 33);
-        auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, change_idx);
-        std::memcpy(change.nonce.data(), rp_nonce.data(), 32);
-    }
 
     // Pick UTXOs for Σamounts + fee.
     std::optional<std::vector<PickedInput>> picked;
@@ -369,6 +344,31 @@ util::Result<uint256> SendConfidentialTxMultiImpl(
     for (const auto& p : *picked) input_total += p.value;
     const CAmount change_value = input_total - target;
 
+    // Build the full output set (recipients + change-to-self) and shuffle so
+    // the change is at a random position. Otherwise an external observer can
+    // identify change as "always last", linking the sender's outputs across
+    // their transaction history.
+    struct PendingOut { std::string address; CAmount amount; };
+    std::vector<PendingOut> pending;
+    pending.reserve(recipients.size() + 1);
+    for (const auto& r : recipients) pending.push_back({r.address, r.amount});
+    const auto& self_id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+    pending.push_back({::pricoin::stealth::Encode(self_id.public_address), change_value});
+
+    FastRandomContext rng;
+    std::shuffle(pending.begin(), pending.end(), rng);
+
+    // Per-output stealth derivation must use the FINAL position, because the
+    // recipient scans by trying each vout's index when computing the
+    // shared-secret tweak — output_index is part of the rewind nonce.
+    std::vector<ResolvedDest> dests;
+    dests.reserve(pending.size());
+    for (size_t i = 0; i < pending.size(); ++i) {
+        auto rd = ResolveDest(pending[i].address, static_cast<uint32_t>(i));
+        if (!rd) return util::Error{Untranslated(strprintf("output %u: %s", i, util::ErrorString(rd).original))};
+        dests.push_back(std::move(*rd));
+    }
+
     // Each transparent prevout commits to its value with a zero blinding
     // factor, so Σ(input_blinds) = 0 regardless of N inputs.
     pricoin::ct::BlindingFactor zero_blind{};
@@ -381,44 +381,35 @@ util::Result<uint256> SendConfidentialTxMultiImpl(
         in_commits.push_back(*c);
     }
 
-    // Each dest gets a random blind; change is the balancing blind so the
-    // bundle's blind sum is zero. Math:
-    //   Σ(input_blinds) = Σ(dest_blinds) + change_blind
-    //   0 = Σ(dest_blinds) + change_blind  →  change_blind = −Σ(dest_blinds)
-    std::vector<pricoin::ct::BlindingFactor> dest_blinds(recipients.size());
-    for (auto& b : dest_blinds) GetRandBytes(b);
-    auto change_blind_opt = pricoin::ct::BalancingBlind(
-        std::array<pricoin::ct::BlindingFactor, 1>{zero_blind},
-        std::span<const pricoin::ct::BlindingFactor>{dest_blinds});
-    if (!change_blind_opt) return util::Error{Untranslated("blind sum failed")};
-    const pricoin::ct::BlindingFactor change_blind = *change_blind_opt;
+    // Random blinds for all but one slot; the remaining slot gets the
+    // balancing blind so Σ(output_blinds) = 0. Pedersen blinds are
+    // statistically uniform, so which slot is balancing is unobservable —
+    // the change slot is no more identifiable than any other.
+    const size_t N = pending.size();
+    std::vector<pricoin::ct::BlindingFactor> blinds(N);
+    for (size_t i = 0; i + 1 < N; ++i) GetRandBytes(blinds[i]);
+    {
+        std::span<const pricoin::ct::BlindingFactor> other_outs{blinds.data(), N - 1};
+        auto last_blind = pricoin::ct::BalancingBlind(
+            std::array<pricoin::ct::BlindingFactor, 1>{zero_blind},
+            other_outs);
+        if (!last_blind) return util::Error{Untranslated("blind sum failed")};
+        blinds.back() = *last_blind;
+    }
 
-    // Build N+1 output commits + rangeproofs.
     std::vector<pricoin::ct::CTOutput> ct_outputs;
-    ct_outputs.reserve(recipients.size() + 1);
-    for (size_t i = 0; i < recipients.size(); ++i) {
+    ct_outputs.reserve(N);
+    for (size_t i = 0; i < N; ++i) {
         auto commit = pricoin::ct::Commitment::Create(
-            static_cast<uint64_t>(recipients[i].amount), dest_blinds[i]);
-        if (!commit) return util::Error{Untranslated(strprintf("recipient %u commit failed", i))};
+            static_cast<uint64_t>(pending[i].amount), blinds[i]);
+        if (!commit) return util::Error{Untranslated(strprintf("output %u commit failed", i))};
         std::vector<unsigned char> spk_bytes(dests[i].spk.begin(), dests[i].spk.end());
         auto proof = pricoin::ct::CreateRangeProof(
-            static_cast<uint64_t>(recipients[i].amount), dest_blinds[i], *commit,
+            static_cast<uint64_t>(pending[i].amount), blinds[i], *commit,
             std::span<const unsigned char>{spk_bytes}, dests[i].nonce);
-        if (!proof) return util::Error{Untranslated(strprintf("recipient %u rangeproof failed", i))};
+        if (!proof) return util::Error{Untranslated(strprintf("output %u rangeproof failed", i))};
         ct_outputs.push_back(pricoin::ct::CTOutput{
             *commit, *proof, std::move(spk_bytes), dests[i].R, dests[i].otp});
-    }
-    {
-        auto commit = pricoin::ct::Commitment::Create(
-            static_cast<uint64_t>(change_value), change_blind);
-        if (!commit) return util::Error{Untranslated("change commit failed")};
-        std::vector<unsigned char> change_spk_bytes(change.spk.begin(), change.spk.end());
-        auto proof = pricoin::ct::CreateRangeProof(
-            static_cast<uint64_t>(change_value), change_blind, *commit,
-            std::span<const unsigned char>{change_spk_bytes}, change.nonce);
-        if (!proof) return util::Error{Untranslated("change rangeproof failed")};
-        ct_outputs.push_back(pricoin::ct::CTOutput{
-            *commit, *proof, std::move(change_spk_bytes), change.R, change.otp});
     }
 
     pricoin::ct::CTBundle bundle;
@@ -432,10 +423,9 @@ util::Result<uint256> SendConfidentialTxMultiImpl(
     for (const auto& p : *picked) {
         mtx.vin.emplace_back(p.outpoint, CScript{}, 0xfffffffe);
     }
-    for (const auto& d : dests) {
-        mtx.vout.emplace_back(0, d.spk);
+    for (size_t i = 0; i < N; ++i) {
+        mtx.vout.emplace_back(0, dests[i].spk);
     }
-    mtx.vout.emplace_back(0, change.spk);
     mtx.ct_bundle = std::move(bundle);
 
     std::map<COutPoint, Coin> coins;
@@ -638,11 +628,16 @@ RPCMethod pricoin_listownct()
 }
 
 // Helper: collect all v4 stealth outputs in confirmed blocks. Returns
-// (outpoint, commitment, one_time_pubkey) for each — usable as ring members.
+// (outpoint, commitment, one_time_pubkey, height) for each — usable as ring
+// members. Height is needed by the decoy sampler so it can bias toward
+// recent outputs (real spends are concentrated in a recent age band; decoys
+// drawn uniformly over all history would let an analyst identify the real
+// spend by its age stand-out).
 struct ChainCTOutput {
     pricoin::ct::PrevoutRef ref;
     pricoin::ct::Commitment commitment;
     pricoin::ct::SerializedPubKey33 one_time_pubkey;
+    int height{0};
 };
 
 std::vector<ChainCTOutput> CollectChainCTOutputs(interfaces::Chain& chain)
@@ -664,11 +659,62 @@ std::vector<ChainCTOutput> CollectChainCTOutputs(interfaces::Chain& chain)
                     .ref = pricoin::ct::PrevoutRef{tx_ref->GetHash().ToUint256(), i},
                     .commitment = o.commitment,
                     .one_time_pubkey = o.one_time_pubkey,
+                    .height = h,
                 });
             }
         }
     }
     return result;
+}
+
+// Sample `k` decoys from `pool` weighted toward recent outputs. Uses
+// weighted reservoir sampling (A-Res) with weight = 1 / (1 + age/half_life).
+// This is a stop-gap approximation of the empirical spend-age distribution
+// (real spends concentrate in a recent age band, with a long tail). A full
+// Monero-style gamma sampler over output age is the proper next step; the
+// linear-decay weighting here is a strict improvement over uniform random,
+// not a finished privacy story.
+//
+// TODO: switch to gamma(k=19.28, scale=1.61) over log(age_seconds) once the
+// chain has enough history that the empirical parameters can be measured.
+std::vector<ChainCTOutput> SampleDecoysRecencyWeighted(
+    std::vector<ChainCTOutput> pool, size_t k, int tip_height,
+    FastRandomContext& cprng)
+{
+    if (k >= pool.size()) return pool;
+
+    // Half-life ≈ 5 days at 150s blocks. Weight halves every ~2880 blocks.
+    constexpr double kHalfLifeBlocks = 2880.0;
+
+    // A-Res (Efraimidis-Spirakis) in log-space. The textbook formulation is
+    // key_i = u_i^(1/w_i), pick top-k. Computing u^(1/w) directly underflows
+    // to 0.0 once age pushes 1/w past ~745, collapsing all sufficiently-old
+    // items to the same key and breaking the ranking. Working in log-space
+    //   log(key_i) = log(u_i) / w_i
+    // is monotone-equivalent (log is strictly increasing on (0, 1)) and
+    // stays in double range for any age the chain can reach. Larger key
+    // (== less-negative log_key) wins.
+    struct KeyedIdx { double log_key; size_t idx; };
+    std::vector<KeyedIdx> keyed;
+    keyed.reserve(pool.size());
+    for (size_t i = 0; i < pool.size(); ++i) {
+        const int age = std::max(0, tip_height - pool[i].height);
+        const double weight = 1.0 / (1.0 + static_cast<double>(age) / kHalfLifeBlocks);
+        // u in (0, 1) — strictly open to keep log well-defined.
+        const double u = (static_cast<double>(cprng.rand32()) + 1.0) /
+                         (static_cast<double>(UINT32_MAX) + 2.0);
+        const double log_key = std::log(u) / weight;
+        keyed.push_back({log_key, i});
+    }
+    std::partial_sort(keyed.begin(), keyed.begin() + k, keyed.end(),
+        [](const KeyedIdx& a, const KeyedIdx& b) { return a.log_key > b.log_key; });
+
+    std::vector<ChainCTOutput> picked;
+    picked.reserve(k);
+    for (size_t i = 0; i < k; ++i) {
+        picked.push_back(std::move(pool[keyed[i].idx]));
+    }
+    return picked;
 }
 
 // TODO(multi-input ring): walletsendct_ring is still single-input — picks
@@ -702,7 +748,6 @@ RPCMethod walletsendct_ring()
             {
                 {RPCResult::Type::STR_HEX, "txid", ""},
                 {RPCResult::Type::NUM, "ring_size", "Number of candidates"},
-                {RPCResult::Type::NUM, "signer_index", "Position pi (kept here for testing; not on-chain)"},
                 {RPCResult::Type::STR_AMOUNT, "input_value", "Recovered input value (sent privately)"},
                 {RPCResult::Type::STR_AMOUNT, "change_amount", "Change amount"},
                 {RPCResult::Type::NUM, "size", ""},
@@ -754,19 +799,23 @@ RPCMethod walletsendct_ring()
 
             // 2. Collect chain CT outputs as decoy pool (excluding our own).
             auto pool = CollectChainCTOutputs(chain);
-            std::vector<ChainCTOutput> decoys;
+            std::vector<ChainCTOutput> decoy_pool;
             for (auto& c : pool) {
                 if (c.ref.hash == picked_outpoint.hash.ToUint256() && c.ref.n == picked_outpoint.n) continue;
-                decoys.push_back(std::move(c));
+                decoy_pool.push_back(std::move(c));
             }
-            if ((int)decoys.size() < ring_size - 1) {
+            if ((int)decoy_pool.size() < ring_size - 1) {
                 throw JSONRPCError(RPC_WALLET_ERROR,
-                    strprintf("Not enough chain CT outputs for ring_size=%d (have %d decoys)", ring_size, (int)decoys.size()));
+                    strprintf("Not enough chain CT outputs for ring_size=%d (have %d decoys)", ring_size, (int)decoy_pool.size()));
             }
-            // Shuffle and take ring_size - 1 random decoys.
+            // Recency-weighted sample (defeats the uniform-over-history
+            // fingerprint described in the security review's H-2).
             FastRandomContext rng;
-            std::shuffle(decoys.begin(), decoys.end(), rng);
-            decoys.resize(ring_size - 1);
+            auto decoys = SampleDecoysRecencyWeighted(
+                std::move(decoy_pool),
+                static_cast<size_t>(ring_size - 1),
+                tip,
+                rng);
 
             // 3. Insert our own output at a random index pi.
             const size_t pi = rng.randrange(static_cast<uint32_t>(ring_size));
@@ -874,13 +923,6 @@ RPCMethod walletsendct_ring()
             ring_input.ring.reserve(ring_size);
             for (const auto& m : ring) ring_input.ring.push_back(m.ref);
             ring_input.pseudo_commitment = *pseudo;
-            // Diagnostic log
-            for (size_t k = 0; k < ring.size(); ++k) {
-                LogInfo("Pricoin ring[%zu]: %s:%u (otp_zero=%s) %s",
-                    k, ring[k].ref.hash.ToString(), ring[k].ref.n,
-                    [&]{ for (auto b : ring[k].one_time_pubkey) if (b) return "no"; return "yes"; }(),
-                    k == pi ? "<- signer" : "");
-            }
 
             pricoin::ct::CTBundle bundle;
             bundle.ring_inputs = {ring_input}; // sig filled in below
@@ -951,7 +993,6 @@ RPCMethod walletsendct_ring()
             UniValue out{UniValue::VOBJ};
             out.pushKV("txid", tx_ref->GetHash().ToString());
             out.pushKV("ring_size", ring_size);
-            out.pushKV("signer_index", (int)pi);
             out.pushKV("input_value", ValueFromAmount(picked->value));
             out.pushKV("change_amount", ValueFromAmount(change_value));
             out.pushKV("size", (int)::GetSerializeSize(TX_WITH_WITNESS(*tx_ref)));

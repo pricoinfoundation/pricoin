@@ -53,6 +53,111 @@ bool ParseCommitment(const Commitment& c, secp256k1_pedersen_commitment& out)
     return secp256k1_pedersen_commitment_parse(Ctx(), &out, c.bytes.data()) == 1;
 }
 
+// Self-test-only bundle builder. Builds a v4 bundle with TRANSPARENT
+// recipients (one_time_pubkey / tx_pubkey are left zero). Production
+// stealth-paying flows live in src/wallet/rpc/pricoin_ct.cpp where R, otp,
+// and the rangeproof rewind nonce are derived per-output from the
+// recipient's stealth address — DO NOT call this builder for stealth
+// payments; the recipient won't be able to scan the output.
+struct CTBuildResultSelfTest {
+    CTBundle bundle;
+    std::vector<BlindingFactor> output_blinds;
+};
+
+BlindingFactor DerivePerOutputNonceSelfTest(const BlindingFactor& seed, uint32_t index)
+{
+    unsigned char idx_le[4]{
+        static_cast<unsigned char>(index & 0xff),
+        static_cast<unsigned char>((index >> 8) & 0xff),
+        static_cast<unsigned char>((index >> 16) & 0xff),
+        static_cast<unsigned char>((index >> 24) & 0xff),
+    };
+    BlindingFactor out;
+    CSHA256().Write(seed.data(), seed.size())
+            .Write(idx_le, sizeof(idx_le))
+            .Finalize(out.data());
+    return out;
+}
+
+std::optional<CTBuildResultSelfTest> BuildBundleSelfTest(
+    std::span<const std::pair<uint64_t, BlindingFactor>> in_values_blinds,
+    std::span<const std::pair<uint64_t, std::vector<unsigned char>>> out_values_scripts,
+    uint64_t transparent_fee,
+    const BlindingFactor& nonce_seed)
+{
+    if (out_values_scripts.empty()) return std::nullopt;
+    uint64_t in_total = 0;
+    for (const auto& [v, _] : in_values_blinds) in_total += v;
+    uint64_t out_total = 0;
+    for (const auto& [v, _] : out_values_scripts) out_total += v;
+    if (in_total != out_total + transparent_fee) return std::nullopt;
+
+    CTBuildResultSelfTest result;
+    auto& bundle = result.bundle;
+    bundle.transparent_fee = transparent_fee;
+
+    bundle.input_commitments.reserve(in_values_blinds.size());
+    for (const auto& [v, blind] : in_values_blinds) {
+        auto c = Commitment::Create(v, blind);
+        if (!c) return std::nullopt;
+        bundle.input_commitments.push_back(*c);
+    }
+
+    const size_t n_out = out_values_scripts.size();
+    result.output_blinds.resize(n_out);
+    for (size_t i = 0; i + 1 < n_out; ++i) {
+        GetRandBytes(result.output_blinds[i]);
+    }
+    std::vector<BlindingFactor> in_blinds_vec;
+    in_blinds_vec.reserve(in_values_blinds.size());
+    for (const auto& [_, b] : in_values_blinds) in_blinds_vec.push_back(b);
+    std::span<const BlindingFactor> other_outs{result.output_blinds.data(), n_out - 1};
+    auto last_blind = BalancingBlind(in_blinds_vec, other_outs);
+    if (!last_blind) return std::nullopt;
+    result.output_blinds.back() = *last_blind;
+
+    bundle.outputs.reserve(n_out);
+    for (size_t i = 0; i < n_out; ++i) {
+        const auto& [value, script] = out_values_scripts[i];
+        const auto& blind = result.output_blinds[i];
+        auto commit = Commitment::Create(value, blind);
+        if (!commit) return std::nullopt;
+        const std::span<const unsigned char> script_span{script.data(), script.size()};
+        auto nonce = DerivePerOutputNonceSelfTest(nonce_seed, static_cast<uint32_t>(i));
+        auto proof = CreateRangeProof(value, blind, *commit, script_span, nonce);
+        if (!proof) return std::nullopt;
+        bundle.outputs.push_back(CTOutput{
+            .commitment = *commit,
+            .rangeproof = *proof,
+            .script_pubkey = script,
+        });
+    }
+    return result;
+}
+
+// Self-test-only structural verifier for CT bundles built with transparent
+// inputs. Checks per-output rangeproofs and Pedersen tally over
+// input_commitments + outputs + transparent_fee. Does NOT verify ring
+// signatures or pseudo commitments — the consensus path is
+// pricoin::VerifyConfidentialContextual in pricoin/validation.cpp.
+bool VerifyBundleSelfTest(const CTBundle& bundle)
+{
+    if (bundle.outputs.empty()) return false;
+    for (const auto& out : bundle.outputs) {
+        const std::span<const unsigned char> script_span{
+            out.script_pubkey.data(), out.script_pubkey.size()};
+        const std::span<const unsigned char> proof_span{
+            out.rangeproof.data(), out.rangeproof.size()};
+        if (!VerifyRangeProof(out.commitment, proof_span, script_span)) {
+            return false;
+        }
+    }
+    std::vector<Commitment> out_commits;
+    out_commits.reserve(bundle.outputs.size());
+    for (const auto& out : bundle.outputs) out_commits.push_back(out.commitment);
+    return VerifySumZero(bundle.input_commitments, out_commits, bundle.transparent_fee);
+}
+
 bool SerializeCommitment(const secp256k1_pedersen_commitment& in, Commitment& out)
 {
     LOCK(g_ctx_mutex);
@@ -291,9 +396,9 @@ void RunSelfTest()
         {kOut / 2, spk_a},
         {kOut - kOut / 2, spk_b},
     }};
-    auto built = BuildBundle(in_pairs, out_pairs, kFee, seed);
+    auto built = BuildBundleSelfTest(in_pairs, out_pairs, kFee, seed);
     if (!built) throw std::runtime_error("ct self-test: bundle build failed");
-    if (!VerifyBundle(built->bundle)) throw std::runtime_error("ct self-test: bundle verify failed");
+    if (!VerifyBundleSelfTest(built->bundle)) throw std::runtime_error("ct self-test: bundle verify failed");
 
     // Serialize round-trip.
     DataStream ds;
@@ -301,17 +406,17 @@ void RunSelfTest()
     CTBundle parsed;
     ds >> parsed;
     if (parsed != built->bundle) throw std::runtime_error("ct self-test: bundle serialize/parse mismatch");
-    if (!VerifyBundle(parsed)) throw std::runtime_error("ct self-test: parsed bundle verify failed");
+    if (!VerifyBundleSelfTest(parsed)) throw std::runtime_error("ct self-test: parsed bundle verify failed");
 
     // Mutate: flip one bit in the first rangeproof — verification must fail.
     CTBundle tampered = parsed;
     tampered.outputs.at(0).rangeproof.at(0) ^= 0x01;
-    if (VerifyBundle(tampered)) throw std::runtime_error("ct self-test: tampered bundle verified");
+    if (VerifyBundleSelfTest(tampered)) throw std::runtime_error("ct self-test: tampered bundle verified");
 
     // Mutate: change the transparent fee — verification must fail.
     tampered = parsed;
     tampered.transparent_fee += 1;
-    if (VerifyBundle(tampered)) throw std::runtime_error("ct self-test: tampered fee verified");
+    if (VerifyBundleSelfTest(tampered)) throw std::runtime_error("ct self-test: tampered fee verified");
 
     LogInfo("Pricoin CT bundle: 2-in/2-out demo serializes to %u bytes (%u per output rangeproof)",
             built->bundle.SerializedSize(),
@@ -338,7 +443,7 @@ void RunSelfTest()
     if (parsed_tx.ct_bundle != built->bundle) {
         throw std::runtime_error("ct self-test: tx-embedded bundle mismatch");
     }
-    if (!VerifyBundle(parsed_tx.ct_bundle)) {
+    if (!VerifyBundleSelfTest(parsed_tx.ct_bundle)) {
         throw std::runtime_error("ct self-test: tx-embedded bundle did not verify");
     }
     LogInfo("Pricoin CT tx round-trip: version=%u tx serialized=%u bytes",

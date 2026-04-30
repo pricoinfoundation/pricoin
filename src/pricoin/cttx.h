@@ -105,30 +105,6 @@ struct CTBundle {
     size_t SerializedSize() const;
 };
 
-// Constructed bundle plus the secret blinds (sender-side state).
-struct CTBuildResult {
-    CTBundle bundle;
-    std::vector<BlindingFactor> output_blinds; // parallel to bundle.outputs
-};
-
-// Build a balanced CT bundle.
-//   in_values_blinds:  (value, blind) for each input that funds the tx
-//   out_values_scripts: (value, scriptPubKey) for each output
-//   transparent_fee:   the cleartext fee
-//   nonce_seed:        sender-chosen 32 bytes; per-output nonces are derived
-//                      deterministically by hashing (nonce_seed || index)
-// Returns std::nullopt on cryptographic failure (probability ~2^-100).
-std::optional<CTBuildResult> BuildBundle(
-    std::span<const std::pair<uint64_t, BlindingFactor>> in_values_blinds,
-    std::span<const std::pair<uint64_t, std::vector<unsigned char>>> out_values_scripts,
-    uint64_t transparent_fee,
-    const BlindingFactor& nonce_seed);
-
-// Verify a bundle: each rangeproof must validate against its commitment +
-// scriptPubKey, and the Pedersen tally must balance with the transparent
-// fee. Returns true iff all checks pass.
-bool VerifyBundle(const CTBundle& bundle);
-
 // Deterministic 32-byte digest of a CTBundle. Used by signature hashing on
 // v4 transactions so a signature commits to the bundle (preventing an
 // attacker from swapping the bundle while keeping the signature intact).

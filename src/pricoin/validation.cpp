@@ -18,6 +18,7 @@
 #include <streams.h>
 #include <sync.h>
 #include <tinyformat.h>
+#include <txmempool.h>
 #include <util/fs.h>
 
 #include <fstream>
@@ -131,6 +132,16 @@ bool VerifyRingInputs(
         }
         if (ri.sig.s.size() != ri.ring.size()) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-sig-size");
+        }
+        // Ring members must reference distinct prev outputs. Otherwise the
+        // CLSAG signature still verifies, but the effective anonymity set
+        // shrinks below the announced ring size — a silent privacy leak.
+        for (size_t a = 0; a < ri.ring.size(); ++a) {
+            for (size_t b = a + 1; b < ri.ring.size(); ++b) {
+                if (ri.ring[a] == ri.ring[b]) {
+                    return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-ring-duplicate");
+                }
+            }
         }
 
         // Phase 4c: multi-layer CLSAG. Build (P_i, W_i) pairs where
@@ -271,6 +282,35 @@ bool IsKeyImageCommitted(const ringsig::Point& ki)
 {
     LOCK(g_ki_mutex);
     return g_key_images.contains(ki);
+}
+
+bool CheckMempoolKeyImageConflict(
+    const CTransaction& tx,
+    const CTxMemPool& pool,
+    TxValidationState& state)
+{
+    if (tx.version != PRICOIN_CT_VERSION) return true;
+    if (tx.ct_bundle.ring_inputs.empty()) return true;
+
+    // Snapshot this tx's KIs into a small unordered_set for O(1) lookup.
+    std::unordered_set<ringsig::Point, KIHash> new_kis;
+    new_kis.reserve(tx.ct_bundle.ring_inputs.size());
+    for (const auto& ri : tx.ct_bundle.ring_inputs) {
+        new_kis.insert(ri.sig.key_image);
+    }
+
+    LOCK(pool.cs);
+    for (const auto& entry : pool.mapTx) {
+        const CTransaction& mtx = entry.GetTx();
+        if (mtx.version != PRICOIN_CT_VERSION) continue;
+        for (const auto& ri : mtx.ct_bundle.ring_inputs) {
+            if (new_kis.contains(ri.sig.key_image)) {
+                return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+                                     "txn-mempool-pct-keyimage-conflict");
+            }
+        }
+    }
+    return true;
 }
 
 void InitKeyImageStore(const std::string& datadir_path)

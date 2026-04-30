@@ -909,6 +909,12 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         if (!pricoin::VerifyConfidentialContextual(tx, m_view, spend_height, state, ws.m_base_fees)) {
             return false;
         }
+        // Reject if any of this tx's key images is already pending in the
+        // mempool (committed-set conflicts are caught above; this catches
+        // intra-mempool collisions before either side has been mined).
+        if (!pricoin::CheckMempoolKeyImageConflict(tx, m_pool, state)) {
+            return false;
+        }
     } else if (!Consensus::CheckTxInputs(tx, state, m_view, spend_height, ws.m_base_fees)) {
         return false; // state filled in by CheckTxInputs
     }
