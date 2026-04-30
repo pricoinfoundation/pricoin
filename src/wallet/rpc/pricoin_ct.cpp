@@ -258,7 +258,10 @@ RPCMethod walletsendct_multi()
             UniValue out{UniValue::VOBJ};
             out.pushKV("txid", res->ToString());
             out.pushKV("recipients", static_cast<int>(recipients.size()));
-            out.pushKV("outputs", static_cast<int>(recipients.size()) + 1);
+            // Bundle holds N recipients + 1 change + privacy padding (so the
+            // total is ≥3 — see SendConfidentialTxMultiImpl).
+            const int total_outputs = std::max<int>(static_cast<int>(recipients.size()) + 1, 3);
+            out.pushKV("outputs", total_outputs);
             out.pushKV("total_sent", ValueFromAmount(total_sent));
             out.pushKV("fee", ValueFromAmount(fee));
             return out;
@@ -350,10 +353,24 @@ util::Result<uint256> SendConfidentialTxMultiImpl(
     // their transaction history.
     struct PendingOut { std::string address; CAmount amount; };
     std::vector<PendingOut> pending;
-    pending.reserve(recipients.size() + 1);
+    pending.reserve(recipients.size() + 2);
     for (const auto& r : recipients) pending.push_back({r.address, r.amount});
     const auto& self_id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
-    pending.push_back({::pricoin::stealth::Encode(self_id.public_address), change_value});
+    const std::string self_addr = ::pricoin::stealth::Encode(self_id.public_address);
+    pending.push_back({self_addr, change_value});
+
+    // PRIVACY: pad to at least 3 outputs so the change isn't 1/2 observable.
+    // The 1-recipient case was emitting (recipient, change) — two outputs of
+    // identical shape, so an external observer assigned change with 50/50
+    // confidence. Padding with a 0-value self-output drops that to 1/3, and
+    // with the other two outputs hidden by Pedersen+rangeproof an observer
+    // can't tell value=0 from value>0 anyway. The decoy goes to the wallet's
+    // own stealth address so the wallet recovers it on scan (as a 0-PRIC
+    // entry that ConfidentialBalance and walletsendct_from_ct ignore).
+    // Multi-recipient sends already have ≥3 outputs and need no padding.
+    while (pending.size() < 3) {
+        pending.push_back({self_addr, 0});
+    }
 
     FastRandomContext rng;
     std::shuffle(pending.begin(), pending.end(), rng);
@@ -856,70 +873,84 @@ RPCMethod walletsendct_ring()
                 std::memcpy(z_pi.data(), sum->data(), 32);
             }
 
-            // 6. Build dest + change outputs (always to stealth recipients here).
-            //    Output blinds are chosen so they sum to pseudo_blind (so the
-            //    bundle's pseudo commitments balance against output commitments).
+            // 6. Build outputs: recipient + change-to-self + (decoy padding to
+            //    reach 3 outputs). Output blinds sum to pseudo_blind so the
+            //    pseudo commitment balances against the output commitments.
+            //    Padding & shuffle: PRIVACY — see the matching block in
+            //    SendConfidentialTxMultiImpl. Two outputs of identical shape
+            //    let an observer label change with 50/50 confidence.
             const CAmount change_value = picked->value - target;
+            struct PendingOut {
+                const ::pricoin::stealth::StealthAddress* stealth;
+                CAmount amount;
+            };
+            std::vector<PendingOut> pending;
+            pending.reserve(3);
+            pending.push_back({&*stealth_dest, dest_amount});
+            pending.push_back({&id.public_address, change_value});
+            while (pending.size() < 3) {
+                pending.push_back({&id.public_address, 0});
+            }
+            FastRandomContext shuffle_rng;
+            std::shuffle(pending.begin(), pending.end(), shuffle_rng);
 
-            CScript dest_spk, change_spk;
-            ::pricoin::stealth::PointBytes dest_R{}, change_R{};
-            ::pricoin::ct::BlindingFactor dest_nonce{}, change_nonce{};
-            ::pricoin::ct::SerializedPubKey33 dest_otp{}, change_otp{};
-            // Dest
-            {
+            // Per-output stealth derivation uses the FINAL position because
+            // the recipient scans by output_index.
+            struct ResolvedOut {
+                CScript spk;
+                ::pricoin::stealth::PointBytes R;
+                ::pricoin::ct::BlindingFactor nonce;
+                ::pricoin::ct::SerializedPubKey33 otp;
+                CAmount amount;
+            };
+            std::vector<ResolvedOut> outs;
+            outs.reserve(pending.size());
+            for (size_t i = 0; i < pending.size(); ++i) {
                 CKey r; r.MakeNewKey(true);
                 CPubKey R = r.GetPubKey();
-                std::memcpy(dest_R.data(), R.data(), 33);
-                auto S = ::pricoin::stealth::ECDHPoint(r, stealth_dest->view);
-                if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth ECDH failed (dest)");
-                auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, 0);
-                auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, stealth_dest->spend);
-                if (!P) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth onetime failed (dest)");
-                dest_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
-                std::memcpy(dest_otp.data(), P->data(), 33);
-                auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, 0);
-                std::memcpy(dest_nonce.data(), rp_nonce.data(), 32);
+                ResolvedOut ro;
+                ro.amount = pending[i].amount;
+                std::memcpy(ro.R.data(), R.data(), 33);
+                auto S = ::pricoin::stealth::ECDHPoint(r, pending[i].stealth->view);
+                if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("stealth ECDH failed (output %u)", i));
+                auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, static_cast<uint32_t>(i));
+                auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, pending[i].stealth->spend);
+                if (!P) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("stealth onetime failed (output %u)", i));
+                ro.spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
+                std::memcpy(ro.otp.data(), P->data(), 33);
+                auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, static_cast<uint32_t>(i));
+                std::memcpy(ro.nonce.data(), rp_nonce.data(), 32);
+                outs.push_back(std::move(ro));
             }
-            // Change
+
+            // Random blinds for outputs [0..N-2]; the last gets the balancing
+            // blind so Σ(output_blinds) = pseudo_blind. Position N-1 is random
+            // w.r.t. the (recipient, change, decoy) labelling because of the
+            // shuffle, so the balancing slot is unobservable.
+            const size_t Nout = outs.size();
+            std::vector<pricoin::ct::BlindingFactor> out_blinds(Nout);
+            for (size_t i = 0; i + 1 < Nout; ++i) GetRandBytes(out_blinds[i]);
             {
-                CKey r; r.MakeNewKey(true);
-                CPubKey R = r.GetPubKey();
-                std::memcpy(change_R.data(), R.data(), 33);
-                auto S = ::pricoin::stealth::ECDHPoint(r, id.public_address.view);
-                if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth ECDH failed (change)");
-                auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, 1);
-                auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, id.public_address.spend);
-                if (!P) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth onetime failed (change)");
-                change_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
-                std::memcpy(change_otp.data(), P->data(), 33);
-                auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, 1);
-                std::memcpy(change_nonce.data(), rp_nonce.data(), 32);
+                std::span<const pricoin::ct::BlindingFactor> other_outs{out_blinds.data(), Nout - 1};
+                auto last = pricoin::ct::BalancingBlind(
+                    std::array<pricoin::ct::BlindingFactor, 1>{pseudo_blind},
+                    other_outs);
+                if (!last) throw JSONRPCError(RPC_INTERNAL_ERROR, "blind sum failed");
+                out_blinds.back() = *last;
             }
 
-            // Output blinds: dest random, change = pseudo_blind - dest_blind
-            // (so dest_blind + change_blind = pseudo_blind, which means
-            // C_dest + C_change = pseudo_blind*G + value*H = C_pseudo when
-            // values balance with the fee).
-            pricoin::ct::BlindingFactor dest_blind;
-            GetRandBytes(dest_blind);
-            auto change_blind = pricoin::ct::BalancingBlind(
-                std::array<pricoin::ct::BlindingFactor, 1>{pseudo_blind},
-                std::array<pricoin::ct::BlindingFactor, 1>{dest_blind});
-            if (!change_blind) throw JSONRPCError(RPC_INTERNAL_ERROR, "blind sum failed");
-
-            auto dest_commit = pricoin::ct::Commitment::Create(static_cast<uint64_t>(dest_amount), dest_blind);
-            auto change_commit = pricoin::ct::Commitment::Create(static_cast<uint64_t>(change_value), *change_blind);
-            if (!dest_commit || !change_commit) throw JSONRPCError(RPC_INTERNAL_ERROR, "output commit failed");
-
-            std::vector<unsigned char> dest_spk_bytes(dest_spk.begin(), dest_spk.end());
-            std::vector<unsigned char> change_spk_bytes(change_spk.begin(), change_spk.end());
-            auto dest_proof = pricoin::ct::CreateRangeProof(
-                static_cast<uint64_t>(dest_amount), dest_blind, *dest_commit,
-                std::span<const unsigned char>{dest_spk_bytes}, dest_nonce);
-            auto change_proof = pricoin::ct::CreateRangeProof(
-                static_cast<uint64_t>(change_value), *change_blind, *change_commit,
-                std::span<const unsigned char>{change_spk_bytes}, change_nonce);
-            if (!dest_proof || !change_proof) throw JSONRPCError(RPC_INTERNAL_ERROR, "rangeproof failed");
+            std::vector<pricoin::ct::CTOutput> ct_outputs;
+            ct_outputs.reserve(Nout);
+            for (size_t i = 0; i < Nout; ++i) {
+                auto commit = pricoin::ct::Commitment::Create(static_cast<uint64_t>(outs[i].amount), out_blinds[i]);
+                if (!commit) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("output %u commit failed", i));
+                std::vector<unsigned char> spk_bytes(outs[i].spk.begin(), outs[i].spk.end());
+                auto proof = pricoin::ct::CreateRangeProof(
+                    static_cast<uint64_t>(outs[i].amount), out_blinds[i], *commit,
+                    std::span<const unsigned char>{spk_bytes}, outs[i].nonce);
+                if (!proof) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("output %u rangeproof failed", i));
+                ct_outputs.push_back(pricoin::ct::CTOutput{*commit, *proof, std::move(spk_bytes), outs[i].R, outs[i].otp});
+            }
 
             // 7. Construct the bundle with a ring input.
             pricoin::ct::CTRingInput ring_input;
@@ -929,10 +960,7 @@ RPCMethod walletsendct_ring()
 
             pricoin::ct::CTBundle bundle;
             bundle.ring_inputs = {ring_input}; // sig filled in below
-            bundle.outputs = {
-                pricoin::ct::CTOutput{*dest_commit, *dest_proof, dest_spk_bytes, dest_R, dest_otp},
-                pricoin::ct::CTOutput{*change_commit, *change_proof, change_spk_bytes, change_R, change_otp},
-            };
+            bundle.outputs = std::move(ct_outputs);
             bundle.transparent_fee = static_cast<uint64_t>(fee);
 
             // 8. Build mtx.
@@ -945,8 +973,9 @@ RPCMethod walletsendct_ring()
                 Txid::FromUint256(ring_input.ring[0].hash),
                 ring_input.ring[0].n};
             mtx.vin.emplace_back(marker_outpoint, CScript{}, 0xfffffffe);
-            mtx.vout.emplace_back(0, dest_spk);
-            mtx.vout.emplace_back(0, change_spk);
+            for (const auto& o : outs) {
+                mtx.vout.emplace_back(0, o.spk);
+            }
             mtx.ct_bundle = std::move(bundle);
 
             // 9. Compute the message and sign with multi-layer CLSAG.
@@ -1082,89 +1111,112 @@ RPCMethod walletsendct_from_ct()
                     "Insufficient recovered CT outputs for dest_amount + fee");
             }
 
-            // Build the destination output (stealth or transparent).
+            // Build outputs: dest + change-to-self + decoy padding (so the
+            // bundle has ≥3 outputs and an external observer can't label
+            // change with 50/50 confidence). Same shuffle/pad story as
+            // SendConfidentialTxMultiImpl. Dest may be stealth (foreign) or
+            // a plain transparent script; change and decoy are always
+            // stealth-to-self.
             const auto stealth_dest = ::pricoin::stealth::Decode(dest_addr_str);
-            CScript dest_spk;
-            ::pricoin::stealth::PointBytes dest_R{};
-            ::pricoin::ct::BlindingFactor dest_nonce{};
-            ::pricoin::ct::SerializedPubKey33 dest_otp{};
-            if (stealth_dest) {
-                CKey r; r.MakeNewKey(true);
-                CPubKey R = r.GetPubKey();
-                std::memcpy(dest_R.data(), R.data(), 33);
-                auto S = ::pricoin::stealth::ECDHPoint(r, stealth_dest->view);
-                if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth ECDH failed");
-                auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, 0);
-                auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, stealth_dest->spend);
-                if (!P) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth onetime pubkey failed");
-                dest_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
-                std::memcpy(dest_otp.data(), P->data(), 33);
-                auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, 0);
-                std::memcpy(dest_nonce.data(), rp_nonce.data(), 32);
-            } else {
+            CScript transparent_dest_spk;
+            if (!stealth_dest) {
                 CTxDestination d = DecodeDestination(dest_addr_str);
                 if (!IsValidDestination(d)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid dest_address");
-                dest_spk = GetScriptForDestination(d);
-                GetRandBytes(dest_nonce);
+                transparent_dest_spk = GetScriptForDestination(d);
             }
-
-            // Change always goes to our own stealth identity.
-            CScript change_spk;
-            ::pricoin::stealth::PointBytes change_R{};
-            ::pricoin::ct::BlindingFactor change_nonce{};
-            ::pricoin::ct::SerializedPubKey33 change_otp{};
-            {
-                CKey r; r.MakeNewKey(true);
-                CPubKey R = r.GetPubKey();
-                std::memcpy(change_R.data(), R.data(), 33);
-                auto S = ::pricoin::stealth::ECDHPoint(r, id.public_address.view);
-                if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth ECDH (change) failed");
-                auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, 1);
-                auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, id.public_address.spend);
-                if (!P) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth onetime pubkey (change) failed");
-                change_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
-                std::memcpy(change_otp.data(), P->data(), 33);
-                auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, 1);
-                std::memcpy(change_nonce.data(), rp_nonce.data(), 32);
-            }
-
             const CAmount change_value = input_total - target;
 
-            // Build the bundle. Each input carries its real recovered blind.
-            // BalancingBlind solves: Σ(input_blinds) = dest_blind + change_blind,
-            // so change_blind = Σ(input_blinds) − dest_blind.
+            struct OutputSpec {
+                enum class Kind { StealthForeign, StealthSelf, Transparent };
+                Kind kind;
+                const ::pricoin::stealth::StealthAddress* stealth;
+                CScript transparent_spk;
+                CAmount amount;
+            };
+            std::vector<OutputSpec> pending;
+            pending.reserve(3);
+            if (stealth_dest) {
+                pending.push_back({OutputSpec::Kind::StealthForeign, &*stealth_dest, {}, dest_amount});
+            } else {
+                pending.push_back({OutputSpec::Kind::Transparent, nullptr, transparent_dest_spk, dest_amount});
+            }
+            pending.push_back({OutputSpec::Kind::StealthSelf, &id.public_address, {}, change_value});
+            while (pending.size() < 3) {
+                pending.push_back({OutputSpec::Kind::StealthSelf, &id.public_address, {}, 0});
+            }
+            FastRandomContext shuffle_rng;
+            std::shuffle(pending.begin(), pending.end(), shuffle_rng);
+
+            // Resolve each output into (spk, R, otp, nonce, amount). Stealth
+            // derivation keys off the FINAL post-shuffle index because the
+            // recipient scans by output_index.
+            struct ResolvedOut {
+                CScript spk;
+                ::pricoin::stealth::PointBytes R;
+                ::pricoin::ct::BlindingFactor nonce;
+                ::pricoin::ct::SerializedPubKey33 otp;
+                CAmount amount;
+            };
+            std::vector<ResolvedOut> outs;
+            outs.reserve(pending.size());
+            for (size_t i = 0; i < pending.size(); ++i) {
+                ResolvedOut ro{};
+                ro.amount = pending[i].amount;
+                if (pending[i].kind == OutputSpec::Kind::Transparent) {
+                    ro.spk = pending[i].transparent_spk;
+                    GetRandBytes(ro.nonce);
+                } else {
+                    CKey r; r.MakeNewKey(true);
+                    CPubKey R = r.GetPubKey();
+                    std::memcpy(ro.R.data(), R.data(), 33);
+                    auto S = ::pricoin::stealth::ECDHPoint(r, pending[i].stealth->view);
+                    if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("stealth ECDH failed (output %u)", i));
+                    auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, static_cast<uint32_t>(i));
+                    auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, pending[i].stealth->spend);
+                    if (!P) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("stealth onetime failed (output %u)", i));
+                    ro.spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
+                    std::memcpy(ro.otp.data(), P->data(), 33);
+                    auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, static_cast<uint32_t>(i));
+                    std::memcpy(ro.nonce.data(), rp_nonce.data(), 32);
+                }
+                outs.push_back(std::move(ro));
+            }
+
+            // Each input carries its real recovered blind. Random blinds for
+            // outputs [0..N-2]; the last balances so Σ(out_blinds) = Σ(in_blinds).
             std::vector<pricoin::ct::BlindingFactor> in_blinds;
             in_blinds.reserve(picked_list.size());
             for (const auto& p : picked_list) in_blinds.push_back(p.rec.blind);
 
-            pricoin::ct::BlindingFactor dest_blind;
-            GetRandBytes(dest_blind);
-            auto change_blind = pricoin::ct::BalancingBlind(
-                std::span<const pricoin::ct::BlindingFactor>{in_blinds},
-                std::array<pricoin::ct::BlindingFactor, 1>{dest_blind});
-            if (!change_blind) throw JSONRPCError(RPC_INTERNAL_ERROR, "blind sum failed");
+            const size_t Nout = outs.size();
+            std::vector<pricoin::ct::BlindingFactor> out_blinds(Nout);
+            for (size_t i = 0; i + 1 < Nout; ++i) GetRandBytes(out_blinds[i]);
+            {
+                std::span<const pricoin::ct::BlindingFactor> other_outs{out_blinds.data(), Nout - 1};
+                auto last = pricoin::ct::BalancingBlind(
+                    std::span<const pricoin::ct::BlindingFactor>{in_blinds},
+                    other_outs);
+                if (!last) throw JSONRPCError(RPC_INTERNAL_ERROR, "blind sum failed");
+                out_blinds.back() = *last;
+            }
 
-            auto dest_commit = pricoin::ct::Commitment::Create(static_cast<uint64_t>(dest_amount), dest_blind);
-            auto change_commit = pricoin::ct::Commitment::Create(static_cast<uint64_t>(change_value), *change_blind);
-            if (!dest_commit || !change_commit) throw JSONRPCError(RPC_INTERNAL_ERROR, "output commit failed");
-
-            std::vector<unsigned char> dest_spk_bytes(dest_spk.begin(), dest_spk.end());
-            std::vector<unsigned char> change_spk_bytes(change_spk.begin(), change_spk.end());
-            auto dest_proof = pricoin::ct::CreateRangeProof(
-                static_cast<uint64_t>(dest_amount), dest_blind, *dest_commit,
-                std::span<const unsigned char>{dest_spk_bytes}, dest_nonce);
-            auto change_proof = pricoin::ct::CreateRangeProof(
-                static_cast<uint64_t>(change_value), *change_blind, *change_commit,
-                std::span<const unsigned char>{change_spk_bytes}, change_nonce);
-            if (!dest_proof || !change_proof) throw JSONRPCError(RPC_INTERNAL_ERROR, "rangeproof failed");
+            std::vector<pricoin::ct::CTOutput> ct_outputs;
+            ct_outputs.reserve(Nout);
+            for (size_t i = 0; i < Nout; ++i) {
+                auto commit = pricoin::ct::Commitment::Create(static_cast<uint64_t>(outs[i].amount), out_blinds[i]);
+                if (!commit) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("output %u commit failed", i));
+                std::vector<unsigned char> spk_bytes(outs[i].spk.begin(), outs[i].spk.end());
+                auto proof = pricoin::ct::CreateRangeProof(
+                    static_cast<uint64_t>(outs[i].amount), out_blinds[i], *commit,
+                    std::span<const unsigned char>{spk_bytes}, outs[i].nonce);
+                if (!proof) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("output %u rangeproof failed", i));
+                ct_outputs.push_back(pricoin::ct::CTOutput{*commit, *proof, std::move(spk_bytes), outs[i].R, outs[i].otp});
+            }
 
             pricoin::ct::CTBundle bundle;
             bundle.input_commitments.reserve(picked_list.size());
             for (const auto& p : picked_list) bundle.input_commitments.push_back(p.rec.commitment);
-            bundle.outputs = {
-                pricoin::ct::CTOutput{*dest_commit, *dest_proof, dest_spk_bytes, dest_R, dest_otp},
-                pricoin::ct::CTOutput{*change_commit, *change_proof, change_spk_bytes, change_R, change_otp},
-            };
+            bundle.outputs = std::move(ct_outputs);
             bundle.transparent_fee = static_cast<uint64_t>(fee);
 
             CMutableTransaction mtx;
@@ -1173,8 +1225,9 @@ RPCMethod walletsendct_from_ct()
             for (const auto& p : picked_list) {
                 mtx.vin.emplace_back(p.outpoint, CScript{}, 0xfffffffe);
             }
-            mtx.vout.emplace_back(0, dest_spk);
-            mtx.vout.emplace_back(0, change_spk);
+            for (const auto& o : outs) {
+                mtx.vout.emplace_back(0, o.spk);
+            }
             mtx.ct_bundle = std::move(bundle);
 
             // Sign each input directly with the derived one-time priv key.

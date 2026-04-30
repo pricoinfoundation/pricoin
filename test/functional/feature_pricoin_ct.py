@@ -15,7 +15,12 @@ Covers:
 """
 
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal, assert_greater_than, assert_raises_rpc_error
+from test_framework.util import (
+    assert_equal,
+    assert_greater_than,
+    assert_greater_than_or_equal,
+    assert_raises_rpc_error,
+)
 
 
 class PricoinCTTest(BitcoinTestFramework):
@@ -57,6 +62,14 @@ class PricoinCTTest(BitcoinTestFramework):
         balances = bob.getbalances()["mine"]
         assert_equal(balances["confidential"], 25.0)
 
+        # PRIVACY: every v4 send must emit ≥3 outputs so the change isn't
+        # 1/2 observable. With 1 recipient, the bundle is padded with a
+        # 0-value self-output. (If this assertion ever drops to 2, the
+        # output-padding has regressed and single-recipient sends leak the
+        # change identity to anyone reading the chain.)
+        send1_raw = node.decoderawtransaction(node.getrawtransaction(send1["txid"]))
+        assert_greater_than_or_equal(len(send1_raw["vout"]), 3)
+
         # ---- 1b. multi-input self-send transparent → CT ----
         # Each coinbase output is 50 PRIC. Sending 120 PRIC forces walletsendct
         # to pick ≥ 3 separate UTXOs — the prior wallet code only picked one.
@@ -90,6 +103,9 @@ class PricoinCTTest(BitcoinTestFramework):
         ring_txid = ring_tx["txid"]
         assert_equal(ring_tx["ring_size"], 4)
         ring_hex = node.getrawtransaction(ring_txid)
+        ring_raw = node.decoderawtransaction(ring_hex)
+        # Same padding rule as the transparent → CT path: ≥3 outputs.
+        assert_greater_than_or_equal(len(ring_raw["vout"]), 3)
         self.generatetoaddress(node, 1, alice_addr)
         # Capture the ring block now — sections below mine more blocks before
         # the invalidate-and-rebroadcast test, so getblockcount() later won't
@@ -99,8 +115,9 @@ class PricoinCTTest(BitcoinTestFramework):
         # Carol recovers, bob's listownct drops the spent input via KI filter.
         assert_equal(carol.pricoin_listownct(0)["total_recovered"], 5.0)
         bob_ct = bob.pricoin_listownct(0)
-        # 4 originals - 1 spent (signer) + 1 change = 4 outputs, total ≈ 35-25 + change ≈ 24.9999
-        assert_equal(len(bob_ct["outputs"]), 4)
+        # 4 originals - 1 spent (signer) + 1 change + 1 self-decoy (privacy
+        # padding from the single-recipient ring path) = 5 outputs.
+        assert_equal(len(bob_ct["outputs"]), 5)
 
         # Phase 3a: spent ring member's chainstate entry is still present.
         spent_signer = self._find_spent_signer(node, ring_txid)
