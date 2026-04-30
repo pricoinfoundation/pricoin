@@ -99,7 +99,9 @@ namespace detail { // forward-decl in this TU; defined below the RPC.
 util::Result<uint256> SendConfidentialTxMultiImpl(
     CWallet& wallet,
     std::span<const PricoinCTRecipient> recipients,
-    CAmount fee);
+    CAmount fee,
+    int32_t lock_height = 0,
+    std::string* hex_out = nullptr);
 } // namespace detail
 
 util::Result<uint256> SendConfidentialTxMulti(
@@ -269,6 +271,80 @@ RPCMethod walletsendct_multi()
     };
 }
 
+RPCMethod walletsendct_locked()
+{
+    return RPCMethod{
+        "walletsendct_locked",
+        "Build and sign a Pricoin Confidential Transaction with an explicit\n"
+        "block-height nLockTime, but do NOT broadcast it. Returns the raw hex\n"
+        "for the caller to broadcast (or hand to a counterparty) once the\n"
+        "lock height has been reached.\n"
+        "\n"
+        "Primary use: the refund leg of an atomic swap. The funder pre-signs\n"
+        "a tx that returns funds to themselves, with `lock_height` set far\n"
+        "enough in the future that the swap counterparty has time to claim.\n"
+        "Mempool acceptance enforces nLockTime, so the refund cannot be\n"
+        "confirmed before the deadline.\n"
+        "\n"
+        "The wallet does NOT track the not-yet-broadcast tx, so the inputs\n"
+        "remain visible to subsequent walletsendct calls — be careful not to\n"
+        "spend the same UTXOs twice. (A future version may add a lock-and-\n"
+        "reserve flag.)\n",
+        {
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO,
+             "Pricoin stealth (H6...) or transparent bech32 destination"},
+            {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Amount in PRIC"},
+            {"fee", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Transparent fee in PRIC"},
+            {"lock_height", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Block height before which the tx cannot be confirmed (nLockTime)"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "hex", "Signed transaction (raw hex)"},
+                {RPCResult::Type::STR_HEX, "txid", "Resulting transaction id"},
+                {RPCResult::Type::NUM, "lock_height", "nLockTime baked into the tx"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("walletsendct_locked", "\"H6...\" 1.0 0.0001 1500")
+        },
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            std::shared_ptr<CWallet> wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            const std::string dest = request.params[0].get_str();
+            const CAmount amount = AmountFromValue(request.params[1]);
+            const CAmount fee = AmountFromValue(request.params[2]);
+            const int lock_height = request.params[3].getInt<int>();
+            if (lock_height < 0) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "lock_height must be >= 0");
+            }
+            // BIP65 reads nLockTime as a height when below LOCKTIME_THRESHOLD
+            // (5e8). We don't support time-based locks here — privacy chains
+            // that reorg PoW timestamps shouldn't anchor refunds to wall time.
+            constexpr int kLockTimeHeightMax = 499'999'999;
+            if (lock_height > kLockTimeHeightMax) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    strprintf("lock_height must be <= %d (height interpretation)",
+                              kLockTimeHeightMax));
+            }
+            std::vector<PricoinCTRecipient> recipients{
+                PricoinCTRecipient{.address = dest, .amount = amount}};
+            std::string hex;
+            auto res = detail::SendConfidentialTxMultiImpl(
+                wallet, std::span<const PricoinCTRecipient>{recipients}, fee,
+                lock_height, &hex);
+            if (!res) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(res).original);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("hex", hex);
+            out.pushKV("txid", res->ToString());
+            out.pushKV("lock_height", lock_height);
+            return out;
+        }
+    };
+}
+
 } // namespace anonymous
 
 namespace detail {
@@ -316,10 +392,25 @@ util::Result<ResolvedDest> ResolveDest(const std::string& addr, uint32_t output_
 // Multi-recipient v4 builder. recipients[].address may mix stealth and
 // transparent; each recipient gets its own one-time output, change goes
 // to the wallet's own stealth identity at output index N.
+//
+// `lock_height`: nLockTime to set on the resulting transaction. 0 means
+// "spendable immediately"; a non-zero value enforces a height-based
+// lock (Bitcoin Core's IsFinalTx gate). Used by atomic-swap refund
+// flows where the funder pre-signs a "give it back" tx that the chain
+// can't confirm until block H.
+//
+// `hex_out`: if non-null, the caller wants the signed tx as raw hex
+// for offline use (typical: hand to a counterparty who will broadcast
+// it later, or stash for the timeout path of an atomic swap). When
+// non-null, the function builds + signs but does NOT broadcast or add
+// to the wallet's mapWallet. When null, the function commits and
+// broadcasts as before.
 util::Result<uint256> SendConfidentialTxMultiImpl(
     CWallet& wallet,
     std::span<const PricoinCTRecipient> recipients,
-    CAmount fee)
+    CAmount fee,
+    int32_t lock_height,
+    std::string* hex_out)
 {
     CAmount total_dest = 0;
     for (size_t i = 0; i < recipients.size(); ++i) {
@@ -436,7 +527,12 @@ util::Result<uint256> SendConfidentialTxMultiImpl(
 
     CMutableTransaction mtx;
     mtx.version = PRICOIN_CT_VERSION;
-    mtx.nLockTime = 0;
+    // Height-based lock when requested; otherwise default-final.
+    // IsFinalTx interprets nLockTime < LOCKTIME_THRESHOLD (5e8) as a
+    // block height, so passing a height directly is correct. nLockTime
+    // is honoured iff at least one vin's nSequence is < 0xffffffff;
+    // the existing 0xfffffffe (final-but-RBF-eligible) qualifies.
+    mtx.nLockTime = (lock_height > 0) ? static_cast<uint32_t>(lock_height) : 0u;
     for (const auto& p : *picked) {
         mtx.vin.emplace_back(p.outpoint, CScript{}, 0xfffffffe);
     }
@@ -462,6 +558,15 @@ util::Result<uint256> SendConfidentialTxMultiImpl(
     }
 
     CTransactionRef tx_ref = MakeTransactionRef(std::move(mtx));
+    if (hex_out) {
+        // Build-only mode: caller broadcasts (or doesn't) on its own.
+        // Don't CommitTransaction — that would add a tx the wallet can't
+        // yet confirm into mapWallet, polluting balance accounting.
+        DataStream ssTx;
+        ssTx << TX_WITH_WITNESS(*tx_ref);
+        *hex_out = HexStr(ssTx);
+        return tx_ref->GetHash().ToUint256();
+    }
     wallet.CommitTransaction(tx_ref, /*mapValue=*/{}, /*orderForm=*/{});
     return tx_ref->GetHash().ToUint256();
 }
@@ -470,6 +575,7 @@ util::Result<uint256> SendConfidentialTxMultiImpl(
 
 RPCMethod walletsendct_export() { return walletsendct(); }
 RPCMethod walletsendct_multi_export() { return walletsendct_multi(); }
+RPCMethod walletsendct_locked_export() { return walletsendct_locked(); }
 
 namespace {
 

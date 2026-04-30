@@ -578,6 +578,47 @@ class PricoinCTTest(BitcoinTestFramework):
                                 frank.pricoin_getstealthaddress)
         node.unloadwallet("frank")
 
+        # ---- 11b. nLockTime is enforced on v4 txs (atomic-swap stage 0) ----
+        # Pre-signed locked txs are the refund leg of every atomic-swap
+        # protocol. Verify Bitcoin Core's IsFinalTx gate fires on v4
+        # before the lock height and clears at the lock height. If this
+        # ever regresses, every atomic-swap protocol built on Pricoin
+        # silently loses its safety property.
+        if "alice" not in node.listwallets():
+            node.loadwallet("alice")
+        alice = node.get_wallet_rpc("alice")
+        # Build a locked v4 tx 5 blocks in the future, paying alice's
+        # own stealth back to alice (the actual refund pattern: funder
+        # gets their funds back if the swap counterparty walks away).
+        alice_stealth = alice.pricoin_getstealthaddress()["address"]
+        tip = node.getblockcount()
+        lock_height = tip + 5
+        locked = alice.walletsendct_locked(alice_stealth, 1.0, 0.0001, lock_height)
+        assert "hex" in locked
+        assert_equal(locked["lock_height"], lock_height)
+        # Pre-lock: mempool must reject as non-final.
+        assert_raises_rpc_error(-26, "non-final",
+                                node.sendrawtransaction, locked["hex"])
+        # Mine to one BEFORE the lock height. Still rejected (the next
+        # block would be at lock_height + 1; IsFinalTx checks against
+        # tip+1's height, so we need tip == lock_height - 1 after this).
+        self.generatetoaddress(node, lock_height - tip - 1, alice_addr)
+        assert_equal(node.getblockcount(), lock_height - 1)
+        assert_raises_rpc_error(-26, "non-final",
+                                node.sendrawtransaction, locked["hex"])
+        # Mine the lock-height block. Now nLockTime <= tip, the tx is
+        # final, mempool accepts.
+        self.generatetoaddress(node, 1, alice_addr)
+        assert_equal(node.getblockcount(), lock_height)
+        accepted_txid = node.sendrawtransaction(locked["hex"])
+        assert_equal(accepted_txid, locked["txid"])
+        # Confirm it actually mines.
+        self.generatetoaddress(node, 1, alice_addr)
+        raw = node.getrawtransaction(accepted_txid, True)
+        assert_equal(raw["confirmations"], 1)
+        assert_equal(raw["locktime"], lock_height)
+        node.unloadwallet("alice")
+
         # ---- 12. Orphaned KI-store .tmp must be cleaned up on startup ----
         # If RewriteFile is interrupted between "open .tmp + write" and
         # the subsequent rename, an orphan pricoin_keyimages.dat.tmp can
