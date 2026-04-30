@@ -230,6 +230,66 @@ class PricoinCTTest(BitcoinTestFramework):
         assert not legacy_side_file.exists(), \
             "fresh wallets must not create the legacy side-file"
 
+        # PRIVACY/RECOVERY: fresh wallets persist the 32-byte seed (from
+        # which view+spend are derived) rather than the legacy 64-byte
+        # view||spend blob. This shrinks the recovery surface to a single
+        # secret that's small enough for paper backup.
+        import sqlite3
+        dave_db = wallet_dir / "wallet.dat"
+        # Pause the wallet briefly to read the DB; requires unload.
+        dave.walletlock()
+        node.unloadwallet("dave")
+        with sqlite3.connect(str(dave_db)) as conn:
+            seed_row = conn.execute("SELECT 1 FROM main WHERE key = ?",
+                                    (b"\x10pct_stealth_seed",)).fetchone()
+            keyblob_row = conn.execute("SELECT 1 FROM main WHERE key = ?",
+                                       (b"\x0bpct_stealth",)).fetchone()
+        assert seed_row is not None, "fresh wallet should write a seed record"
+        assert keyblob_row is None, "fresh wallet must NOT write the legacy key-blob"
+        node.loadwallet("dave")
+        dave = node.get_wallet_rpc("dave")
+        dave.walletpassphrase("dave-passphrase", 60)
+        # Address must be unchanged after the unload/reload.
+        assert_equal(dave.pricoin_getstealthaddress()["address"], dave_stealth)
+
+        # pricoin_getstealthseed exposes the 32-byte master for paper backup.
+        # Same seed across calls (it's the persisted secret), 64 hex chars.
+        seed_resp = dave.pricoin_getstealthseed()
+        assert "seed" in seed_resp
+        assert_equal(len(seed_resp["seed"]), 64)
+        assert_equal(seed_resp["seed"], dave.pricoin_getstealthseed()["seed"])
+        # Locking the wallet must refuse seed export (same posture as
+        # dumpprivkey).
+        dave.walletlock()
+        assert_raises_rpc_error(-13, "unlocked wallet",
+                                dave.pricoin_getstealthseed)
+        dave.walletpassphrase("dave-passphrase", 60)
+
+        # Seed import round-trip: a fresh recovery wallet receives the
+        # paper-backup hex and ends up with the same address.
+        dave_seed_hex = seed_resp["seed"]
+        node.createwallet("dave_recovered")
+        dave_recovered = node.get_wallet_rpc("dave_recovered")
+        # Force the wallet to materialise its own seed so the overwrite
+        # guard has something to refuse. (Whether createwallet already
+        # touched GetOrCreate depends on the chain-rescan ordering, which
+        # is not stable across runs.)
+        dave_recovered.pricoin_getstealthaddress()
+        # Without confirm_overwrite, refuses because a seed already exists.
+        assert_raises_rpc_error(-4, "confirm_overwrite",
+                                dave_recovered.pricoin_setstealthseed,
+                                dave_seed_hex)
+        # With confirm_overwrite, the seed is adopted and the address
+        # matches dave's original.
+        result = dave_recovered.pricoin_setstealthseed(dave_seed_hex, True)
+        assert_equal(result["address"], dave_stealth)
+        assert_equal(dave_recovered.pricoin_getstealthseed()["seed"], dave_seed_hex)
+        # Bad-length seed → RPC param error.
+        assert_raises_rpc_error(-8, "64 hex characters",
+                                dave_recovered.pricoin_setstealthseed,
+                                "deadbeef", True)
+        node.unloadwallet("dave_recovered")
+
         # Send to dave; he scans and recovers (wallet still unlocked).
         alice.walletsendct(dave_stealth, 7.0, 0.0001)
         self.generatetoaddress(node, 1, alice_addr)
@@ -313,9 +373,15 @@ class PricoinCTTest(BitcoinTestFramework):
         george_db = george_dir / "wallet.dat"
         # Bitcoin Core's SQLite keys are varint-prefixed serialised strings.
         # "pct_stealth" is 11 bytes, varint prefix is 0x0b.
+        # "pct_stealth_seed" is 16 bytes, varint prefix is 0x10.
         stealth_key = b"\x0b" + b"pct_stealth"
+        seed_key = b"\x10" + b"pct_stealth_seed"
+        # Delete BOTH possible stealth records (seed for v0.1.12+ wallets,
+        # key-blob for v0.1.11 wallets) so the load path falls through to
+        # the legacy side-file.
         with sqlite3.connect(str(george_db)) as conn:
             conn.execute("DELETE FROM main WHERE key = ?", (stealth_key,))
+            conn.execute("DELETE FROM main WHERE key = ?", (seed_key,))
             conn.commit()
         # Drop a legacy unencrypted blob (version 0x00) with known content.
         import secrets
@@ -356,14 +422,17 @@ class PricoinCTTest(BitcoinTestFramework):
         node.unloadwallet("dave")
         dave_dir = node.datadir_path / node.chain / "wallets" / "dave"
         dave_db = dave_dir / "wallet.dat"
+        # Tamper the seed record (v0.1.12+ default). The key-blob record
+        # would be the v0.1.11 path; this test deliberately exercises the
+        # current format.
         with sqlite3.connect(str(dave_db)) as conn:
             row = conn.execute("SELECT value FROM main WHERE key = ?",
-                               (stealth_key,)).fetchone()
-            assert row is not None, "dave should have a stealth DB record"
-            # The raw value is the on-the-wire serialised blob: a varint
-            # length prefix followed by the bytes EncodeBlob produced. For a
-            # 145-byte blob the varint prefix is one byte (0x91 — actually
-            # 145 < 0xfd so it's just 0x91). Skip past it.
+                               (seed_key,)).fetchone()
+            assert row is not None, "dave should have a seed DB record"
+            # Raw value layout: varint-length-prefix then the EncodeBlob
+            # output. For an encrypted 32-byte seed the encoded blob is
+            # 1 (ver) + 32 (iv) + 48 (PKCS7-padded ciphertext) + 32 (mac) =
+            # 113 bytes; varint prefix for 113 is 0x71.
             assert len(row[0]) >= 2, "value too short"
             assert row[0][1] == 0x02, \
                 f"expected version 0x02 at offset 1, got {hex(row[0][1])}"
@@ -371,7 +440,7 @@ class PricoinCTTest(BitcoinTestFramework):
             # ciphertext starts at byte 2 (varint) + 1 (ver) + 32 (iv) = 35.
             blob[35] ^= 0x01
             conn.execute("UPDATE main SET value = ? WHERE key = ?",
-                         (bytes(blob), stealth_key))
+                         (bytes(blob), seed_key))
             conn.commit()
         node.loadwallet("dave", load_on_startup=False)
         dave = node.get_wallet_rpc("dave")

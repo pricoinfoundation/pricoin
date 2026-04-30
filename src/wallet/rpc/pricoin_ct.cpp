@@ -1322,9 +1322,134 @@ RPCMethod pricoin_getstealthaddress()
         }
     };
 }
+
+RPCMethod pricoin_getstealthseed()
+{
+    return RPCMethod{
+        "pricoin_getstealthseed",
+        "Return the 32-byte master seed from which this wallet's stealth view\n"
+        "and spend keys are derived. Save this hex string offline — anyone with\n"
+        "it can reconstruct your stealth address and recover all CT payments\n"
+        "ever sent to it. Equivalent to a wallet seed phrase for the stealth\n"
+        "side; pair it with `listdescriptors true` (for the transparent side)\n"
+        "for a complete cold backup.\n"
+        "\n"
+        "Errors:\n"
+        "  - wallet locked (call `walletpassphrase` first).\n"
+        "  - wallet uses the legacy v0.1.11 key-blob format. Use `backupwallet`\n"
+        "    or `bitcoin-wallet dump` to back up those wallets — there is no\n"
+        "    seed to extract.\n",
+        {},
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "seed", "32-byte master seed (hex)"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("pricoin_getstealthseed", "")
+        },
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            // Even though the seed is held in memory while the wallet is
+            // running (so we could technically return it after walletlock),
+            // we require an unlocked wallet for export — same posture as
+            // dumpprivkey. Locking is the user's signal "do not surface
+            // secrets right now."
+            if (wallet_sp->HasEncryptionKeys() && wallet_sp->IsLocked()) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED,
+                    "Pricoin stealth seed export requires an unlocked wallet "
+                    "(call `walletpassphrase` first, then retry — but treat "
+                    "this seed as you would a private-key dump: anyone who "
+                    "sees it can reconstruct your stealth identity).");
+            }
+            auto seed = wallet::pricoin_stealth::GetSeedIfAvailable(*wallet_sp);
+            if (!seed) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                    "This wallet uses the legacy v0.1.11 stealth-key format and has no "
+                    "extractable seed. Use `backupwallet` or `bitcoin-wallet dump` to "
+                    "back it up instead.");
+            }
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("seed", HexStr(*seed));
+            return out;
+        }
+    };
+}
+RPCMethod pricoin_setstealthseed()
+{
+    return RPCMethod{
+        "pricoin_setstealthseed",
+        "Restore the wallet's stealth identity from a 32-byte seed (hex), e.g.\n"
+        "from a `pricoin_getstealthseed` paper backup. Refuses to clobber an\n"
+        "existing identity unless `confirm_overwrite=true` — overwriting\n"
+        "discards every CT output already received by this wallet.\n"
+        "\n"
+        "Typical recovery flow:\n"
+        "  1. createwallet \"recovered\" — produces a fresh seed.\n"
+        "  2. pricoin_setstealthseed \"<32-byte hex>\" true — replaces it.\n"
+        "  3. The wallet now derives the original stealth address; rescan\n"
+        "     to find any CT payments previously sent to it.\n",
+        {
+            {"seed_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "32-byte seed in hex (64 chars)."},
+            {"confirm_overwrite", RPCArg::Type::BOOL, RPCArg::Default{false},
+             "If the wallet already has a stealth identity, set true to overwrite it. "
+             "Any CT funds previously received are LOST (recoverable only via the "
+             "old wallet.dat or seed)."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR, "address", "Newly-active stealth address (Base58Check)"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("pricoin_setstealthseed", "\"<32-byte hex>\" true")
+        },
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const std::string seed_hex = request.params[0].get_str();
+            const bool confirm = !request.params[1].isNull() && request.params[1].get_bool();
+            if (!IsHex(seed_hex) || seed_hex.size() != 64) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "seed_hex must be exactly 64 hex characters (32 bytes)");
+            }
+            const std::vector<unsigned char> seed = ParseHex(seed_hex);
+            const auto result = wallet::pricoin_stealth::SetSeed(*wallet_sp, seed, confirm);
+            switch (result) {
+                case wallet::pricoin_stealth::SetSeedResult::Ok:
+                    break;
+                case wallet::pricoin_stealth::SetSeedResult::InvalidSeed:
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        "seed does not derive valid secp256k1 keys");
+                case wallet::pricoin_stealth::SetSeedResult::Locked:
+                    throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED,
+                        "Pricoin stealth seed import requires an unlocked wallet "
+                        "(call `walletpassphrase` first).");
+                case wallet::pricoin_stealth::SetSeedResult::AlreadyHasIdentity:
+                    throw JSONRPCError(RPC_WALLET_ERROR,
+                        "Wallet already has a stealth identity. Pass "
+                        "`confirm_overwrite=true` to replace it (LOSES access to all "
+                        "CT funds received under the previous identity).");
+                case wallet::pricoin_stealth::SetSeedResult::WriteFailed:
+                    throw JSONRPCError(RPC_WALLET_ERROR,
+                        "Failed to persist stealth seed to wallet.dat");
+            }
+            const auto& id = wallet::pricoin_stealth::GetOrCreate(*wallet_sp);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("address", ::pricoin::stealth::Encode(id.public_address));
+            return out;
+        }
+    };
+}
 } // namespace
 
 RPCMethod pricoin_getstealthaddress_export() { return pricoin_getstealthaddress(); }
+RPCMethod pricoin_getstealthseed_export() { return pricoin_getstealthseed(); }
+RPCMethod pricoin_setstealthseed_export() { return pricoin_setstealthseed(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

@@ -13,6 +13,7 @@
 #include <random.h>
 #include <support/cleanse.h>
 #include <sync.h>
+#include <tinyformat.h>
 #include <uint256.h>
 #include <util/fs.h>
 #include <wallet/crypter.h>
@@ -32,6 +33,14 @@ namespace wallet::pricoin_stealth {
 
 namespace {
 
+// Form in which the wallet persists the stealth identity.
+//   Seed:    32-byte master from which view+spend are derived
+//            (current path; one secret to back up).
+//   KeyBlob: 64-byte (view||spend) blob (legacy v0.1.11 wallets — kept on
+//            read so users don't lose access on upgrade; new wallets do
+//            not write this form).
+enum class PersistKind { Seed, KeyBlob };
+
 struct CacheEntry {
     Identity id;
     // True once we've persisted this identity in the format that matches
@@ -40,6 +49,12 @@ struct CacheEntry {
     // encrypted+locked, so we couldn't safely write them yet) — retry
     // the save on the next GetOrCreate call.
     bool saved_in_target_format{false};
+    // Which DB record we own. Drives the retry-save path.
+    PersistKind persist_kind{PersistKind::Seed};
+    // For seed-based entries, the raw seed bytes are kept so a deferred
+    // save (after the wallet unlocks) can re-encrypt and re-write. Empty
+    // / unused for KeyBlob entries.
+    std::array<unsigned char, 32> seed{};
     // RAII handle into wallet.NotifyUnload that erases this entry from the
     // cache when its CWallet is unloaded. Without it, the raw CWallet*
     // key in `g_identities` would dangle, and a future wallet allocated at
@@ -68,10 +83,13 @@ std::map<const CWallet*, CacheEntry> g_identities GUARDED_BY(g_mutex);
 constexpr unsigned char kVersionPlain = 0x00;
 constexpr unsigned char kVersionEncryptedNoMac = 0x01;  // legacy read-only
 constexpr unsigned char kVersionEncrypted = 0x02;
-constexpr size_t kPlaintextSize = 64;
+constexpr size_t kKeyBlobSize = 64;       // view (32) + spend (32)
+constexpr size_t kSeedSize = 32;          // master seed for HD derivation
 constexpr size_t kIVSize = 32;
 constexpr size_t kMacSize = 32;
 constexpr const char* kMacTag = "pricoin/stealth/mac-v1";
+constexpr const char* kViewTag = "pricoin/stealth/view-v1";
+constexpr const char* kSpendTag = "pricoin/stealth/spend-v1";
 
 // Constant-time byte compare. Used for MAC verification: lookup-table or
 // short-circuit memcmp leaks information about *where* the MAC differs,
@@ -99,13 +117,6 @@ void ComputeStealthFileMac(const CKeyingMaterial& mk,
     hmac.Finalize(out);
 }
 
-CKey FreshKey()
-{
-    CKey k;
-    k.MakeNewKey(/*fCompressed=*/true);
-    return k;
-}
-
 fs::path StealthFilePath(CWallet& wallet)
 {
     fs::path db_path = fs::PathFromString(wallet.GetDatabase().Filename());
@@ -115,7 +126,7 @@ fs::path StealthFilePath(CWallet& wallet)
 
 // Sets the two privkeys + derived public_address into `out`. `plain` holds
 // 32 view + 32 spend bytes; cleansed by the caller after this returns.
-bool MaterializeIdentity(const std::array<unsigned char, kPlaintextSize>& plain, Identity& out)
+bool MaterializeIdentity(const std::array<unsigned char, kKeyBlobSize>& plain, Identity& out)
 {
     out.view.Set(plain.begin(), plain.begin() + 32, /*fCompressedIn=*/true);
     out.spend.Set(plain.begin() + 32, plain.begin() + 64, /*fCompressedIn=*/true);
@@ -125,91 +136,118 @@ bool MaterializeIdentity(const std::array<unsigned char, kPlaintextSize>& plain,
     return true;
 }
 
-// Decode a stealth-identity blob (any of the supported versions) into the
-// 64-byte plaintext (view||spend). Throws std::runtime_error if the blob
+// Derive view+spend from a 32-byte seed via tagged SHA-256:
+//   k = SHA256(tag || seed || ctr) until k is a valid secp256k1 scalar.
+// The counter loop covers the ~2^-128 invalid-scalar case; in practice the
+// first hash always succeeds. Tags are domain-separated so view ≠ spend
+// for the same seed and so this scheme can't collide with future KDFs
+// over the same secret.
+Identity DeriveIdentityFromSeed(std::span<const unsigned char> seed)
+{
+    auto derive_key = [&seed](const char* tag, CKey& out) {
+        for (uint16_t ctr = 0; ctr <= 0xff; ++ctr) {
+            CSHA256 h;
+            h.Write(reinterpret_cast<const unsigned char*>(tag), std::strlen(tag));
+            h.Write(seed.data(), seed.size());
+            const unsigned char ctr_byte = static_cast<unsigned char>(ctr);
+            h.Write(&ctr_byte, 1);
+            std::array<unsigned char, 32> bytes{};
+            h.Finalize(bytes.data());
+            out.Set(bytes.begin(), bytes.end(), /*fCompressedIn=*/true);
+            memory_cleanse(bytes.data(), bytes.size());
+            if (out.IsValid()) return;
+        }
+        throw std::runtime_error("stealth seed derivation: rehash counter exhausted");
+    };
+    Identity id;
+    derive_key(kViewTag, id.view);
+    derive_key(kSpendTag, id.spend);
+    if (!id.view.IsValid() || !id.spend.IsValid()) {
+        throw std::runtime_error("stealth seed derivation produced invalid keys");
+    }
+    id.public_address.view = id.view.GetPubKey();
+    id.public_address.spend = id.spend.GetPubKey();
+    return id;
+}
+
+// Decode a versioned secret blob into raw plaintext bytes. Caller owns
+// validating the resulting size against the secret type it expected (32
+// for a seed, 64 for a key-blob). Throws std::runtime_error if the blob
 // is encrypted and the wallet is currently locked. Sets `needs_upgrade`
-// when the blob's format is older than what we'd write today, so the
-// caller can re-save to migrate.
+// when the on-disk format is older than what we'd write today.
+//
+// Note: `buf.size() == kKeyBlobSize` (a raw 64-byte buffer with no
+// version byte) is intentionally NOT supported here — that legacy form
+// only ever existed in the side file. The caller handles that case
+// before calling DecodeBlob.
 bool DecodeBlob(CWallet& wallet,
                 std::span<const unsigned char> buf,
-                std::array<unsigned char, kPlaintextSize>& plain,
+                std::vector<unsigned char>& plain,
                 bool& needs_upgrade)
 {
     needs_upgrade = false;
+    plain.clear();
     if (buf.empty()) return false;
-    bool plaintext = false;
 
-    if (buf.size() == kPlaintextSize) {
-        // Legacy unversioned 64-byte plaintext (file-only; never written
-        // to the DB). Always upgrade.
-        std::memcpy(plain.data(), buf.data(), kPlaintextSize);
-        plaintext = true;
-        needs_upgrade = true;
-    } else if (buf[0] == kVersionPlain) {
-        if (buf.size() != 1 + kPlaintextSize) return false;
-        std::memcpy(plain.data(), buf.data() + 1, kPlaintextSize);
-        plaintext = true;
-    } else if (buf[0] == kVersionEncryptedNoMac || buf[0] == kVersionEncrypted) {
-        const bool has_mac = (buf[0] == kVersionEncrypted);
-        const size_t min_size = has_mac
-            ? (1 + kIVSize + 1 + kMacSize)
-            : (1 + kIVSize + 1);
-        if (buf.size() < min_size) return false;
-        if (wallet.IsLocked()) {
-            throw std::runtime_error(
-                "Pricoin stealth keys are encrypted; unlock the wallet "
-                "(`walletpassphrase`) before scanning or sending confidential transactions");
+    if (buf[0] == kVersionPlain) {
+        if (buf.size() < 2) return false;
+        plain.assign(buf.begin() + 1, buf.end());
+        if (wallet.HasEncryptionKeys() && !wallet.IsLocked()) {
+            needs_upgrade = true;
         }
-        uint256 iv;
-        std::memcpy(iv.begin(), buf.data() + 1, kIVSize);
-        const size_t ct_end = buf.size() - (has_mac ? kMacSize : 0);
-        std::vector<unsigned char> ciphertext(buf.begin() + 1 + kIVSize,
-                                              buf.begin() + ct_end);
-        CKeyingMaterial decrypted;
-        bool ok = false;
-        wallet.WithEncryptionKey([&](const CKeyingMaterial& mk) {
-            if (mk.empty()) return false;
-            if (has_mac) {
-                unsigned char expected[kMacSize];
-                ComputeStealthFileMac(mk, buf[0],
-                                      std::span<const unsigned char>{iv.begin(), kIVSize},
-                                      ciphertext, expected);
-                const unsigned char* on_disk = buf.data() + ct_end;
-                if (!ConstantTimeEqual(expected, on_disk, kMacSize)) {
-                    // Wrong key, or tampered ciphertext. AES-CBC has no
-                    // built-in integrity; a bad-MAC plaintext is garbage.
-                    return false;
-                }
-            }
-            if (!DecryptSecret(mk, ciphertext, iv, decrypted)) return false;
-            ok = (decrypted.size() == kPlaintextSize);
-            return ok;
-        });
-        if (!ok) return false;
-        std::memcpy(plain.data(), decrypted.data(), kPlaintextSize);
-        memory_cleanse(decrypted.data(), decrypted.size());
-        if (!has_mac) needs_upgrade = true;
-    } else {
+        return true;
+    }
+
+    if (buf[0] != kVersionEncryptedNoMac && buf[0] != kVersionEncrypted) {
         return false;
     }
-
-    // Plaintext loaded under an encrypted wallet → upgrade so the next
-    // write encrypts the keys at rest.
-    if (plaintext && wallet.HasEncryptionKeys() && !wallet.IsLocked()) {
-        needs_upgrade = true;
+    const bool has_mac = (buf[0] == kVersionEncrypted);
+    const size_t min_size = has_mac
+        ? (1 + kIVSize + 1 + kMacSize)
+        : (1 + kIVSize + 1);
+    if (buf.size() < min_size) return false;
+    if (wallet.IsLocked()) {
+        throw std::runtime_error(
+            "Pricoin stealth keys are encrypted; unlock the wallet "
+            "(`walletpassphrase`) before scanning or sending confidential transactions");
     }
+    uint256 iv;
+    std::memcpy(iv.begin(), buf.data() + 1, kIVSize);
+    const size_t ct_end = buf.size() - (has_mac ? kMacSize : 0);
+    std::vector<unsigned char> ciphertext(buf.begin() + 1 + kIVSize,
+                                          buf.begin() + ct_end);
+    CKeyingMaterial decrypted;
+    bool ok = false;
+    wallet.WithEncryptionKey([&](const CKeyingMaterial& mk) {
+        if (mk.empty()) return false;
+        if (has_mac) {
+            unsigned char expected[kMacSize];
+            ComputeStealthFileMac(mk, buf[0],
+                                  std::span<const unsigned char>{iv.begin(), kIVSize},
+                                  ciphertext, expected);
+            const unsigned char* on_disk = buf.data() + ct_end;
+            if (!ConstantTimeEqual(expected, on_disk, kMacSize)) {
+                return false;
+            }
+        }
+        if (!DecryptSecret(mk, ciphertext, iv, decrypted)) return false;
+        ok = !decrypted.empty();
+        return ok;
+    });
+    if (!ok) return false;
+    plain.assign(decrypted.begin(), decrypted.end());
+    memory_cleanse(decrypted.data(), decrypted.size());
+    if (!has_mac) needs_upgrade = true;
     return true;
 }
 
-// Encode a 64-byte plaintext into a versioned blob ready for storage.
-// Returns false if the wallet is encrypted-but-locked (caller retries
-// later — see SaveIdentity comment for why we won't write plaintext
-// under an encrypted wallet).
+// Encode a plaintext secret of arbitrary size into a versioned blob.
+// Returns false if the wallet is encrypted-but-locked.
 bool EncodeBlob(CWallet& wallet,
                 std::span<const unsigned char> plain,
                 std::vector<unsigned char>& blob)
 {
-    if (plain.size() != kPlaintextSize) return false;
+    if (plain.empty()) return false;
 
     if (wallet.HasEncryptionKeys() && wallet.IsLocked()) {
         return false;
@@ -246,24 +284,34 @@ bool EncodeBlob(CWallet& wallet,
     // Unencrypted wallet: store plaintext alongside the wallet's other
     // plaintext secrets.
     blob.clear();
-    blob.reserve(1 + kPlaintextSize);
+    blob.reserve(1 + plain.size());
     blob.push_back(kVersionPlain);
     blob.insert(blob.end(), plain.begin(), plain.end());
     return true;
 }
 
-// Read the stealth blob from the wallet's DB. Returns false if absent or
-// the read failed.
-bool ReadBlobFromDB(CWallet& wallet, std::vector<unsigned char>& blob)
+bool ReadKeyBlobFromDB(CWallet& wallet, std::vector<unsigned char>& blob)
 {
     WalletBatch batch(wallet.GetDatabase());
     return batch.ReadPricoinStealth(blob);
 }
 
-bool WriteBlobToDB(CWallet& wallet, const std::vector<unsigned char>& blob)
+bool WriteKeyBlobToDB(CWallet& wallet, const std::vector<unsigned char>& blob)
 {
     WalletBatch batch(wallet.GetDatabase());
     return batch.WritePricoinStealth(blob);
+}
+
+bool ReadSeedFromDB(CWallet& wallet, std::vector<unsigned char>& blob)
+{
+    WalletBatch batch(wallet.GetDatabase());
+    return batch.ReadPricoinStealthSeed(blob);
+}
+
+bool WriteSeedToDB(CWallet& wallet, const std::vector<unsigned char>& blob)
+{
+    WalletBatch batch(wallet.GetDatabase());
+    return batch.WritePricoinStealthSeed(blob);
 }
 
 // Legacy: read the raw side-file blob. Used only for one-time migration
@@ -278,29 +326,99 @@ bool ReadBlobFromLegacyFile(CWallet& wallet, std::vector<unsigned char>& blob)
     return !blob.empty();
 }
 
-// Wrap DecodeBlob to fill an Identity, cleansing the intermediate plaintext.
-bool DecodeBlobIntoIdentity(CWallet& wallet,
-                            std::span<const unsigned char> blob,
-                            Identity& out,
-                            bool& needs_upgrade)
+// Try to read & decode the seed record. On success, `seed_out` holds the
+// 32 raw bytes and `out` is the derived identity. May throw on locked.
+bool LoadFromSeedRecord(CWallet& wallet,
+                        Identity& out,
+                        std::array<unsigned char, kSeedSize>& seed_out,
+                        bool& needs_upgrade)
 {
-    std::array<unsigned char, kPlaintextSize> plain{};
+    needs_upgrade = false;
+    std::vector<unsigned char> blob;
+    if (!ReadSeedFromDB(wallet, blob)) return false;
+    std::vector<unsigned char> plain;
     if (!DecodeBlob(wallet, blob, plain, needs_upgrade)) return false;
-    bool ok = MaterializeIdentity(plain, out);
+    if (plain.size() != kSeedSize) {
+        memory_cleanse(plain.data(), plain.size());
+        return false;
+    }
+    std::memcpy(seed_out.data(), plain.data(), kSeedSize);
     memory_cleanse(plain.data(), plain.size());
+    out = DeriveIdentityFromSeed(seed_out);
+    return true;
+}
+
+// Try to read & decode the legacy v0.1.11 key-blob record.
+bool LoadFromKeyBlobRecord(CWallet& wallet, Identity& out, bool& needs_upgrade)
+{
+    needs_upgrade = false;
+    std::vector<unsigned char> blob;
+    if (!ReadKeyBlobFromDB(wallet, blob)) return false;
+    std::vector<unsigned char> plain;
+    if (!DecodeBlob(wallet, blob, plain, needs_upgrade)) return false;
+    if (plain.size() != kKeyBlobSize) {
+        memory_cleanse(plain.data(), plain.size());
+        return false;
+    }
+    std::array<unsigned char, kKeyBlobSize> arr{};
+    std::memcpy(arr.data(), plain.data(), kKeyBlobSize);
+    memory_cleanse(plain.data(), plain.size());
+    bool ok = MaterializeIdentity(arr, out);
+    memory_cleanse(arr.data(), arr.size());
     return ok;
 }
 
-bool SaveIdentity(CWallet& wallet, const Identity& id)
+// Try to read & decode the legacy side-file (pre-v0.1.11). Handles the
+// even-older 64-byte unversioned form too.
+bool LoadFromLegacyFile(CWallet& wallet, Identity& out)
 {
-    std::array<unsigned char, kPlaintextSize> plain{};
+    std::vector<unsigned char> blob;
+    if (!ReadBlobFromLegacyFile(wallet, blob)) return false;
+
+    if (blob.size() == kKeyBlobSize) {
+        // Pre-versioning: raw 64 bytes (view||spend), no header.
+        std::array<unsigned char, kKeyBlobSize> arr{};
+        std::memcpy(arr.data(), blob.data(), kKeyBlobSize);
+        bool ok = MaterializeIdentity(arr, out);
+        memory_cleanse(arr.data(), arr.size());
+        return ok;
+    }
+    bool unused_upgrade = false;
+    std::vector<unsigned char> plain;
+    if (!DecodeBlob(wallet, blob, plain, unused_upgrade)) return false;
+    if (plain.size() != kKeyBlobSize) {
+        memory_cleanse(plain.data(), plain.size());
+        return false;
+    }
+    std::array<unsigned char, kKeyBlobSize> arr{};
+    std::memcpy(arr.data(), plain.data(), kKeyBlobSize);
+    memory_cleanse(plain.data(), plain.size());
+    bool ok = MaterializeIdentity(arr, out);
+    memory_cleanse(arr.data(), arr.size());
+    return ok;
+}
+
+bool SaveSeed(CWallet& wallet, std::span<const unsigned char> seed)
+{
+    if (seed.size() != kSeedSize) return false;
+    std::vector<unsigned char> blob;
+    if (!EncodeBlob(wallet, seed, blob)) return false;
+    return WriteSeedToDB(wallet, blob);
+}
+
+// Save a legacy v0.1.11 key blob (only used when migrating a legacy
+// side file or refreshing the on-disk format of an existing key-blob
+// wallet — never when we're starting from scratch).
+bool SaveKeyBlob(CWallet& wallet, const Identity& id)
+{
+    std::array<unsigned char, kKeyBlobSize> plain{};
     std::memcpy(plain.data(),      id.view.data(),  32);
     std::memcpy(plain.data() + 32, id.spend.data(), 32);
     std::vector<unsigned char> blob;
     bool ok = EncodeBlob(wallet, plain, blob);
     memory_cleanse(plain.data(), plain.size());
     if (!ok) return false;
-    return WriteBlobToDB(wallet, blob);
+    return WriteKeyBlobToDB(wallet, blob);
 }
 
 } // namespace
@@ -314,7 +432,13 @@ const Identity& GetOrCreate(CWallet& wallet)
         // try again now — by the time the user calls into us a second
         // time, walletpassphrase has typically been called.
         if (!it->second.saved_in_target_format) {
-            if (SaveIdentity(wallet, it->second.id)) {
+            bool ok = false;
+            if (it->second.persist_kind == PersistKind::Seed) {
+                ok = SaveSeed(wallet, it->second.seed);
+            } else {
+                ok = SaveKeyBlob(wallet, it->second.id);
+            }
+            if (ok) {
                 it->second.saved_in_target_format = true;
                 LogInfo("Pricoin: persisted previously-in-memory stealth identity for wallet %s",
                         wallet.GetName());
@@ -324,51 +448,84 @@ const Identity& GetOrCreate(CWallet& wallet)
     }
 
     Identity id;
+    PersistKind kind = PersistKind::Seed;
+    std::array<unsigned char, kSeedSize> seed{};
     bool loaded = false;
     bool needs_resave = false;
     const char* origin = nullptr;
 
-    // 1. Wallet DB (current home — what `backupwallet` covers).
-    std::vector<unsigned char> blob;
-    if (ReadBlobFromDB(wallet, blob)) {
-        if (!DecodeBlobIntoIdentity(wallet, blob, id, needs_resave)) {
-            // DB record exists but we can't decode it. Don't silently
-            // overwrite — the user may have wallet-locked state or a
-            // genuinely corrupt entry. Surface the failure.
-            throw std::runtime_error(
-                "Pricoin stealth record in wallet.dat failed to decode "
-                "(wallet locked, wrong passphrase, or corrupt entry)");
-        }
-        loaded = true;
-        origin = "wallet.dat";
-    }
+    // For both record types: if the row is present but the load fails,
+    // surface the decode failure instead of silently regenerating.
+    // Generating fresh keys over a corrupt-but-present record would
+    // permanently brick recovery of every payment received under the
+    // original identity.
+    auto guard_corrupt = [](const char* which) {
+        throw std::runtime_error(strprintf(
+            "Pricoin stealth %s record in wallet.dat failed to decode "
+            "(wallet locked, wrong passphrase, or corrupt entry)",
+            which));
+    };
 
-    // 2. Legacy side file (pre-this-commit installs). Migrate into the DB
-    //    on first read so future backups carry the identity. The file is
-    //    intentionally left in place as a downgrade safety net — it's no
-    //    longer the source of truth, but reverting to an older binary
-    //    will still find it.
-    if (!loaded && ReadBlobFromLegacyFile(wallet, blob)) {
-        if (DecodeBlobIntoIdentity(wallet, blob, id, needs_resave)) {
+    // 1. Seed record (current home for new wallets).
+    {
+        bool seed_resave = false;
+        if (LoadFromSeedRecord(wallet, id, seed, seed_resave)) {
             loaded = true;
-            origin = "legacy pricoin_stealth.dat (migrating to wallet.dat)";
-            needs_resave = true;  // always migrate format-wise too
+            kind = PersistKind::Seed;
+            needs_resave = seed_resave;
+            origin = "wallet.dat (seed)";
+        } else {
+            std::vector<unsigned char> probe;
+            if (ReadSeedFromDB(wallet, probe) && !probe.empty()) {
+                guard_corrupt("seed");
+            }
         }
     }
 
-    // 3. Nothing on disk — generate a fresh identity.
+    // 2. Legacy v0.1.11 key-blob record. Don't migrate to seed — we
+    //    can't reverse-derive a seed from random keys. Keep using the
+    //    key blob to preserve the user's existing identity.
     if (!loaded) {
-        id.view = FreshKey();
-        id.spend = FreshKey();
-        id.public_address.view = id.view.GetPubKey();
-        id.public_address.spend = id.spend.GetPubKey();
+        bool kb_resave = false;
+        if (LoadFromKeyBlobRecord(wallet, id, kb_resave)) {
+            loaded = true;
+            kind = PersistKind::KeyBlob;
+            needs_resave = kb_resave;
+            origin = "wallet.dat (legacy key blob)";
+        } else {
+            std::vector<unsigned char> probe;
+            if (ReadKeyBlobFromDB(wallet, probe) && !probe.empty()) {
+                guard_corrupt("key-blob");
+            }
+        }
+    }
+
+    // 3. Legacy side file (pre-v0.1.11). Migrate into a key-blob DB
+    //    record so future backups carry the identity. We don't migrate
+    //    to seed for the same reason as case 2.
+    if (!loaded && LoadFromLegacyFile(wallet, id)) {
+        loaded = true;
+        kind = PersistKind::KeyBlob;
         needs_resave = true;
-        origin = "generated";
+        origin = "legacy pricoin_stealth.dat (migrating to wallet.dat key blob)";
+    }
+
+    // 4. Nothing on disk — generate a fresh seed-based identity.
+    if (!loaded) {
+        GetRandBytes(seed);
+        id = DeriveIdentityFromSeed(seed);
+        kind = PersistKind::Seed;
+        needs_resave = true;
+        origin = "generated (seed-derived)";
     }
 
     bool saved = false;
     if (needs_resave) {
-        saved = SaveIdentity(wallet, id);
+        if (kind == PersistKind::Seed) {
+            saved = SaveSeed(wallet, seed);
+        } else {
+            saved = SaveKeyBlob(wallet, id);
+        }
         if (saved) {
             LogInfo("Pricoin: stealth identity for wallet %s — %s, persisted to wallet.dat",
                     wallet.GetName(), origin);
@@ -383,7 +540,13 @@ const Identity& GetOrCreate(CWallet& wallet)
         LogInfo("Pricoin: loaded stealth identity for wallet %s from %s",
                 wallet.GetName(), origin);
     }
-    auto [inserted, _] = g_identities.emplace(&wallet, CacheEntry{std::move(id), saved});
+
+    CacheEntry entry;
+    entry.id = std::move(id);
+    entry.saved_in_target_format = saved;
+    entry.persist_kind = kind;
+    if (kind == PersistKind::Seed) entry.seed = seed;
+    auto [inserted, _] = g_identities.emplace(&wallet, std::move(entry));
     // Drop our cache entry the moment the wallet is unloaded, so a future
     // wallet that happens to be allocated at the same heap address can't
     // inherit this identity. NotifyUnload fires from RemoveWallet() before
@@ -391,9 +554,84 @@ const Identity& GetOrCreate(CWallet& wallet)
     CWallet* wallet_ptr = &wallet;
     inserted->second.unload_conn = wallet.NotifyUnload.connect([wallet_ptr]() {
         LOCK(g_mutex);
+        auto cached = g_identities.find(wallet_ptr);
+        if (cached != g_identities.end()) {
+            memory_cleanse(cached->second.seed.data(), cached->second.seed.size());
+        }
         g_identities.erase(wallet_ptr);
     });
+    // The local `seed` was copied into `entry.seed` above (or unused for
+    // KeyBlob entries). Cleanse the stack copy so it doesn't linger in
+    // the caller's frame.
+    memory_cleanse(seed.data(), seed.size());
     return inserted->second.id;
+}
+
+std::optional<std::array<unsigned char, 32>> GetSeedIfAvailable(CWallet& wallet)
+{
+    // Prime the cache (load or generate). After this, g_identities has
+    // the entry — possibly seed-backed, possibly key-blob (legacy).
+    GetOrCreate(wallet);
+    LOCK(g_mutex);
+    auto it = g_identities.find(&wallet);
+    if (it == g_identities.end()) return std::nullopt;
+    if (it->second.persist_kind != PersistKind::Seed) return std::nullopt;
+    return it->second.seed;
+}
+
+SetSeedResult SetSeed(CWallet& wallet,
+                      std::span<const unsigned char> seed,
+                      bool confirm_overwrite)
+{
+    if (seed.size() != kSeedSize) return SetSeedResult::InvalidSeed;
+
+    // Validate the seed derives well-formed keys before we write anything.
+    // Throws on cryptographic failure; the rare invalid-scalar path
+    // already loops with a counter, so this should never fire.
+    try {
+        Identity probe = DeriveIdentityFromSeed(seed);
+        if (!probe.view.IsValid() || !probe.spend.IsValid()) {
+            return SetSeedResult::InvalidSeed;
+        }
+    } catch (...) {
+        return SetSeedResult::InvalidSeed;
+    }
+
+    LOCK(g_mutex);
+    if (wallet.HasEncryptionKeys() && wallet.IsLocked()) {
+        return SetSeedResult::Locked;
+    }
+
+    // Refuse to clobber an existing identity unless the caller has
+    // explicitly opted in. We check both the in-memory cache and the
+    // on-disk records, since the cache might be stale relative to disk
+    // (e.g., the user just imported via createfromdump).
+    if (!confirm_overwrite) {
+        auto it = g_identities.find(&wallet);
+        if (it != g_identities.end()) return SetSeedResult::AlreadyHasIdentity;
+        std::vector<unsigned char> probe;
+        if (ReadSeedFromDB(wallet, probe) && !probe.empty()) {
+            return SetSeedResult::AlreadyHasIdentity;
+        }
+        if (ReadKeyBlobFromDB(wallet, probe) && !probe.empty()) {
+            return SetSeedResult::AlreadyHasIdentity;
+        }
+    }
+
+    // Write the new seed and erase the legacy key-blob record (if any),
+    // so future loads come from a single source of truth. Also drop the
+    // in-memory cache so GetOrCreate reloads from disk.
+    if (!SaveSeed(wallet, seed)) return SetSeedResult::WriteFailed;
+    {
+        WalletBatch batch(wallet.GetDatabase());
+        batch.ErasePricoinStealth();
+    }
+    auto it = g_identities.find(&wallet);
+    if (it != g_identities.end()) {
+        memory_cleanse(it->second.seed.data(), it->second.seed.size());
+        g_identities.erase(it);
+    }
+    return SetSeedResult::Ok;
 }
 
 void Shutdown()
