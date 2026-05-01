@@ -70,6 +70,7 @@
 #include <pricoin/validation.h>
 #ifdef ENABLE_WALLET
 #include <wallet/pricoin_stealth.h>
+#include <wallet/pricoin_swap_ceremony.h>
 #include <wallet/pricoin_swap_session.h>
 #include <swap/chain_backend.h>
 #include <swap/esplora_backend.h>
@@ -438,6 +439,7 @@ void Shutdown(NodeContext& node)
     // inside libc's vectorized memset.
     try { wallet::pricoin_stealth::Shutdown(); } catch (...) {}
     try { wallet::pricoin_swap_session::Shutdown(); } catch (...) {}
+    try { wallet::pricoin_swap_ceremony::Shutdown(); } catch (...) {}
 #endif
     // Drop chain-watch backends (libevent state etc.). Independent of
     // the wallet — backends live at the process level.

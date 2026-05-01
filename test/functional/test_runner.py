@@ -103,6 +103,7 @@ BASE_SCRIPTS = [
     'feature_pricoin_jointspend.py',
     'feature_pricoin_chainwatch.py',
     'feature_pricoin_btc_htlc.py',
+    'feature_pricoin_swap_ceremony.py',
     # Scripts that are run by default.
     # Longest test should go first, to favor running tests in parallel
     # vv Tests less than 5m vv

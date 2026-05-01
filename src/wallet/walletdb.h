@@ -94,6 +94,7 @@ extern const std::string PRICOIN_RECOVERY_CACHE;
 // keyed by uint256 session_id. Format: encrypted blob via the
 // EncryptWalletBlob pattern. See wallet/pricoin_swap_session.cpp.
 extern const std::string PRICOIN_SWAP_SESSION;
+extern const std::string PRICOIN_SWAP_CEREMONY;
 extern const std::string PURPOSE;
 extern const std::string SETTINGS;
 extern const std::string TX;
@@ -310,6 +311,12 @@ public:
     // Read every swap session record into `out`. Returns false on
     // cursor error; an empty wallet returns Ok with empty `out`.
     bool ReadAllPricoinSwapSessions(
+        std::map<uint256, std::vector<unsigned char>>& out);
+    // Per-ceremony swap records — same multi-row pattern.
+    bool WritePricoinSwapCeremony(const uint256& ceremony_id,
+                                  const std::vector<unsigned char>& blob);
+    bool ErasePricoinSwapCeremony(const uint256& ceremony_id);
+    bool ReadAllPricoinSwapCeremonies(
         std::map<uint256, std::vector<unsigned char>>& out);
     //! Begin a new transaction
     bool TxnBegin();

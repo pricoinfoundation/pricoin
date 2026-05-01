@@ -36,6 +36,7 @@
 #include <wallet/coinselection.h>
 #include <wallet/pricoin_ct_send.h>
 #include <wallet/pricoin_stealth.h>
+#include <wallet/pricoin_swap_ceremony.h>
 #include <wallet/pricoin_swap_session.h>
 #include <wallet/rpc/util.h>
 #include <wallet/scriptpubkeyman.h>
@@ -2971,6 +2972,432 @@ RPCMethod pricoin_swap_session_list()
     };
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Atomic-swap stage 3 — swap ceremony state machine RPCs.
+// Tracks the multi-step BTC ↔ PRIC swap workflow. State transitions
+// are explicit (caller drives them); next_action returns a hint.
+// ─────────────────────────────────────────────────────────────────
+
+namespace ssc = ::wallet::pricoin_swap_ceremony;
+
+namespace {
+
+const char* RoleStr(ssc::Role r)
+{
+    return r == ssc::Role::BuyingForeign ? "buying_foreign" : "selling_foreign";
+}
+ssc::Role ParseRole(const std::string& s)
+{
+    if (s == "buying_foreign")  return ssc::Role::BuyingForeign;
+    if (s == "selling_foreign") return ssc::Role::SellingForeign;
+    throw JSONRPCError(RPC_INVALID_PARAMETER,
+        "role must be 'buying_foreign' or 'selling_foreign'");
+}
+
+const char* StateStr(ssc::State s)
+{
+    switch (s) {
+        case ssc::State::Init:         return "init";
+        case ssc::State::BtcFunded:    return "foreign_funded";
+        case ssc::State::PricFunded:   return "pric_funded";
+        case ssc::State::BtcClaimed:   return "foreign_claimed";
+        case ssc::State::PricReleased: return "pric_released";
+        case ssc::State::Complete:     return "complete";
+        case ssc::State::Aborted:      return "aborted";
+    }
+    return "unknown";
+}
+
+UniValue CeremonyToJSON(const ssc::SwapCeremony& s)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("ceremony_id", s.ceremony_id.ToString());
+    out.pushKV("role", RoleStr(s.role));
+    out.pushKV("state", StateStr(s.state));
+    out.pushKV("counterparty_pubkey", HexStr(s.counterparty_pub));
+
+    UniValue foreign{UniValue::VOBJ};
+    foreign.pushKV("chain", s.foreign.chain);
+    foreign.pushKV("htlc_address", s.foreign.htlc_address);
+    foreign.pushKV("redeem_script", HexStr(s.foreign.redeem_script));
+    foreign.pushKV("amount_sat", s.foreign.amount_sat);
+    foreign.pushKV("timeout", s.foreign.timeout);
+    out.pushKV("foreign", std::move(foreign));
+
+    UniValue pric{UniValue::VOBJ};
+    pric.pushKV("joint_stealth_address", s.pric.joint_stealth_address);
+    pric.pushKV("amount_sat", s.pric.amount_sat);
+    if (!s.pric.our_x_share.empty()) {
+        // x_share is sensitive — only expose to the wallet's own RPC
+        // caller, not in list dumps. Always returning hex here is OK
+        // since this whole RPC requires wallet-level auth.
+        pric.pushKV("our_x_share", HexStr(s.pric.our_x_share));
+    }
+    out.pushKV("pric", std::move(pric));
+
+    if (!s.preimage_hash.empty()) out.pushKV("preimage_hash", HexStr(s.preimage_hash));
+    if (!s.preimage.empty())      out.pushKV("preimage",      HexStr(s.preimage));
+
+    if (!s.foreign_funding_txid.empty()) {
+        out.pushKV("foreign_funding_txid", s.foreign_funding_txid);
+        out.pushKV("foreign_funding_vout", s.foreign_funding_vout);
+    }
+    if (!s.foreign_claim_txid.empty()) out.pushKV("foreign_claim_txid", s.foreign_claim_txid);
+    if (!s.pric_funding_txid.IsNull()) {
+        out.pushKV("pric_funding_txid", s.pric_funding_txid.ToString());
+        out.pushKV("pric_funding_vout", s.pric_funding_vout);
+    }
+    if (!s.pric_release_txid.IsNull()) out.pushKV("pric_release_txid", s.pric_release_txid.ToString());
+
+    out.pushKV("memo", s.memo);
+    out.pushKV("created_time", s.created_time);
+    out.pushKV("updated_time", s.updated_time);
+    if (!s.abort_reason.empty()) out.pushKV("abort_reason", s.abort_reason);
+    out.pushKV("next_action", ssc::NextActionHint(s));
+    return out;
+}
+
+void ThrowFromCeremonyCreate(ssc::CreateResult r)
+{
+    using R = ssc::CreateResult;
+    switch (r) {
+        case R::Ok: return;
+        case R::InvalidCounterpartyPubkey:
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid counterparty pubkey");
+        case R::InvalidForeignLeg:
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid foreign leg fields");
+        case R::InvalidPricLeg:
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid PRIC leg fields");
+        case R::InvalidPreimage:
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "preimage_or_hash must be 32 bytes (preimage for buying_foreign, hash for selling_foreign)");
+        case R::Locked:
+            throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet is locked");
+        case R::WriteFailed:
+            throw JSONRPCError(RPC_WALLET_ERROR, "Persistence failed");
+    }
+}
+
+void ThrowFromCeremonyTransition(ssc::TransitionResult r)
+{
+    using R = ssc::TransitionResult;
+    switch (r) {
+        case R::Ok: return;
+        case R::NotFound:
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Ceremony not found");
+        case R::InvalidState:
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "Ceremony is not in the expected state for this transition");
+        case R::InvalidInput:
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid input for this transition");
+        case R::Locked:
+            throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet is locked");
+        case R::WriteFailed:
+            throw JSONRPCError(RPC_WALLET_ERROR, "Persistence failed");
+    }
+}
+
+ssc::ForeignLeg ParseForeignLeg(const UniValue& v)
+{
+    if (!v.isObject()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "foreign must be an object");
+    }
+    ssc::ForeignLeg f;
+    f.chain         = v.find_value("chain").get_str();
+    f.htlc_address  = v.find_value("htlc_address").get_str();
+    const auto rs   = v.find_value("redeem_script").get_str();
+    if (!IsHex(rs)) throw JSONRPCError(RPC_INVALID_PARAMETER, "foreign.redeem_script must be hex");
+    f.redeem_script = ParseHex(rs);
+    f.amount_sat    = v.find_value("amount_sat").getInt<int64_t>();
+    f.timeout       = v.find_value("timeout").getInt<int64_t>();
+    return f;
+}
+
+ssc::PricLeg ParsePricLeg(const UniValue& v)
+{
+    if (!v.isObject()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "pric must be an object");
+    }
+    ssc::PricLeg p;
+    p.joint_stealth_address = v.find_value("joint_stealth_address").get_str();
+    p.amount_sat            = v.find_value("amount_sat").getInt<int64_t>();
+    return p;
+}
+
+} // namespace
+
+RPCMethod pricoin_swap_ceremony_create()
+{
+    return RPCMethod{
+        "pricoin_swap_ceremony_create",
+        "Open a new swap ceremony record. Caller specifies their role,\n"
+        "the counterparty's swap-identity pubkey, the foreign-chain leg\n"
+        "(chain + HTLC address + redeem script + amount + timeout) and\n"
+        "the PRIC leg (joint stealth address + amount).\n"
+        "\n"
+        "Preimage handling depends on role:\n"
+        "  buying_foreign  — caller passes empty `preimage_or_hash` and\n"
+        "                    we generate a 32-byte preimage. Hash is\n"
+        "                    derived as SHA-256(preimage). Ship the hash\n"
+        "                    to the counterparty out-of-band.\n"
+        "  selling_foreign — caller passes the 32-byte hash they got\n"
+        "                    from the buying counterparty. Preimage is\n"
+        "                    learned later from the on-chain claim.\n"
+        "\n"
+        "WARNING: this state machine alone does NOT make a swap atomic.\n"
+        "Without adaptor-CLSAG (deferred), use only with trusted\n"
+        "counterparties or alongside slashing-deposit (phase 7).\n",
+        {
+            {"role", RPCArg::Type::STR, RPCArg::Optional::NO,
+                "buying_foreign | selling_foreign"},
+            {"counterparty_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Counterparty's stable swap-identity pubkey (33 bytes hex)"},
+            {"foreign", RPCArg::Type::OBJ, RPCArg::Optional::NO, "",
+                {{"chain", RPCArg::Type::STR, RPCArg::Optional::NO, ""},
+                 {"htlc_address", RPCArg::Type::STR, RPCArg::Optional::NO, ""},
+                 {"redeem_script", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+                 {"amount_sat", RPCArg::Type::NUM, RPCArg::Optional::NO, ""},
+                 {"timeout", RPCArg::Type::NUM, RPCArg::Optional::NO,
+                     "Block height or unix time (per OP_CLTV)"}}},
+            {"pric", RPCArg::Type::OBJ, RPCArg::Optional::NO, "",
+                {{"joint_stealth_address", RPCArg::Type::STR, RPCArg::Optional::NO, ""},
+                 {"amount_sat", RPCArg::Type::NUM, RPCArg::Optional::NO, ""}}},
+            {"preimage_or_hash", RPCArg::Type::STR_HEX, RPCArg::Default{""},
+                "Empty for buying_foreign (we generate); 32-byte hash for selling_foreign"},
+            {"memo", RPCArg::Type::STR, RPCArg::Default{""}, "Free-form note"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Ceremony record" },
+        RPCExamples{HelpExampleCli("pricoin_swap_ceremony_create", "<role> <cp_pubkey> {...} {...}")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+
+            ssc::Role role = ParseRole(request.params[0].get_str());
+            CPubKey cp = ParseSessionPubkey(request.params[1].get_str(), "counterparty_pubkey");
+            auto foreign = ParseForeignLeg(request.params[2]);
+            auto pric    = ParsePricLeg(request.params[3]);
+
+            std::vector<unsigned char> preimage_or_hash;
+            if (!request.params[4].isNull()) {
+                const auto h = request.params[4].get_str();
+                if (!h.empty()) {
+                    if (!IsHex(h)) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        "preimage_or_hash must be hex");
+                    preimage_or_hash = ParseHex(h);
+                }
+            }
+            const std::string memo = request.params[5].isNull() ? "" : request.params[5].get_str();
+
+            ssc::SwapCeremony out;
+            ThrowFromCeremonyCreate(ssc::Create(
+                *wallet_sp, role, cp, foreign, pric,
+                std::span<const unsigned char>{preimage_or_hash}, memo, out));
+            return CeremonyToJSON(out);
+        }
+    };
+}
+
+RPCMethod pricoin_swap_ceremony_set_foreign_funded()
+{
+    return RPCMethod{
+        "pricoin_swap_ceremony_set_foreign_funded",
+        "Mark the foreign-chain HTLC as funded. State: Init → BtcFunded.\n",
+        {
+            {"ceremony_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"funding_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"funding_vout", RPCArg::Type::NUM, RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Ceremony record" },
+        RPCExamples{HelpExampleCli("pricoin_swap_ceremony_set_foreign_funded", "<id> <txid> 0")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            auto cid = uint256::FromHex(request.params[0].get_str());
+            if (!cid) throw JSONRPCError(RPC_INVALID_PARAMETER, "ceremony_id must be 32-byte hex");
+            const std::string txid = request.params[1].get_str();
+            const int32_t vout = request.params[2].getInt<int32_t>();
+            ThrowFromCeremonyTransition(
+                ssc::SetForeignFunded(*wallet_sp, *cid, txid, vout));
+            ssc::SwapCeremony s;
+            ssc::Get(*wallet_sp, *cid, s);
+            return CeremonyToJSON(s);
+        }
+    };
+}
+
+RPCMethod pricoin_swap_ceremony_set_pric_funded()
+{
+    return RPCMethod{
+        "pricoin_swap_ceremony_set_pric_funded",
+        "Mark the PRIC joint-stealth output as funded. State: BtcFunded → PricFunded.\n"
+        "`our_x_share` is the spend-secret share returned by\n"
+        "pricoin_jointspend_loadshare (with the agreed absorb_shared_secret\n"
+        "convention between the parties).\n",
+        {
+            {"ceremony_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"pric_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"pric_vout", RPCArg::Type::NUM, RPCArg::Optional::NO, ""},
+            {"our_x_share", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte hex from pricoin_jointspend_loadshare"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Ceremony record" },
+        RPCExamples{HelpExampleCli("pricoin_swap_ceremony_set_pric_funded", "<id> <txid> <vout> <x_share>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            auto cid = uint256::FromHex(request.params[0].get_str());
+            if (!cid) throw JSONRPCError(RPC_INVALID_PARAMETER, "ceremony_id must be 32-byte hex");
+            auto ptxid = uint256::FromHex(request.params[1].get_str());
+            if (!ptxid) throw JSONRPCError(RPC_INVALID_PARAMETER, "pric_txid must be 32-byte hex");
+            const int32_t vout = request.params[2].getInt<int32_t>();
+            const auto xs_hex = request.params[3].get_str();
+            if (!IsHex(xs_hex) || xs_hex.size() != 64) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "our_x_share must be 32-byte hex");
+            }
+            const auto xs = ParseHex(xs_hex);
+            ThrowFromCeremonyTransition(
+                ssc::SetPricFunded(*wallet_sp, *cid, *ptxid, vout,
+                    std::span<const unsigned char>{xs}));
+            ssc::SwapCeremony s;
+            ssc::Get(*wallet_sp, *cid, s);
+            return CeremonyToJSON(s);
+        }
+    };
+}
+
+RPCMethod pricoin_swap_ceremony_set_foreign_claimed()
+{
+    return RPCMethod{
+        "pricoin_swap_ceremony_set_foreign_claimed",
+        "Mark the foreign-chain HTLC as claimed. State: PricFunded → BtcClaimed.\n"
+        "Optional `preimage` — supply the 32-byte secret extracted from\n"
+        "the on-chain claim witness (selling_foreign side); the call\n"
+        "rejects if SHA-256(preimage) doesn't match the recorded hash.\n",
+        {
+            {"ceremony_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"claim_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"preimage", RPCArg::Type::STR_HEX, RPCArg::Default{""}, ""},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Ceremony record" },
+        RPCExamples{HelpExampleCli("pricoin_swap_ceremony_set_foreign_claimed", "<id> <claim_txid> [preimage]")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            auto cid = uint256::FromHex(request.params[0].get_str());
+            if (!cid) throw JSONRPCError(RPC_INVALID_PARAMETER, "ceremony_id must be 32-byte hex");
+            const std::string txid = request.params[1].get_str();
+            std::vector<unsigned char> preimage;
+            if (!request.params[2].isNull() && !request.params[2].get_str().empty()) {
+                if (!IsHex(request.params[2].get_str())) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "preimage must be hex");
+                }
+                preimage = ParseHex(request.params[2].get_str());
+            }
+            ThrowFromCeremonyTransition(
+                ssc::SetForeignClaimed(*wallet_sp, *cid, txid,
+                    std::span<const unsigned char>{preimage}));
+            ssc::SwapCeremony s;
+            ssc::Get(*wallet_sp, *cid, s);
+            return CeremonyToJSON(s);
+        }
+    };
+}
+
+RPCMethod pricoin_swap_ceremony_set_pric_released()
+{
+    return RPCMethod{
+        "pricoin_swap_ceremony_set_pric_released",
+        "Mark the cooperative PRIC release as broadcast. State: BtcClaimed → Complete.\n",
+        {
+            {"ceremony_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"release_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Ceremony record" },
+        RPCExamples{HelpExampleCli("pricoin_swap_ceremony_set_pric_released", "<id> <release_txid>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            auto cid = uint256::FromHex(request.params[0].get_str());
+            if (!cid) throw JSONRPCError(RPC_INVALID_PARAMETER, "ceremony_id must be 32-byte hex");
+            auto rtxid = uint256::FromHex(request.params[1].get_str());
+            if (!rtxid) throw JSONRPCError(RPC_INVALID_PARAMETER, "release_txid must be 32-byte hex");
+            ThrowFromCeremonyTransition(ssc::SetPricReleased(*wallet_sp, *cid, *rtxid));
+            ssc::SwapCeremony s;
+            ssc::Get(*wallet_sp, *cid, s);
+            return CeremonyToJSON(s);
+        }
+    };
+}
+
+RPCMethod pricoin_swap_ceremony_abort()
+{
+    return RPCMethod{
+        "pricoin_swap_ceremony_abort",
+        "Abort a ceremony from any non-terminal state.\n",
+        {
+            {"ceremony_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"reason", RPCArg::Type::STR, RPCArg::Default{""}, ""},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Ceremony record" },
+        RPCExamples{HelpExampleCli("pricoin_swap_ceremony_abort", "<id> \"counterparty went silent\"")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            auto cid = uint256::FromHex(request.params[0].get_str());
+            if (!cid) throw JSONRPCError(RPC_INVALID_PARAMETER, "ceremony_id must be 32-byte hex");
+            const std::string reason = request.params[1].isNull() ? "" : request.params[1].get_str();
+            ThrowFromCeremonyTransition(ssc::Abort(*wallet_sp, *cid, reason));
+            ssc::SwapCeremony s;
+            ssc::Get(*wallet_sp, *cid, s);
+            return CeremonyToJSON(s);
+        }
+    };
+}
+
+RPCMethod pricoin_swap_ceremony_get()
+{
+    return RPCMethod{
+        "pricoin_swap_ceremony_get",
+        "Look up a single ceremony by id.\n",
+        {{"ceremony_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""}},
+        RPCResult{ RPCResult::Type::ANY, "", "Ceremony record" },
+        RPCExamples{HelpExampleCli("pricoin_swap_ceremony_get", "<id>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            auto cid = uint256::FromHex(request.params[0].get_str());
+            if (!cid) throw JSONRPCError(RPC_INVALID_PARAMETER, "ceremony_id must be 32-byte hex");
+            ssc::SwapCeremony s;
+            const auto r = ssc::Get(*wallet_sp, *cid, s);
+            if (r == ssc::LookupResult::Locked) throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+            if (r != ssc::LookupResult::Ok) throw JSONRPCError(RPC_INVALID_PARAMETER, "Ceremony not found");
+            return CeremonyToJSON(s);
+        }
+    };
+}
+
+RPCMethod pricoin_swap_ceremony_list()
+{
+    return RPCMethod{
+        "pricoin_swap_ceremony_list",
+        "List all ceremonies in this wallet.\n",
+        {},
+        RPCResult{ RPCResult::Type::ARR, "", "",
+            {{RPCResult::Type::ANY, "", "Ceremony record"}} },
+        RPCExamples{HelpExampleCli("pricoin_swap_ceremony_list", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            std::vector<ssc::SwapCeremony> all;
+            const auto r = ssc::List(*wallet_sp, all);
+            if (r == ssc::LookupResult::Locked) throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+            UniValue out{UniValue::VARR};
+            for (const auto& s : all) out.push_back(CeremonyToJSON(s));
+            return out;
+        }
+    };
+}
+
 // Atomic-swap stage 2b — load this wallet's spend-secret share for a
 // joint stealth output. The caller will pass the returned x_share into
 // pricoin_jointspend_round1 as part of the cooperative signing
@@ -3170,6 +3597,14 @@ RPCMethod pricoin_swap_session_complete_export() { return pricoin_swap_session_c
 RPCMethod pricoin_swap_session_abort_export()    { return pricoin_swap_session_abort(); }
 RPCMethod pricoin_swap_session_get_export()      { return pricoin_swap_session_get(); }
 RPCMethod pricoin_swap_session_list_export()     { return pricoin_swap_session_list(); }
+RPCMethod pricoin_swap_ceremony_create_export()              { return pricoin_swap_ceremony_create(); }
+RPCMethod pricoin_swap_ceremony_set_foreign_funded_export()  { return pricoin_swap_ceremony_set_foreign_funded(); }
+RPCMethod pricoin_swap_ceremony_set_pric_funded_export()     { return pricoin_swap_ceremony_set_pric_funded(); }
+RPCMethod pricoin_swap_ceremony_set_foreign_claimed_export() { return pricoin_swap_ceremony_set_foreign_claimed(); }
+RPCMethod pricoin_swap_ceremony_set_pric_released_export()   { return pricoin_swap_ceremony_set_pric_released(); }
+RPCMethod pricoin_swap_ceremony_abort_export()               { return pricoin_swap_ceremony_abort(); }
+RPCMethod pricoin_swap_ceremony_get_export()                 { return pricoin_swap_ceremony_get(); }
+RPCMethod pricoin_swap_ceremony_list_export()                { return pricoin_swap_ceremony_list(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

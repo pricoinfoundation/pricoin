@@ -53,6 +53,7 @@ const std::string PRICOIN_STEALTH{"pct_stealth"};
 const std::string PRICOIN_STEALTH_SEED{"pct_stealth_seed"};
 const std::string PRICOIN_RECOVERY_CACHE{"pct_recovery_cache"};
 const std::string PRICOIN_SWAP_SESSION{"pct_swap_session"};
+const std::string PRICOIN_SWAP_CEREMONY{"pct_swap_ceremony"};
 const std::string PURPOSE{"purpose"};
 const std::string SETTINGS{"settings"};
 const std::string TX{"tx"};
@@ -1326,6 +1327,42 @@ bool WalletBatch::ReadAllPricoinSwapSessions(
         std::vector<unsigned char> blob;
         ssValue >> blob;
         out.emplace(session_id, std::move(blob));
+    }
+    return true;
+}
+
+bool WalletBatch::WritePricoinSwapCeremony(const uint256& ceremony_id,
+                                            const std::vector<unsigned char>& blob)
+{
+    return WriteIC(std::make_pair(DBKeys::PRICOIN_SWAP_CEREMONY, ceremony_id), blob);
+}
+
+bool WalletBatch::ErasePricoinSwapCeremony(const uint256& ceremony_id)
+{
+    return EraseIC(std::make_pair(DBKeys::PRICOIN_SWAP_CEREMONY, ceremony_id));
+}
+
+bool WalletBatch::ReadAllPricoinSwapCeremonies(
+    std::map<uint256, std::vector<unsigned char>>& out)
+{
+    DataStream prefix;
+    prefix << DBKeys::PRICOIN_SWAP_CEREMONY;
+    std::unique_ptr<DatabaseCursor> cursor = m_batch->GetNewPrefixCursor(prefix);
+    if (!cursor) return false;
+    while (true) {
+        DataStream ssKey;
+        DataStream ssValue;
+        DatabaseCursor::Status status = cursor->Next(ssKey, ssValue);
+        if (status == DatabaseCursor::Status::DONE) break;
+        if (status == DatabaseCursor::Status::FAIL) return false;
+        std::string type;
+        ssKey >> type;
+        if (type != DBKeys::PRICOIN_SWAP_CEREMONY) continue;
+        uint256 ceremony_id;
+        ssKey >> ceremony_id;
+        std::vector<unsigned char> blob;
+        ssValue >> blob;
+        out.emplace(ceremony_id, std::move(blob));
     }
     return true;
 }
