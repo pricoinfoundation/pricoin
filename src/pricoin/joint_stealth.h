@@ -5,11 +5,14 @@
 #ifndef BITCOIN_PRICOIN_JOINT_STEALTH_H
 #define BITCOIN_PRICOIN_JOINT_STEALTH_H
 
+#include <key.h>
 #include <pricoin/stealth.h>
+#include <uint256.h>
 
 #include <array>
 #include <optional>
 #include <span>
+#include <vector>
 
 // Two-party joint stealth addresses for cooperative receive (and, in a
 // follow-up commit, cooperative spend). The on-chain output is
@@ -64,6 +67,85 @@ std::optional<::pricoin::stealth::PointBytes> ScanPartial(
 std::optional<::pricoin::stealth::PointBytes> CombinePartials(
     std::span<const unsigned char> partial_a_33,
     std::span<const unsigned char> partial_b_33);
+
+// ─────────────────────────────────────────────────────────────────
+// Proof-of-possession (rogue-key defense for atomic-swap setup).
+//
+// The plain additive joint-key construction `B_J = B_A + B_B` is
+// vulnerable to a rogue-key attack: after seeing Alice's `B_A`, a
+// malicious Bob can pick `B_B' = B_B - B_A` so that `B_J = B_B'`
+// and Bob alone controls the joint key. For atomic swaps, this
+// breaks atomicity entirely.
+//
+// Defense (per `doc/adaptor-clsag.md` rev 4 §6.0): each party
+// publishes a signature on a tagged challenge under their spend
+// privkey, proving knowledge of that privkey. The challenge binds:
+//
+//   * a fixed protocol tag ("pricoin/joint-stealth/PoP-v1"),
+//   * a session_id (32 bytes; agreed between parties off-band, or
+//     derived from the swap ceremony's session id),
+//   * the counterparty's spend pubkey.
+//
+// Binding the counterparty's pubkey forces each party to commit
+// to the OTHER side's pubkey before producing a valid PoP — so a
+// rogue-key choice would invalidate the signature.
+//
+// We use ECDSA (compatible with our existing key infrastructure;
+// no x-only-pubkey complications). The signature is unforgeable
+// under standard ECDSA assumptions in the random-oracle model;
+// for the rogue-key defense argument we just need
+// existential-unforgeability, which both ECDSA and Schnorr provide.
+//
+// PoP is REQUIRED for atomic-swap joint stealth setup. The
+// non-PoP `Combine(...)` path remains in place for the existing
+// stage-2a receive flow which doesn't need rogue-key protection
+// (cooperative-only output that neither party can spend alone
+// regardless of how the public key was constructed).
+
+// Compute the canonical PoP challenge digest (32 bytes).
+// `session_id` and `counterparty_spend_pubkey` differentiate
+// otherwise-equivalent challenges across sessions and counterparties,
+// so a PoP can never be replayed across sessions or partners.
+uint256 PoPChallenge(
+    const uint256& session_id,
+    const CPubKey& counterparty_spend_pubkey);
+
+// Sign the PoP challenge under `self_spend_priv`. Returns the
+// ECDSA-DER signature, or nullopt on signing failure (invalid
+// privkey).
+std::optional<std::vector<unsigned char>> ProvePossession(
+    const CKey& self_spend_priv,
+    const uint256& session_id,
+    const CPubKey& counterparty_spend_pubkey);
+
+// Verify a PoP signature. Returns false if the signature is
+// malformed or doesn't verify against `self_spend_pubkey` over
+// the canonical challenge.
+bool VerifyPossession(
+    const CPubKey& self_spend_pubkey,
+    const uint256& session_id,
+    const CPubKey& counterparty_spend_pubkey,
+    std::span<const unsigned char> sig);
+
+// Combine two stealth addresses with mutual proof-of-possession.
+// Each PoP must verify under the corresponding party's spend
+// pubkey + session_id + the OTHER party's pubkey (so the PoP is
+// session- and partner-bound).
+//
+// Returns nullopt if any PoP fails verification, any input
+// address is invalid, or the combined point is the identity
+// (degenerate input pair).
+std::optional<::pricoin::stealth::StealthAddress> CombineWithPoP(
+    const ::pricoin::stealth::StealthAddress& a,
+    const ::pricoin::stealth::StealthAddress& b,
+    std::span<const unsigned char> a_pop,
+    std::span<const unsigned char> b_pop,
+    const uint256& session_id);
+
+// Self-test: PoP honest round-trip + rogue-key attack rejection +
+// session/counterparty replay rejection. Throws on failure.
+// Called from `pricoin::ct::RunSelfTest`.
+void RunPoPSelfTest();
 
 } // namespace pricoin::joint_stealth
 

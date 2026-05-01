@@ -14,6 +14,7 @@
 #include <pricoin/adaptor_ringsig.h>
 #include <pricoin/cttx.h>
 #include <pricoin/joint_ringsig.h>
+#include <pricoin/joint_stealth.h>
 #include <pricoin/ringsig.h>
 #include <primitives/transaction.h>
 #include <random.h>
@@ -472,6 +473,10 @@ void RunSelfTest()
     // Atomic-swap phase 5 — cooperative multi-layer adaptor-CLSAG (v4 outputs).
     ::pricoin::adaptor_joint_ringsig::RunSelfTestML();
     LogInfo("Pricoin adaptor_joint_ringsig (cooperative adaptor-CLSAG multi-layer) self-test passed");
+
+    // Atomic-swap phase 5 — joint-stealth proof-of-possession (rogue-key defense).
+    ::pricoin::joint_stealth::RunPoPSelfTest();
+    LogInfo("Pricoin joint_stealth PoP (rogue-key defense) self-test passed");
 }
 
 } // namespace pricoin::ct

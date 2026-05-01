@@ -1920,6 +1920,210 @@ RPCMethod pricoin_buildjointstealthaddress()
     };
 }
 
+RPCMethod pricoin_jointstealth_pop_sign()
+{
+    return RPCMethod{
+        "pricoin_jointstealth_pop_sign",
+        "Sign the joint-stealth proof-of-possession challenge for this\n"
+        "wallet's stealth spend key, binding to a specific session_id and\n"
+        "counterparty spend pubkey. Required as the rogue-key defense\n"
+        "(`doc/adaptor-clsag.md` §6.0) when constructing joint stealth\n"
+        "addresses for trustless atomic swaps.\n"
+        "\n"
+        "The challenge is `H('pricoin/joint-stealth/PoP-v1' || session_id\n"
+        "|| counterparty_spend_pubkey)`. Both parties exchange PoP\n"
+        "signatures BEFORE constructing the joint address; if either\n"
+        "fails to verify, the joint address must not be used.\n",
+        {
+            {"session_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte session id (agreed off-band, e.g., from the swap "
+                "ceremony's session id)"},
+            {"counterparty_spend_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Counterparty's stealth spend pubkey (33-byte compressed)"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "pop", "ECDSA-DER signature"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_jointstealth_pop_sign",
+            "\"<session_id>\" \"<counterparty_spend_pubkey>\"")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            if (wallet.HasEncryptionKeys() && wallet.IsLocked()) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED,
+                    "PoP signing requires the wallet to be unlocked.");
+            }
+
+            auto sid_opt = uint256::FromHex(request.params[0].get_str());
+            if (!sid_opt) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "session_id must be 32-byte hex");
+
+            const std::string cp_hex = request.params[1].get_str();
+            if (!IsHex(cp_hex) || cp_hex.size() != 66) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "counterparty_spend_pubkey must be 33 bytes hex");
+            }
+            const std::vector<unsigned char> cp_bytes = ParseHex(cp_hex);
+            CPubKey cp(std::span<const unsigned char>{cp_bytes});
+            if (!cp.IsValid() || !cp.IsCompressed()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "counterparty_spend_pubkey is not a valid compressed pubkey");
+            }
+
+            const auto& self_id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+            auto pop = ::pricoin::joint_stealth::ProvePossession(
+                self_id.spend, *sid_opt, cp);
+            if (!pop) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "ProvePossession failed");
+            }
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("pop", HexStr(*pop));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_jointstealth_pop_verify()
+{
+    return RPCMethod{
+        "pricoin_jointstealth_pop_verify",
+        "Verify a joint-stealth proof-of-possession signature.\n",
+        {
+            {"self_spend_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Pubkey the PoP claims to be FROM (33-byte compressed)"},
+            {"session_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"counterparty_spend_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "The OTHER party in the binding (33-byte compressed)"},
+            {"pop", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "ECDSA-DER signature from pricoin_jointstealth_pop_sign"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::BOOL, "valid", ""}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_jointstealth_pop_verify",
+            "\"<self_pub>\" \"<session>\" \"<cp_pub>\" \"<sig>\"")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            const std::string self_hex = request.params[0].get_str();
+            if (!IsHex(self_hex) || self_hex.size() != 66) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "self_spend_pubkey invalid");
+            }
+            const auto self_bytes = ParseHex(self_hex);
+            CPubKey self_pub(std::span<const unsigned char>{self_bytes});
+
+            auto sid_opt = uint256::FromHex(request.params[1].get_str());
+            if (!sid_opt) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "session_id must be 32-byte hex");
+
+            const std::string cp_hex = request.params[2].get_str();
+            if (!IsHex(cp_hex) || cp_hex.size() != 66) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "counterparty_spend_pubkey invalid");
+            }
+            const auto cp_bytes = ParseHex(cp_hex);
+            CPubKey cp(std::span<const unsigned char>{cp_bytes});
+
+            auto sig = TryParseHex<unsigned char>(request.params[3].get_str());
+            if (!sig) throw JSONRPCError(RPC_INVALID_PARAMETER, "pop hex invalid");
+
+            const bool ok = ::pricoin::joint_stealth::VerifyPossession(
+                self_pub, *sid_opt, cp, std::span<const unsigned char>{*sig});
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("valid", ok);
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_buildjointstealthaddress_pop()
+{
+    return RPCMethod{
+        "pricoin_buildjointstealthaddress_pop",
+        "Like pricoin_buildjointstealthaddress, but with mandatory mutual\n"
+        "proof-of-possession (rogue-key defense per `doc/adaptor-clsag.md`\n"
+        "§6.0). Required for atomic-swap setup.\n"
+        "\n"
+        "Both parties must have already run pricoin_jointstealth_pop_sign\n"
+        "(under the SAME session_id) and exchanged the resulting pop\n"
+        "signatures off-band. This RPC verifies BOTH PoPs before producing\n"
+        "the joint address — if either fails, the call rejects.\n",
+        {
+            {"other_view_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"other_spend_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"session_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte session id (must match what both PoPs were signed against)"},
+            {"self_pop", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "This wallet's PoP signature from pricoin_jointstealth_pop_sign"},
+            {"other_pop", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Counterparty's PoP signature"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR, "address", "Joint stealth address"},
+                {RPCResult::Type::STR_HEX, "joint_view_pubkey", ""},
+                {RPCResult::Type::STR_HEX, "joint_spend_pubkey", ""},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_buildjointstealthaddress_pop",
+            "\"<view>\" \"<spend>\" \"<session>\" \"<self_pop>\" \"<other_pop>\"")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            if (wallet.HasEncryptionKeys() && wallet.IsLocked()) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+            }
+
+            const std::string view_hex  = request.params[0].get_str();
+            const std::string spend_hex = request.params[1].get_str();
+            if (!IsHex(view_hex)  || view_hex.size()  != 66 ||
+                !IsHex(spend_hex) || spend_hex.size() != 66) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "pubkey hex invalid");
+            }
+            const auto view_bytes  = ParseHex(view_hex);
+            const auto spend_bytes = ParseHex(spend_hex);
+
+            ::pricoin::stealth::StealthAddress other;
+            other.view  = CPubKey(std::span<const unsigned char>{view_bytes});
+            other.spend = CPubKey(std::span<const unsigned char>{spend_bytes});
+            if (!other.IsValid()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "counterparty pubkeys are not valid compressed secp256k1 points");
+            }
+
+            auto sid_opt = uint256::FromHex(request.params[2].get_str());
+            if (!sid_opt) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "session_id must be 32-byte hex");
+
+            auto self_pop  = TryParseHex<unsigned char>(request.params[3].get_str());
+            auto other_pop = TryParseHex<unsigned char>(request.params[4].get_str());
+            if (!self_pop || !other_pop) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "pop hex invalid");
+            }
+
+            const auto& self_id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+            auto joint = ::pricoin::joint_stealth::CombineWithPoP(
+                self_id.public_address, other,
+                std::span<const unsigned char>{*self_pop},
+                std::span<const unsigned char>{*other_pop},
+                *sid_opt);
+            if (!joint) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "joint construction rejected: at least one PoP failed to verify "
+                    "(possible rogue-key attempt or wrong session_id)");
+            }
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("address", ::pricoin::stealth::Encode(*joint));
+            out.pushKV("joint_view_pubkey", HexStr(joint->view));
+            out.pushKV("joint_spend_pubkey", HexStr(joint->spend));
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_jointscan_partial()
 {
     return RPCMethod{
@@ -3583,6 +3787,9 @@ RPCMethod pricoin_getstealthaddress_export() { return pricoin_getstealthaddress(
 RPCMethod pricoin_getstealthseed_export() { return pricoin_getstealthseed(); }
 RPCMethod pricoin_setstealthseed_export() { return pricoin_setstealthseed(); }
 RPCMethod pricoin_buildjointstealthaddress_export() { return pricoin_buildjointstealthaddress(); }
+RPCMethod pricoin_jointstealth_pop_sign_export()      { return pricoin_jointstealth_pop_sign(); }
+RPCMethod pricoin_jointstealth_pop_verify_export()    { return pricoin_jointstealth_pop_verify(); }
+RPCMethod pricoin_buildjointstealthaddress_pop_export() { return pricoin_buildjointstealthaddress_pop(); }
 RPCMethod pricoin_jointscan_partial_export() { return pricoin_jointscan_partial(); }
 RPCMethod pricoin_jointscan_recover_export() { return pricoin_jointscan_recover(); }
 RPCMethod pricoin_jointspend_loadshare_export() { return pricoin_jointspend_loadshare(); }

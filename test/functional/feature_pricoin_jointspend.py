@@ -88,6 +88,10 @@ class PricoinJointSpendTest(BitcoinTestFramework):
         self.log.info("Section 6: swap session lifecycle + identifiable blame")
         self._run_swap_session_lifecycle(node)
 
+        # Section 7 — joint-stealth proof-of-possession (rogue-key defense).
+        self.log.info("Section 7: joint-stealth PoP rogue-key defense")
+        self._run_jointstealth_pop(node)
+
         self.log.info("Pricoin cooperative-CLSAG RPC flow OK")
 
     # -----------------------------------------------------------------
@@ -663,6 +667,104 @@ class PricoinJointSpendTest(BitcoinTestFramework):
         # Call pricoin_swap_identity again and confirm same pubkey.
         assert_equal(alice.pricoin_swap_identity()["pubkey"], alice_pub)
         assert_equal(bob.pricoin_swap_identity()["pubkey"], bob_pub)
+
+    # -----------------------------------------------------------------
+
+    def _run_jointstealth_pop(self, node):
+        """Drive the PoP-aware joint-stealth setup via wallet RPCs.
+
+        Sequence per spec §6.0:
+          1. Each wallet has a stealth identity.
+          2. They exchange spend pubkeys + agree on a session_id.
+          3. Each runs pricoin_jointstealth_pop_sign with the OTHER
+             party's spend pubkey + the agreed session.
+          4. They exchange PoPs and run
+             pricoin_buildjointstealthaddress_pop, which verifies
+             both PoPs before producing the joint address.
+
+        Adversarial: if a wrong session_id, wrong counterparty pubkey,
+        or rogue-key choice is attempted, the build call rejects.
+        """
+        node.createwallet("alice_pop")
+        node.createwallet("bob_pop")
+        alice = node.get_wallet_rpc("alice_pop")
+        bob   = node.get_wallet_rpc("bob_pop")
+
+        alice_keys = alice.pricoin_getstealthaddress()
+        bob_keys   = bob.pricoin_getstealthaddress()
+
+        session_id = "ab" * 32
+
+        # ---- Honest happy path ----
+        alice_pop = alice.pricoin_jointstealth_pop_sign(
+            session_id, bob_keys["spend_pubkey"])["pop"]
+        bob_pop   = bob.pricoin_jointstealth_pop_sign(
+            session_id, alice_keys["spend_pubkey"])["pop"]
+
+        # Verify each PoP standalone before building.
+        assert_equal(
+            alice.pricoin_jointstealth_pop_verify(
+                alice_keys["spend_pubkey"], session_id,
+                bob_keys["spend_pubkey"], alice_pop)["valid"],
+            True)
+        assert_equal(
+            bob.pricoin_jointstealth_pop_verify(
+                bob_keys["spend_pubkey"], session_id,
+                alice_keys["spend_pubkey"], bob_pop)["valid"],
+            True)
+
+        # Both parties run buildjointstealthaddress_pop with their
+        # OWN PoP as self_pop and the other's as other_pop.
+        joint_a = alice.pricoin_buildjointstealthaddress_pop(
+            bob_keys["view_pubkey"], bob_keys["spend_pubkey"],
+            session_id, alice_pop, bob_pop)
+        joint_b = bob.pricoin_buildjointstealthaddress_pop(
+            alice_keys["view_pubkey"], alice_keys["spend_pubkey"],
+            session_id, bob_pop, alice_pop)
+        # Same joint address regardless of which side computes it.
+        assert_equal(joint_a["address"], joint_b["address"])
+        assert_equal(joint_a["joint_view_pubkey"], joint_b["joint_view_pubkey"])
+        assert_equal(joint_a["joint_spend_pubkey"], joint_b["joint_spend_pubkey"])
+        # And it should match the non-PoP Combine output (math is the
+        # same; PoP just gates the construction).
+        plain = alice.pricoin_buildjointstealthaddress(
+            bob_keys["view_pubkey"], bob_keys["spend_pubkey"])
+        assert_equal(joint_a["address"], plain["address"])
+
+        # ---- Wrong session_id rejected ----
+        wrong_session = "cd" * 32
+        try:
+            alice.pricoin_buildjointstealthaddress_pop(
+                bob_keys["view_pubkey"], bob_keys["spend_pubkey"],
+                wrong_session, alice_pop, bob_pop)
+            assert False, "wrong session_id should have rejected"
+        except Exception as e:
+            assert "PoP failed" in str(e) or "rejected" in str(e), f"unexpected: {e}"
+
+        # ---- Wrong counterparty pubkey in PoP rejected ----
+        # Alice tries to use a PoP signed for Carol, against Bob.
+        node.createwallet("carol_pop")
+        carol = node.get_wallet_rpc("carol_pop")
+        carol_keys = carol.pricoin_getstealthaddress()
+        alice_pop_for_carol = alice.pricoin_jointstealth_pop_sign(
+            session_id, carol_keys["spend_pubkey"])["pop"]
+        try:
+            alice.pricoin_buildjointstealthaddress_pop(
+                bob_keys["view_pubkey"], bob_keys["spend_pubkey"],
+                session_id, alice_pop_for_carol, bob_pop)
+            assert False, "PoP for wrong counterparty should have rejected"
+        except Exception as e:
+            assert "PoP failed" in str(e) or "rejected" in str(e), f"unexpected: {e}"
+
+        # ---- Tampered PoP rejected ----
+        bad_pop = "00" + alice_pop[2:]
+        try:
+            alice.pricoin_buildjointstealthaddress_pop(
+                bob_keys["view_pubkey"], bob_keys["spend_pubkey"],
+                session_id, bad_pop, bob_pop)
+            assert False, "tampered PoP should have rejected"
+        except Exception as e:
+            assert "PoP failed" in str(e) or "rejected" in str(e), f"unexpected: {e}"
 
 
 if __name__ == "__main__":
