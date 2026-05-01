@@ -183,6 +183,139 @@ std::optional<AdaptorPreSignature> AssembleAdaptorPreSig(
 // `pricoin::ct::RunSelfTest`.
 void RunSelfTest();
 
+// ─────────────────────────────────────────────────────────────────
+// Multi-layer cooperative adaptor-CLSAG (spec rev 4 §5).
+// ─────────────────────────────────────────────────────────────────
+//
+// Same composition as single-layer but with µ-aggregation. v4 PRIC
+// outputs use multi-layer; this is what an actual atomic swap will
+// invoke.
+//
+// Per spec §5.2, the multi-layer cooperative protocol REQUIRES:
+//   * Each party additively splits BOTH `x` and `z` shares.
+//   * Per-party DLEQ-3 proofs binding `z_X` across G and H_p(P_pi)
+//     (in addition to DLEQ-1 + DLEQ-2 from single-layer).
+//   * NonceCommit binds `D_share` in addition to `KI_share`.
+//   * Public spend share `X_pub_X = x_X·G` AND public commitment-
+//     offset share `Z_pub_X = z_X·G` are both pre-committed in
+//     swap setup BEFORE adaptor data is exchanged.
+//
+// Math at the signer's index (un-shifted):
+//   * `a = µ_P·x_pi + µ_C·z_pi` — aggregated priv.
+//   * `I_agg = µ_P·KI + µ_C·D = a·H_p(P_pi)`.
+//   * `L_pi = α·G`, `R_pi = α·H_p(P_pi)`.
+//   * Closing: `ŝ_pi = α − c_pi · a`.
+//   * Adapt: `s_pi = ŝ_pi + t`. Verifier reconstructs `(α+t)·G` =
+//     `L'_pi`, same for R; walk closes — same trick as single-layer.
+
+using ::pricoin::ringsig::MultiLayerMember;
+
+// Per-party round-1 output for multi-layer cooperative adaptor.
+struct AdaptorNonceShareML {
+    Scalar    alpha;        // PRIVATE
+    Point     L_share;      // α_X · G
+    Point     R_share;      // α_X · H_p(P_pi)
+    Point     KI_share;     // x_X · H_p(P_pi)
+    Point     D_share;      // z_X · H_p(P_pi)              <-- NEW vs single-layer
+    DLEQProof dleq_alpha;   // DLEQ-1
+    DLEQProof dleq_x;       // DLEQ-2
+    DLEQProof dleq_z;       // DLEQ-3                       <-- NEW vs single-layer
+    Scalar    commitment;   // hash binds D_share + dleq_z too
+
+    SERIALIZE_METHODS(AdaptorNonceShareML, obj) {
+        READWRITE(obj.alpha);
+        READWRITE(obj.L_share);
+        READWRITE(obj.R_share);
+        READWRITE(obj.KI_share);
+        READWRITE(obj.D_share);
+        READWRITE(obj.dleq_alpha);
+        READWRITE(obj.dleq_x);
+        READWRITE(obj.dleq_z);
+        READWRITE(obj.commitment);
+    }
+};
+
+struct AdaptorCombineOutputML {
+    Point KI;
+    Point D;             //                                    <-- NEW
+    Point L_pi;
+    Point R_pi;
+    Point L_prime;
+    Point R_prime;
+    Scalar mu_P;         //                                    <-- NEW
+    Scalar mu_C;         //                                    <-- NEW
+    Scalar c_pi;
+    Scalar c0;
+    std::vector<Scalar> s_others;
+};
+
+// Round-1 multi-layer per-party generator.
+//
+// `P_pi`     — joint pubkey at signer's ring index.
+// `X_pub_X`  — pre-committed public spend share (x_X·G).
+// `Z_pub_X`  — pre-committed public commitment-offset share (z_X·G).
+// `x_X, z_X` — this party's secret shares. PRIVATE.
+// Other args mirror the single-layer variant.
+std::optional<AdaptorNonceShareML> NonceGenAdaptorML(
+    const Point& P_pi,
+    const Point& X_pub_X,
+    const Point& Z_pub_X,
+    const Scalar& x_X,
+    const Scalar& z_X,
+    const AdaptorPoints& adaptor,
+    std::span<const unsigned char> session_label,
+    std::span<const unsigned char> session_payload);
+
+bool VerifyAdaptorNonceShareML(
+    const Point& P_pi,
+    const Point& X_pub_X,
+    const Point& Z_pub_X,
+    const AdaptorNonceShareML& share,
+    const AdaptorPoints& adaptor,
+    std::span<const unsigned char> session_label,
+    std::span<const unsigned char> session_payload);
+
+// Combine + walk for multi-layer. Verifies every party's share
+// (DLEQ-1/2/3 + commitment + adaptor DLEQ), sums shares, computes
+// µ, applies the adaptor shift, derives deterministic s_others
+// from SESSION, walks the µ-aggregated ring.
+std::optional<AdaptorCombineOutputML> CombineAndWalkML(
+    std::span<const MultiLayerMember> ring,
+    size_t pi,
+    const uint256& msg,
+    const AdaptorPoints& adaptor,
+    const DLEQProof& dleq_t,
+    std::span<const Point> X_pub_shares,
+    std::span<const Point> Z_pub_shares,
+    std::span<const AdaptorNonceShareML> shares,
+    std::span<const unsigned char> session_label,
+    std::span<const unsigned char> session_payload);
+
+// `ŝ_share = α_X − c_pi · a_X` where `a_X = µ_P·x_X + µ_C·z_X`.
+std::optional<Scalar> CooperativeCloseShareAdaptorML(
+    const Scalar& alpha_X,
+    const Scalar& c_pi,
+    const Scalar& mu_P,
+    const Scalar& mu_C,
+    const Scalar& x_X,
+    const Scalar& z_X);
+
+// Assemble the final multi-layer adaptor pre-signature.
+// `commitment_image` is set to the joint D point.
+std::optional<AdaptorPreSignature> AssembleAdaptorPreSigML(
+    const AdaptorCombineOutputML& combined,
+    std::span<const Scalar> close_shares,
+    size_t pi,
+    const AdaptorPoints& adaptor,
+    const DLEQProof& dleq_t);
+
+// Self-test: 2-party in-process multi-layer cooperative adaptor
+// flow + Adapt + standard `pricoin::ringsig::VerifyMultiLayer`
+// round-trip + Extract; adversarial cases (malformed KI/D shares
+// rejected by DLEQ-2/DLEQ-3). Throws on failure. Called from
+// `pricoin::ct::RunSelfTest`.
+void RunSelfTestML();
+
 } // namespace pricoin::adaptor_joint_ringsig
 
 #endif // BITCOIN_PRICOIN_ADAPTOR_JOINT_RINGSIG_H

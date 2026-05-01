@@ -468,6 +468,10 @@ void RunSelfTest()
     // Atomic-swap phase 5 — cooperative single-layer adaptor-CLSAG.
     ::pricoin::adaptor_joint_ringsig::RunSelfTest();
     LogInfo("Pricoin adaptor_joint_ringsig (cooperative adaptor-CLSAG single-layer) self-test passed");
+
+    // Atomic-swap phase 5 — cooperative multi-layer adaptor-CLSAG (v4 outputs).
+    ::pricoin::adaptor_joint_ringsig::RunSelfTestML();
+    LogInfo("Pricoin adaptor_joint_ringsig (cooperative adaptor-CLSAG multi-layer) self-test passed");
 }
 
 } // namespace pricoin::ct
