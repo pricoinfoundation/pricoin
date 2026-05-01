@@ -356,3 +356,154 @@ signatures wouldn't be byte-compatible with the deployed verifier.
 18. No fee-bump plan for Alice's foreign claim.
 19. No reorg policy.
 20. Supporting adaptor-ECDSA before Schnorr is solid.
+
+---
+
+## Round 3, response 1 — 2026-05-01
+
+Run against revision 3 of `doc/adaptor-clsag.md` (post-round-2
+revisions). **Verdict: not broken; research prototype OK after
+revisions; small-value mainnet pilot only after external human
+review.** Strongest verdict yet — no fundamental construction
+breaks identified, only tightening issues.
+
+### Headline findings
+
+**Finding A — foreign-adaptor binding under-specified (highest
+priority new finding).** The spec says both legs use the same `t`,
+but doesn't specify how Alice verifies that the foreign Schnorr
+adaptor point equals the PRIC `T_G` byte-for-byte. If both chains
+use secp256k1 generator G, byte-equality should be required.
+Otherwise the rev-2 "unverifiable same secret" hashlock bug recurs
+in a different form.
+
+**Finding B — SESSION contains pi; privacy-sensitive.** Binding
+pi into SESSION (for off-chain pre-sig verification) is fine, but
+SESSION must not be logged, exposed via RPC, or reused in any
+context that could leak pi to a third-party observer. Spec should
+either (a) split SESSION_public / SESSION_private, or (b) document
+SESSION as private artifact alongside pre-sig objects.
+
+**Finding D — Deterministic s_others rejection-loop details.**
+"Reduce mod n, retry on invalid" is too vague. Use the existing
+`pricoin::ringsig::HashToScalar` with its rejection/rehash protocol,
+or define an adaptor-specific clone explicitly.
+
+### Q1–Q9 verdicts (rev 3)
+
+* **Q1 — transcript binding:** CONCERN. Move from txids to unsigned
+  template hashes correct; canonical template byte layout still
+  underspecified. Sloppy implementation could omit input outpoints,
+  sequence numbers, sighash type, fee policy, etc.
+* **Q2 — DLEQ:** OK with wire-format requirements. Standard
+  Chaum-Pedersen as written. Implementation must reject infinity,
+  invalid encodings, zero adaptor points; bind exact P_pi via
+  SESSION; prefer explicit `(A_G, A_H, z)` over compressed form.
+* **Q3 — H_p:** CONCERN, not adaptor-specific. Inherited from
+  CLSAG; no new adaptor-introduced break. Spec should explicitly
+  say adaptor inherits H_p's existing security/side-channel
+  profile.
+* **Q4 — µ × adaptor:** OK-ish with mandatory DLEQs and
+  precommitted shares. No counter-example found. Hard precondition
+  required: `x_X·G` and `z_X·G` must be **committed before**
+  adaptor point publication and before nonce commits. Without
+  precommit, malicious counterparty can grind shares to bias µ.
+* **Q5 — concurrent-session attacks:** CONCERN. Commit-reveal
+  necessary but not provably sufficient. Recommended mitigation:
+  durably persist nonce commitments before sending; refuse to
+  sign twice with same `(joint output, ring, tx template, role,
+  adaptor point)`.
+* **Q6 — identifiable abort:** OK for v1 prototype; document the
+  griefing risk explicitly. Multi-layer share DLEQs are mandatory
+  even without identifiable abort because they are part of the
+  µ-safety argument.
+* **Q7 — refund timelock:** OK direction; atomicity claim still
+  occasionally too strong. Replace remaining "neither party can
+  be strictly worse off" language with explicit liveness wording.
+* **Q8 — pre-sig leaks pi:** OK for cooperative setting, with
+  operational caveat. SESSION (which contains pi) must be private.
+* **Q9 — side-channel:** CONCERN, manageable. Use libsecp256k1
+  constant-time scalar ops; clean logs.
+
+### Additional findings (rev 3)
+
+* **Finding A:** foreign-adaptor binding under-specified (above).
+* **Finding B:** SESSION contains pi (above).
+* **Finding C:** Single-layer optional DLEQs are a footgun. Same
+  code paths reused for multi-layer; make DLEQ-1 and DLEQ-2
+  mandatory everywhere in adaptor mode.
+* **Finding D:** Deterministic s_others rejection-loop details
+  (above).
+* **Finding E:** Existing cooperative code does not yet match the
+  spec — `NonceCommit` doesn't bind `D_share`, `s_others` is
+  designated-party-generated in self-test, no share-consistency
+  DLEQs, multi-layer cooperative test is in-process not
+  adversarial. Spec acknowledges; implementation must not
+  "reuse joint_ringsig.cpp" without upgrading.
+* **Finding F:** Code invariant check passed: `WalkRing` /
+  `WalkRingMultiLayer` accept caller-supplied L_pi, R_pi
+  unchanged, so passing shifted anchors works without internal
+  changes.
+* **Finding G:** Existing `CombineScalars` rejects zero sums.
+  Adapt produces `s_pi = ŝ_pi + t` which could be zero with
+  negligible probability; spec must say abort and restart.
+* **Finding H:** Atomic swap funding order creates liquidity
+  griefing risk — Bob funds foreign first; Alice can disappear
+  before funding PRIC. Not theft, but lockup griefing. Spec
+  should distinguish atomicity from free-option / liquidity-
+  lockup.
+* **Finding I:** Human reviewer list is plausible, citations
+  verified.
+
+### Confidence ratings (rev 3)
+
+* (a) Math correctness: **4/5.** Algebra closes for both
+  variants. Remaining uncertainty is binding/exception
+  specification, not derivation.
+* (b) µ-aggregation safety: **3/5.** No concrete attack with
+  mandatory DLEQs + precommitted shares. Informal argument
+  holds; formal proof not attempted.
+* (c) §6.3 atomicity: **3/5.** Direction correct; some claim
+  language too strong.
+* (d) Safe to deploy with $1k verbatim: **2.5/5.** Testnet or
+  controlled pilots OK; real $1k mainnet needs more.
+
+### Required revisions for rev 4
+
+1. Foreign-adaptor binding: byte-identical T_G across chains, or
+   DLEQ if bases differ.
+2. Canonical transaction-template byte layout, not prose.
+3. Mandatory DLEQs everywhere in adaptor mode (drop single-
+   layer "optional" footgun).
+4. Split private/public transcript concepts (or document SESSION
+   as private).
+5. State precommit order explicitly: public shares before T_G/T_H
+   and before nonce commitments.
+6. Reference exact HashToScalar for s_others.
+7. Add adversarial cooperative tests (10+ specific cases).
+8. Acknowledge liquidity griefing as separate from atomicity.
+9. Persist nonce state durably before sending.
+10. Explicit zero-scalar abort.
+
+### Implementation hazards (rev 3, top items)
+
+1. Foreign adaptor point not bound to PRIC T_G.
+2. Wrong T_H base in multi-layer.
+3. Omitted/non-canonical tx-template fields.
+4. DLEQ accepts invalid points or zero scalars.
+5. DLEQ challenge not bound to full session.
+6. Adaptor extraction checks only t·G == T_G.
+7. Multi-layer share DLEQs skipped.
+8. Existing NonceCommit reused for multi-layer.
+9. s_others chosen by one party.
+10. Sign mistakes (close/adapt/extract).
+11. Confusing x with aggregate a (multi-layer).
+12. Using ring[pi].W in H_p (must be P_i).
+13. Treating SESSION as public.
+14. Nonce reuse.
+15. Crash between commit and durable state write.
+16. Accepting duplicate ring members.
+17. Zero adapted scalar.
+18. Logging pre-signatures.
+19. Side-channel leakage in DLEQ generation.
+20. Adaptor-ECDSA as minor extension.
