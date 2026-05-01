@@ -71,6 +71,8 @@
 #ifdef ENABLE_WALLET
 #include <wallet/pricoin_stealth.h>
 #include <wallet/pricoin_swap_session.h>
+#include <swap/chain_backend.h>
+#include <swap/esplora_backend.h>
 #endif
 #include <protocol.h>
 #include <rpc/blockchain.h>
@@ -437,6 +439,9 @@ void Shutdown(NodeContext& node)
     try { wallet::pricoin_stealth::Shutdown(); } catch (...) {}
     try { wallet::pricoin_swap_session::Shutdown(); } catch (...) {}
 #endif
+    // Drop chain-watch backends (libevent state etc.). Independent of
+    // the wallet — backends live at the process level.
+    try { pricoin::swap::Shutdown(); } catch (...) {}
 
     RemovePidFile(*node.args);
 
@@ -697,6 +702,21 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     SetupChainParamsBaseOptions(argsman);
 
     argsman.AddArg("-acceptnonstdtxn", strprintf("Relay and mine \"non-standard\" transactions (test networks only; default: %u)", DEFAULT_ACCEPT_NON_STD_TXN), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
+    // Pricoin atomic-swap chainwatch backends. One -<chain>watchurl per
+    // foreign chain we may want to swap against. URL must be plain HTTP
+    // (HTTPS deferred). Self-host an Esplora instance, or run a local
+    // HTTP-only relay in front of mempool.space / blockstream.info.
+    argsman.AddArg("-btcwatchurl=<url>",
+        "Esplora-style HTTP base URL for the BTC chain (e.g. http://localhost:3002/api). "
+        "Used by atomic-swap RPCs. Plain HTTP only; HTTPS support deferred.",
+        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-ltcwatchurl=<url>",
+        "Esplora-style HTTP base URL for the LTC chain.",
+        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-chainwatchurl=<chain>=<url>",
+        "Generic chainwatch backend registration: -chainwatchurl=doge=http://... "
+        "May be specified multiple times for additional chains.",
+        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-incrementalrelayfee=<amt>", strprintf("Fee rate (in %s/kvB) used to define cost of relay, used for mempool limiting and replacement policy. (default: %s)", CURRENCY_UNIT, FormatMoney(DEFAULT_INCREMENTAL_RELAY_FEE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-dustrelayfee=<amt>", strprintf("Fee rate (in %s/kvB) used to define dust, the value of an output such that it will cost more than its value in fees at this fee rate to spend it. (default: %s)", CURRENCY_UNIT, FormatMoney(DUST_RELAY_TX_FEE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-acceptstalefeeestimates", strprintf("Read fee estimates even if they are stale (%sdefault: %u) fee estimates are considered stale if they are %s hours old", "regtest only; ", DEFAULT_ACCEPT_STALE_FEE_ESTIMATES, Ticks<std::chrono::hours>(MAX_FILE_AGE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
@@ -1478,6 +1498,46 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     // committed by past sessions; subsequent CommitRingKeyImages calls
     // append to this file.
     pricoin::InitKeyImageStore(fs::PathToString(args.GetDataDirNet()));
+
+    // Pricoin: register chain-watch backends from -btcwatchurl /
+    // -ltcwatchurl / -chainwatchurl=<chain>=<url> args. Backends are
+    // optional — atomic-swap RPCs that need a backend will fail-with-
+    // helpful-message if none is registered for the requested chain.
+    {
+        auto register_url = [&](const std::string& chain, const std::string& url) {
+            if (url.empty()) return true;
+            try {
+                pricoin::swap::EsploraBackendOptions opts;
+                opts.base_url = url;
+                opts.chain_name = chain;
+                pricoin::swap::RegisterBackend(pricoin::swap::MakeEsploraBackend(opts));
+                LogInfo("Pricoin chainwatch backend registered: %s -> %s", chain, url);
+            } catch (const std::exception& e) {
+                LogError("Failed to register chainwatch backend for %s: %s", chain, e.what());
+                return false;
+            }
+            return true;
+        };
+        if (!register_url("btc", args.GetArg("-btcwatchurl", ""))) {
+            return InitError(_("Failed to register -btcwatchurl backend (see debug.log)"));
+        }
+        if (!register_url("ltc", args.GetArg("-ltcwatchurl", ""))) {
+            return InitError(_("Failed to register -ltcwatchurl backend"));
+        }
+        for (const auto& spec : args.GetArgs("-chainwatchurl")) {
+            const auto eq = spec.find('=');
+            if (eq == std::string::npos) {
+                return InitError(Untranslated(strprintf(
+                    "-chainwatchurl=%s must be in <chain>=<url> form", spec)));
+            }
+            const std::string chain = spec.substr(0, eq);
+            const std::string url   = spec.substr(eq + 1);
+            if (chain.empty() || url.empty() || !register_url(chain, url)) {
+                return InitError(Untranslated(strprintf(
+                    "Failed to register -chainwatchurl=%s", spec)));
+            }
+        }
+    }
 
     LogInfo("Using at most %i automatic connections (%i file descriptors available)", nMaxConnections, available_fds);
 
