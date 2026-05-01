@@ -963,6 +963,9 @@ RPCMethod pricoin_btc_musig2_nonce_mark_finalized_export();
 RPCMethod pricoin_btc_musig2_nonce_get_export();
 RPCMethod pricoin_btc_musig2_nonce_list_export();
 RPCMethod pricoin_btc_musig2_nonce_erase_export();
+RPCMethod pricoin_btc_swap_tx_build_export();
+RPCMethod pricoin_btc_swap_tx_finalize_export();
+RPCMethod pricoin_btc_p2tr_address_export();
 RPCMethod pricoin_listownct_export();
 RPCMethod walletsendct_from_ct_export();
 RPCMethod walletsendct_ring_export();
@@ -1034,6 +1037,9 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &pricoin_btc_musig2_nonce_get_export},
         {"wallet", &pricoin_btc_musig2_nonce_list_export},
         {"wallet", &pricoin_btc_musig2_nonce_erase_export},
+        {"wallet", &pricoin_btc_swap_tx_build_export},
+        {"wallet", &pricoin_btc_swap_tx_finalize_export},
+        {"wallet", &pricoin_btc_p2tr_address_export},
         {"wallet", &pricoin_listownct_export},
         {"wallet", &walletsendct_from_ct_export},
         {"wallet", &walletsendct_ring_export},

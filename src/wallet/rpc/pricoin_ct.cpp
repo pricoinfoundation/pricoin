@@ -37,6 +37,7 @@
 #include <wallet/coinselection.h>
 #include <swap/btc_musig2_adaptor.h>
 #include <swap/btc_musig2_runtime.h>
+#include <swap/btc_refund_tx.h>
 #include <wallet/pricoin_adaptor_swap.h>
 #include <wallet/pricoin_btc_musig2_nonce_records.h>
 #include <wallet/pricoin_clsag_nonce_records.h>
@@ -5592,9 +5593,156 @@ RPCMethod pricoin_btc_musig2_nonce_erase()
     };
 }
 
-} // namespace (close BTC MuSig2 wire RPCs anonymous block)
+// ─────────────────────────────────────────────────────────────────
+// BTC swap-tx build / finalize / address helper.
+// Wraps `swap/btc_refund_tx` so a Python test can drive a full
+// BTC-side refund (or claim) end-to-end on regtest.
+// ─────────────────────────────────────────────────────────────────
 
-} // namespace
+namespace brt = ::pricoin::swap::btc_refund_tx;
+
+RPCMethod pricoin_btc_swap_tx_build()
+{
+    return RPCMethod{
+        "pricoin_btc_swap_tx_build",
+        "Build a BTC-side swap-tx skeleton spending a 2-of-2 P2TR funding output.\n"
+        "Returns the unsigned tx hex + the BIP341 key-path-spend sighash that the\n"
+        "cooperative MuSig2 flow signs. Set `nlocktime` ≥ T_foreign_refund for a\n"
+        "refund tx; set 0 for a claim tx (no timelock).\n",
+        {
+            {"funding_txid",     RPCArg::Type::STR_HEX, RPCArg::Optional::NO,  "32-byte funding txid"},
+            {"funding_vout",     RPCArg::Type::NUM,     RPCArg::Optional::NO,  ""},
+            {"funding_amount_sat", RPCArg::Type::NUM,   RPCArg::Optional::NO,  "Funding output amount (smallest unit)"},
+            {"agg_xonly",        RPCArg::Type::STR_HEX, RPCArg::Optional::NO,  "32-byte aggregate x-only pubkey of the 2-of-2"},
+            {"recipient_script_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Hex of the recipient's scriptPubKey"},
+            {"refund_amount_sat", RPCArg::Type::NUM,    RPCArg::Optional::NO,  "Recipient amount (= funding - fee)"},
+            {"nlocktime",        RPCArg::Type::NUM,     RPCArg::Default{0},    "0 for claim, ≥1 for refund"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "tx_hex",  "Unsigned tx (empty witness)"},
+                {RPCResult::Type::STR_HEX, "sighash", "32-byte BIP341 sighash"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_swap_tx_build", "<args>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            brt::BtcRefundTxParams p;
+            auto txid = uint256::FromHex(request.params[0].get_str());
+            if (!txid) throw JSONRPCError(RPC_INVALID_PARAMETER, "funding_txid must be 32-byte hex");
+            p.funding_txid = *txid;
+            p.funding_vout = request.params[1].getInt<uint32_t>();
+            p.funding_amount_sat = request.params[2].getInt<int64_t>();
+
+            auto agg = TryParseHex<unsigned char>(request.params[3].get_str());
+            if (!agg || agg->size() != 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "agg_xonly must be 32-byte hex");
+            }
+            std::copy(agg->begin(), agg->end(), p.agg_xonly.begin());
+
+            auto spk = TryParseHex<unsigned char>(request.params[4].get_str());
+            if (!spk || spk->empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "recipient_script_pubkey must be non-empty hex");
+            }
+            p.recipient_script_pubkey = *spk;
+
+            p.refund_amount_sat = request.params[5].getInt<int64_t>();
+            p.nlocktime = request.params[6].isNull() ? 0 : request.params[6].getInt<int32_t>();
+
+            auto built = brt::Build(p);
+            if (!built) throw JSONRPCError(RPC_INVALID_PARAMETER, "btc_refund_tx::Build rejected params");
+
+            DataStream ds;
+            ds << TX_WITH_WITNESS(CTransaction{built->tx});
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("tx_hex",  HexStr(std::span<const unsigned char>{
+                UCharCast(ds.data()), ds.size()}));
+            // sighash is just raw 32 bytes — caller treats it as the message.
+            out.pushKV("sighash", HexStr(built->sighash));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_swap_tx_finalize()
+{
+    return RPCMethod{
+        "pricoin_btc_swap_tx_finalize",
+        "Attach a 64-byte BIP340 (cooperative MuSig2) signature to a swap-tx skeleton's\n"
+        "input 0 as a P2TR key-path-spend witness, returning the broadcastable hex.\n",
+        {
+            {"tx_hex",   RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Skeleton from pricoin_btc_swap_tx_build"},
+            {"sig64",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "64-byte BIP340 signature"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "tx_hex", "Broadcastable tx (witness attached)"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_swap_tx_finalize", "<tx_hex> <sig64>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            // Decode the skeleton.
+            auto tx_bytes = TryParseHex<unsigned char>(request.params[0].get_str());
+            if (!tx_bytes) throw JSONRPCError(RPC_INVALID_PARAMETER, "tx_hex must be hex");
+            CMutableTransaction mtx;
+            try {
+                DataStream ds{std::span<const unsigned char>{*tx_bytes}};
+                ds >> TX_WITH_WITNESS(mtx);
+            } catch (const std::exception&) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "tx_hex did not parse as a valid transaction");
+            }
+            if (mtx.vin.empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "tx has no inputs");
+            }
+
+            auto sig = TryParseHex<unsigned char>(request.params[1].get_str());
+            if (!sig || sig->size() != 64) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "sig64 must be 64-byte hex");
+            }
+
+            // Wrap up via Build/Finalize idiom — but we already have the skeleton,
+            // so attach the witness directly (matches what brt::Finalize does).
+            mtx.vin[0].scriptWitness.stack.clear();
+            mtx.vin[0].scriptWitness.stack.emplace_back(sig->begin(), sig->end());
+
+            DataStream ds;
+            ds << TX_WITH_WITNESS(CTransaction{mtx});
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("tx_hex", HexStr(std::span<const unsigned char>{
+                UCharCast(ds.data()), ds.size()}));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_p2tr_address()
+{
+    return RPCMethod{
+        "pricoin_btc_p2tr_address",
+        "Encode a 32-byte x-only pubkey as a P2TR (BIP350 bech32m) address using\n"
+        "the current chain's HRP. Useful for funding a 2-of-2 MuSig2 aggregate via\n"
+        "the existing wallet sendtoaddress on regtest.\n",
+        {
+            {"xonly", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte x-only pubkey"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR, "address", "P2TR bech32m address"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_p2tr_address", "<xonly>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto bytes = TryParseHex<unsigned char>(request.params[0].get_str());
+            if (!bytes || bytes->size() != 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "xonly must be 32-byte hex");
+            }
+            XOnlyPubKey xonly(std::span<const unsigned char>{bytes->data(), 32});
+            const std::string addr = EncodeDestination(WitnessV1Taproot{xonly});
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("address", addr);
+            return out;
+        }
+    };
+}
+
+} // namespace (close BTC MuSig2 wire RPCs anonymous block — balances open at 4840)
+
+} // namespace (close outer anonymous — balances open at 590; exports + helpers below are at namespace wallet level)
 
 RPCMethod pricoin_getstealthaddress_export() { return pricoin_getstealthaddress(); }
 RPCMethod pricoin_getstealthseed_export() { return pricoin_getstealthseed(); }
@@ -5656,6 +5804,9 @@ RPCMethod pricoin_btc_musig2_nonce_mark_finalized_export() { return pricoin_btc_
 RPCMethod pricoin_btc_musig2_nonce_get_export()          { return pricoin_btc_musig2_nonce_get(); }
 RPCMethod pricoin_btc_musig2_nonce_list_export()         { return pricoin_btc_musig2_nonce_list(); }
 RPCMethod pricoin_btc_musig2_nonce_erase_export()        { return pricoin_btc_musig2_nonce_erase(); }
+RPCMethod pricoin_btc_swap_tx_build_export()             { return pricoin_btc_swap_tx_build(); }
+RPCMethod pricoin_btc_swap_tx_finalize_export()          { return pricoin_btc_swap_tx_finalize(); }
+RPCMethod pricoin_btc_p2tr_address_export()              { return pricoin_btc_p2tr_address(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

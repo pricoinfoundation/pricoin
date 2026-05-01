@@ -40,7 +40,9 @@ std::optional<BtcRefundTxBuilt> Build(const BtcRefundTxParams& params)
     if (params.funding_amount_sat <= 0) return std::nullopt;
     if (params.refund_amount_sat <= 0) return std::nullopt;
     if (params.refund_amount_sat >= params.funding_amount_sat) return std::nullopt;
-    if (params.nlocktime <= 0) return std::nullopt;
+    // 0 is valid: no timelock, claim-tx semantics (broadcastable immediately
+    // once the funding confirms). Refund txs use a real height ≥ 1.
+    if (params.nlocktime < 0) return std::nullopt;
     if (params.recipient_script_pubkey.empty()) return std::nullopt;
     // agg_xonly is fixed-size; just check it's not all-zero (sentinel
     // for "uninitialized") — a real x-only pub on the curve cannot be
@@ -241,9 +243,14 @@ void TestNegatives()
     p.refund_amount_sat = p.funding_amount_sat;
     Check(!Build(p).has_value(), "reject refund >= funding (no fee headroom)");
 
+    // nlocktime = 0 is the CLAIM-tx mode (no timelock). Module covers
+    // both refund (>0) and claim (=0) shapes; only negative is invalid.
     p = base;
     p.nlocktime = 0;
-    Check(!Build(p).has_value(), "reject zero nLockTime");
+    Check(Build(p).has_value(), "accept zero nLockTime (claim mode)");
+    p = base;
+    p.nlocktime = -1;
+    Check(!Build(p).has_value(), "reject negative nLockTime");
 
     p = base;
     p.recipient_script_pubkey.clear();
