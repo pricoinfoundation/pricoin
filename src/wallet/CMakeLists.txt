@@ -17,6 +17,7 @@ add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   load.cpp
   migrate.cpp
   pricoin_adaptor_swap.cpp
+  pricoin_btc_musig2_nonce_records.cpp
   pricoin_clsag_nonce_records.cpp
   pricoin_stealth.cpp
   pricoin_swap_ceremony.cpp

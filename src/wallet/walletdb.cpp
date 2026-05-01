@@ -56,6 +56,7 @@ const std::string PRICOIN_SWAP_SESSION{"pct_swap_session"};
 const std::string PRICOIN_SWAP_CEREMONY{"pct_swap_ceremony"};
 const std::string PRICOIN_CLSAG_NONCE{"pct_clsag_nonce"};
 const std::string PRICOIN_ADAPTOR_SWAP{"pct_adaptor_swap"};
+const std::string PRICOIN_BTC_MUSIG2_NONCE{"pct_btc_musig2_nonce"};
 const std::string PURPOSE{"purpose"};
 const std::string SETTINGS{"settings"};
 const std::string TX{"tx"};
@@ -1437,6 +1438,42 @@ bool WalletBatch::ReadAllPricoinAdaptorSwaps(
         std::vector<unsigned char> blob;
         ssValue >> blob;
         out.emplace(sid, std::move(blob));
+    }
+    return true;
+}
+
+bool WalletBatch::WritePricoinBtcMusig2Nonce(const uint256& digest,
+                                               const std::vector<unsigned char>& blob)
+{
+    return WriteIC(std::make_pair(DBKeys::PRICOIN_BTC_MUSIG2_NONCE, digest), blob);
+}
+
+bool WalletBatch::ErasePricoinBtcMusig2Nonce(const uint256& digest)
+{
+    return EraseIC(std::make_pair(DBKeys::PRICOIN_BTC_MUSIG2_NONCE, digest));
+}
+
+bool WalletBatch::ReadAllPricoinBtcMusig2Nonces(
+    std::map<uint256, std::vector<unsigned char>>& out)
+{
+    DataStream prefix;
+    prefix << DBKeys::PRICOIN_BTC_MUSIG2_NONCE;
+    std::unique_ptr<DatabaseCursor> cursor = m_batch->GetNewPrefixCursor(prefix);
+    if (!cursor) return false;
+    while (true) {
+        DataStream ssKey;
+        DataStream ssValue;
+        DatabaseCursor::Status status = cursor->Next(ssKey, ssValue);
+        if (status == DatabaseCursor::Status::DONE) break;
+        if (status == DatabaseCursor::Status::FAIL) return false;
+        std::string type;
+        ssKey >> type;
+        if (type != DBKeys::PRICOIN_BTC_MUSIG2_NONCE) continue;
+        uint256 digest;
+        ssKey >> digest;
+        std::vector<unsigned char> blob;
+        ssValue >> blob;
+        out.emplace(digest, std::move(blob));
     }
     return true;
 }

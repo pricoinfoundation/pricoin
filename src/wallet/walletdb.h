@@ -106,6 +106,11 @@ extern const std::string PRICOIN_CLSAG_NONCE;
 // pre-signatures, which are required to broadcast the swap's claim
 // or refund txs. See wallet/pricoin_adaptor_swap.cpp.
 extern const std::string PRICOIN_ADAPTOR_SWAP;
+// BTC-side §4.1a MuSig2 nonce-reuse defence record. Multi-row,
+// keyed by 32-byte digest of (agg_xonly, msg, role). Encrypted
+// at rest via EncryptWalletBlob — the contents are public but the
+// envelope keeps the wallet's at-rest posture uniform.
+extern const std::string PRICOIN_BTC_MUSIG2_NONCE;
 extern const std::string PURPOSE;
 extern const std::string SETTINGS;
 extern const std::string TX;
@@ -342,6 +347,12 @@ public:
                                   const std::vector<unsigned char>& blob);
     bool ErasePricoinAdaptorSwap(const uint256& swap_id);
     bool ReadAllPricoinAdaptorSwaps(
+        std::map<uint256, std::vector<unsigned char>>& out);
+    // Per-record BTC MuSig2 nonce store (BTC-side §4.1a).
+    bool WritePricoinBtcMusig2Nonce(const uint256& digest,
+                                     const std::vector<unsigned char>& blob);
+    bool ErasePricoinBtcMusig2Nonce(const uint256& digest);
+    bool ReadAllPricoinBtcMusig2Nonces(
         std::map<uint256, std::vector<unsigned char>>& out);
     //! Begin a new transaction
     bool TxnBegin();

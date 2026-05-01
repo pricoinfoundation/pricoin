@@ -38,6 +38,7 @@
 #include <swap/btc_musig2_adaptor.h>
 #include <swap/btc_musig2_runtime.h>
 #include <wallet/pricoin_adaptor_swap.h>
+#include <wallet/pricoin_btc_musig2_nonce_records.h>
 #include <wallet/pricoin_clsag_nonce_records.h>
 #include <wallet/pricoin_ct_send.h>
 #include <wallet/pricoin_stealth.h>
@@ -5278,6 +5279,310 @@ RPCMethod pricoin_btc_musig2_extract()
     };
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Atomic-swap phase 5 — BTC MuSig2 nonce-reuse defence (BTC-side §4.1a).
+//
+// Wallet-tier RPCs to begin / mark-finalized / inspect / erase
+// per-(agg_xonly, msg, role) round-1 commitment records. Plus a
+// `_safe` variant of round1 that atomically generates a pubnonce
+// and persists the commitment record before the pubnonce returns.
+// ─────────────────────────────────────────────────────────────────
+
+namespace bnr = ::wallet::pricoin_btc_musig2_nonce_records;
+namespace bnp = ::pricoin::btc_musig2_nonce_policy;
+
+bnp::Role ParseBtcNonceRole(const std::string& s)
+{
+    if (s == "initiator") return bnp::Role::Initiator;
+    if (s == "responder") return bnp::Role::Responder;
+    throw JSONRPCError(RPC_INVALID_PARAMETER,
+        "role must be \"initiator\" or \"responder\"");
+}
+
+bnp::RecordKey ParseBtcNonceRecordKey(
+    const UniValue& agg_xonly_hex, const UniValue& msg_hex, const UniValue& role_str)
+{
+    auto agg = uint256::FromHex(agg_xonly_hex.get_str());
+    if (!agg) throw JSONRPCError(RPC_INVALID_PARAMETER, "agg_xonly must be 32-byte hex");
+    auto msg = uint256::FromHex(msg_hex.get_str());
+    if (!msg) throw JSONRPCError(RPC_INVALID_PARAMETER, "msg must be 32-byte hex");
+    bnp::RecordKey k;
+    k.agg_xonly = *agg;
+    k.msg = *msg;
+    k.role = ParseBtcNonceRole(role_str.get_str());
+    return k;
+}
+
+UniValue BtcNonceRecordToJSON(const bnp::NonceRecord& r)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("agg_xonly",     r.key.agg_xonly.ToString());
+    out.pushKV("msg",           r.key.msg.ToString());
+    out.pushKV("role",
+        r.key.role == bnp::Role::Initiator ? "initiator" : "responder");
+    out.pushKV("session_id",    r.session_id.ToString());
+    out.pushKV("pubnonce",      HexStr(r.pubnonce));
+    out.pushKV("finalized",     r.finalized);
+    out.pushKV("created_time",  r.created_time);
+    out.pushKV("updated_time",  r.updated_time);
+    out.pushKV("record_digest", bnp::RecordDigest(r.key).ToString());
+    return out;
+}
+
+[[noreturn]] void ThrowFromBtcNonceBeginResult(bnr::BeginResult r)
+{
+    using R = bnr::BeginResult;
+    switch (r) {
+    case R::Ok: assert(false);
+    case R::InvalidInput:
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "session_id must be non-null");
+    case R::Locked:
+        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+    case R::ConflictDifferentSession:
+        throw JSONRPCError(RPC_INVALID_REQUEST,
+            "BTC §4.1a: a record exists for this (agg_xonly, msg, role) under "
+            "a DIFFERENT session_id — refusing to commit a new pubnonce");
+    case R::ConflictSameSessionInFlight:
+        throw JSONRPCError(RPC_INVALID_REQUEST,
+            "BTC §4.1a: a record exists for this (agg_xonly, msg, role) under "
+            "the same session_id with finalized=false — already in flight");
+    case R::WriteFailed:
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "wallet write failed");
+    }
+    assert(false);
+}
+
+[[noreturn]] void ThrowFromBtcNonceMutateResult(bnr::MutateResult r)
+{
+    using R = bnr::MutateResult;
+    switch (r) {
+    case R::Ok: assert(false);
+    case R::NotFound:
+        throw JSONRPCError(RPC_INVALID_REQUEST, "no record for this key");
+    case R::Locked:
+        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+    case R::WriteFailed:
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "wallet write failed");
+    }
+    assert(false);
+}
+
+RPCMethod pricoin_btc_musig2_round1_safe()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_round1_safe",
+        "BTC-side §4.1a: generate a MuSig2 round-1 nonce AND atomically\n"
+        "persist the commitment record before the pubnonce returns. Equivalent\n"
+        "to pricoin_btc_musig2_round1 followed by Begin, but enforced as a\n"
+        "single transaction: the pubnonce is never returned to the caller\n"
+        "unless the persistence record is on disk.\n"
+        "\n"
+        "REJECTS if a record already exists for the same (agg_xonly, msg, role)\n"
+        "under a different session_id, OR under the same session_id with\n"
+        "finalized=false.\n",
+        {
+            {"self_pub",     RPCArg::Type::STR_HEX, RPCArg::Optional::NO,  "33-byte compressed self pubkey"},
+            {"keyagg_cache", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,  "197-byte cache from pricoin_btc_musig2_keyagg"},
+            {"agg_xonly",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO,  "32-byte aggregate x-only pubkey (key field)"},
+            {"msg",          RPCArg::Type::STR_HEX, RPCArg::Optional::NO,  "32-byte sighash (key field + nonce binding)"},
+            {"role",         RPCArg::Type::STR,     RPCArg::Optional::NO,  "\"initiator\" or \"responder\""},
+            {"session_id",   RPCArg::Type::STR_HEX, RPCArg::Optional::NO,  "32-byte session id (typically from pricoin_swap_session_create)"},
+            {"session_seed", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,  "32-byte CSPRNG bytes — must be unique per call"},
+            {"self_priv",    RPCArg::Type::STR_HEX, RPCArg::Default{""},   "Optional 32-byte priv (binding for nonce derivation)"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "pubnonce",        "66-byte serialized pubnonce"},
+                {RPCResult::Type::STR_HEX, "secnonce_handle", "32-byte opaque handle for partial_sign"},
+                {RPCResult::Type::STR_HEX, "record_digest",   "32-byte digest of (agg_xonly, msg, role)"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_round1_safe",
+            "<self_pub> <cache> <agg_xonly> <msg> initiator <session_id> <seed>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+
+            auto pub_bytes = TryParseHex<unsigned char>(request.params[0].get_str());
+            if (!pub_bytes || pub_bytes->size() != 33) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "self_pub must be 33-byte hex");
+            }
+            CPubKey self_pub(std::span<const unsigned char>(pub_bytes->data(), 33));
+            if (!self_pub.IsValid() || !self_pub.IsCompressed()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "self_pub invalid");
+            }
+
+            bma::KeyAggCache cache = ParseKeyAggCacheBlob(request.params[1].get_str());
+
+            // Parse the record-key components.
+            bnp::RecordKey key = ParseBtcNonceRecordKey(
+                request.params[2], request.params[3], request.params[4]);
+
+            auto sid = uint256::FromHex(request.params[5].get_str());
+            if (!sid) throw JSONRPCError(RPC_INVALID_PARAMETER, "session_id must be 32-byte hex");
+
+            auto seed_bytes = TryParseHex<unsigned char>(request.params[6].get_str());
+            if (!seed_bytes || seed_bytes->size() != 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "session_seed must be 32-byte hex");
+            }
+            uint256 session_seed;
+            std::copy(seed_bytes->begin(), seed_bytes->end(), session_seed.begin());
+
+            std::optional<bma::Scalar> self_priv;
+            const std::string priv_hex = request.params[7].isNull() ? "" : request.params[7].get_str();
+            if (!priv_hex.empty()) {
+                auto priv_bytes = TryParseHex<unsigned char>(priv_hex);
+                if (!priv_bytes || priv_bytes->size() != 32) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "self_priv must be 32-byte hex");
+                }
+                bma::Scalar s;
+                std::copy(priv_bytes->begin(), priv_bytes->end(), s.begin());
+                self_priv = s;
+            }
+
+            // Generate the secnonce + pubnonce.
+            auto secnonce = std::make_unique<MuSig2SecNonce>();
+            auto pubnonce = bma::NonceGen(*secnonce, self_priv, self_pub,
+                                           key.msg, cache, session_seed);
+            if (!pubnonce) throw JSONRPCError(RPC_INTERNAL_ERROR, "NonceGen failed");
+
+            // ATOMIC: persist the commitment BEFORE we expose the pubnonce.
+            // If Begin rejects, we throw without returning — pubnonce stays
+            // local and the secnonce is dropped on scope exit.
+            bnp::NonceRecord rec;
+            bnr::BeginResult br = bnr::Begin(*wallet_sp, key, *sid, *pubnonce, rec);
+            if (br != bnr::BeginResult::Ok) ThrowFromBtcNonceBeginResult(br);
+
+            // Stash the secnonce keyed by a fresh handle.
+            uint256 handle;
+            GetStrongRandBytes(handle);
+            if (!btr::Stash(handle, std::move(secnonce))) {
+                // Should never happen — fresh random handle.
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "secnonce handle collision");
+            }
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("pubnonce",        HexStr(*pubnonce));
+            out.pushKV("secnonce_handle", handle.ToString());
+            out.pushKV("record_digest",   bnp::RecordDigest(key).ToString());
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_musig2_nonce_mark_finalized()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_nonce_mark_finalized",
+        "Mark a BTC MuSig2 nonce-reuse record finalized. Call this when the\n"
+        "corresponding BTC tx is confirmed on-chain — the spent output is\n"
+        "no longer signable, so nonce-reuse is no longer a concern.\n"
+        "After this transition, future round1_safe under the SAME session_id\n"
+        "is permitted; under a different session_id the policy continues to\n"
+        "reject (strict reading — manual Erase is required to fully reset).\n",
+        {
+            {"agg_xonly", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"msg",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"role",      RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated record" },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_nonce_mark_finalized",
+            "<agg_xonly> <msg> initiator")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            bnp::RecordKey key = ParseBtcNonceRecordKey(
+                request.params[0], request.params[1], request.params[2]);
+            auto r = bnr::MarkFinalized(*wallet_sp, key);
+            if (r != bnr::MutateResult::Ok) ThrowFromBtcNonceMutateResult(r);
+            bnp::NonceRecord rec;
+            (void)bnr::Get(*wallet_sp, key, rec);
+            return BtcNonceRecordToJSON(rec);
+        }
+    };
+}
+
+RPCMethod pricoin_btc_musig2_nonce_get()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_nonce_get",
+        "Read a BTC MuSig2 nonce-reuse record.\n",
+        {
+            {"agg_xonly", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"msg",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"role",      RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Record" },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_nonce_get",
+            "<agg_xonly> <msg> initiator")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            bnp::RecordKey key = ParseBtcNonceRecordKey(
+                request.params[0], request.params[1], request.params[2]);
+            bnp::NonceRecord rec;
+            auto r = bnr::Get(*wallet_sp, key, rec);
+            if (r == bnr::LookupResult::Locked) throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+            if (r == bnr::LookupResult::NotFound) throw JSONRPCError(RPC_INVALID_REQUEST, "no record for this key");
+            return BtcNonceRecordToJSON(rec);
+        }
+    };
+}
+
+RPCMethod pricoin_btc_musig2_nonce_list()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_nonce_list",
+        "List all BTC MuSig2 nonce-reuse records in this wallet.\n",
+        {},
+        RPCResult{ RPCResult::Type::ARR, "", "",
+            {{RPCResult::Type::ANY, "", "Record"}} },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_nonce_list", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            std::vector<bnp::NonceRecord> all;
+            auto r = bnr::List(*wallet_sp, all);
+            if (r == bnr::LookupResult::Locked) throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+            UniValue out{UniValue::VARR};
+            for (const auto& rec : all) out.push_back(BtcNonceRecordToJSON(rec));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_musig2_nonce_erase()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_nonce_erase",
+        "DESTRUCTIVE: hard-delete a BTC MuSig2 nonce-reuse record. After erase\n"
+        "the slot becomes a fresh starting point — the §4.1a safety rail is\n"
+        "gone. Use only when the in-flight signing session is permanently\n"
+        "aborted and you have explicit operator approval.\n",
+        {
+            {"agg_xonly", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"msg",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"role",      RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::BOOL, "erased", "true"}} },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_nonce_erase",
+            "<agg_xonly> <msg> initiator")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            bnp::RecordKey key = ParseBtcNonceRecordKey(
+                request.params[0], request.params[1], request.params[2]);
+            auto r = bnr::Erase(*wallet_sp, key);
+            if (r != bnr::MutateResult::Ok) ThrowFromBtcNonceMutateResult(r);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("erased", true);
+            return out;
+        }
+    };
+}
+
 } // namespace (close BTC MuSig2 wire RPCs anonymous block)
 
 } // namespace
@@ -5337,6 +5642,11 @@ RPCMethod pricoin_btc_musig2_partial_sign_export()       { return pricoin_btc_mu
 RPCMethod pricoin_btc_musig2_aggregate_partials_export() { return pricoin_btc_musig2_aggregate_partials(); }
 RPCMethod pricoin_btc_musig2_adapt_export()              { return pricoin_btc_musig2_adapt(); }
 RPCMethod pricoin_btc_musig2_extract_export()            { return pricoin_btc_musig2_extract(); }
+RPCMethod pricoin_btc_musig2_round1_safe_export()        { return pricoin_btc_musig2_round1_safe(); }
+RPCMethod pricoin_btc_musig2_nonce_mark_finalized_export() { return pricoin_btc_musig2_nonce_mark_finalized(); }
+RPCMethod pricoin_btc_musig2_nonce_get_export()          { return pricoin_btc_musig2_nonce_get(); }
+RPCMethod pricoin_btc_musig2_nonce_list_export()         { return pricoin_btc_musig2_nonce_list(); }
+RPCMethod pricoin_btc_musig2_nonce_erase_export()        { return pricoin_btc_musig2_nonce_erase(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

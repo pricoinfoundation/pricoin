@@ -16,6 +16,7 @@
 #include <pricoin/joint_ringsig.h>
 #include <pricoin/joint_stealth.h>
 #include <pricoin/ringsig.h>
+#include <pricoin/btc_musig2_nonce_policy.h>
 #include <pricoin/clsag_nonce_policy.h>
 #include <swap/atomic_swap_e2e_test.h>
 #include <swap/btc_adaptor_schnorr.h>
@@ -494,6 +495,10 @@ void RunSelfTest()
     // Atomic-swap phase 5 — cooperative-CLSAG nonce-reuse policy (§4.1a).
     ::pricoin::clsag_nonce_policy::RunSelfTest();
     LogInfo("Pricoin clsag_nonce_policy (§4.1a nonce-reuse defence) self-test passed");
+
+    // Atomic-swap phase 5 — BTC-side MuSig2 nonce-reuse policy (foreign-leg §4.1a analog).
+    ::pricoin::btc_musig2_nonce_policy::RunSelfTest();
+    LogInfo("Pricoin btc_musig2_nonce_policy (BTC-side §4.1a nonce-reuse defence) self-test passed");
 
     // Atomic-swap phase 5 — full cross-chain happy-path integration.
     // Walks Alice + Bob through one swap end-to-end (no chain) and
