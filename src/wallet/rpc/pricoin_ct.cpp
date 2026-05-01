@@ -2123,6 +2123,418 @@ RPCMethod pricoin_jointscan_recover()
     };
 }
 
+// Atomic-swap stage 2b — produce a v4 spend-tx skeleton (empty CLSAG)
+// for a joint stealth output, plus everything the cooperative
+// signing protocol needs: the multi-layer ring, signer's index pi,
+// the deterministic sighash, and a pre-randomised z-split for the
+// two parties.
+//
+// The caller (the spending side, traditionally Alice) drives the
+// flow:
+//   1. Run pricoin_jointspend_loadshare to learn the joint output's
+//      value/blind/pubkey and her x_share.
+//   2. Run THIS RPC to build the skeleton + everything for signing.
+//   3. Send (tx_hex, z_other_share) to the counterparty along with
+//      the sighash + ring + pi (the counterparty will RE-derive ring
+//      and sighash from the tx_hex to be sure she didn't lie).
+//   4. Run the cooperative-signing rounds (round1 → combine →
+//      share → assemble) to produce a multi-layer CLSAG.
+//   5. Run pricoin_jointspend_submittx to inject the signature into
+//      the skeleton and broadcast.
+RPCMethod pricoin_jointspend_buildtx()
+{
+    return RPCMethod{
+        "pricoin_jointspend_buildtx",
+        "Build a v4 spend-tx skeleton (with empty CLSAG) for a joint stealth output.\n"
+        "\n"
+        "Returns the tx hex, the deterministic sighash that the cooperative\n"
+        "CLSAG must commit to, the multi-layer ring (P_i, W_i for each ring\n"
+        "member), the signer's index, and a random z-split so the two parties\n"
+        "can run the multi-layer cooperative protocol symmetrically.\n"
+        "\n"
+        "WARNING: z_self embeds the wallet's joint-output blind (b_prev). Treat\n"
+        "with care; only the spender (the party calling this RPC) should hold it.\n",
+        {
+            {"joint_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Tx id of the joint stealth output being spent"},
+            {"joint_vout", RPCArg::Type::NUM, RPCArg::Optional::NO,
+                "Vout index of the joint stealth output"},
+            {"joint_value", RPCArg::Type::AMOUNT, RPCArg::Optional::NO,
+                "Recovered value of the joint output (from loadshare)"},
+            {"joint_blind", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte rangeproof blind from loadshare (b_prev)"},
+            {"joint_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "33-byte one-time pubkey at the joint output"},
+            {"dest_address", RPCArg::Type::STR, RPCArg::Optional::NO,
+                "Destination Pricoin stealth address"},
+            {"dest_amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Amount in PRIC"},
+            {"fee", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Transparent fee in PRIC"},
+            {"ring_size", RPCArg::Type::NUM, RPCArg::Default{4},
+                "Total ring size (must have ring_size-1 chain decoys)"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "tx_hex", "Hex tx skeleton (empty CLSAG, ready for signing)"},
+                {RPCResult::Type::STR_HEX, "sighash", "32-byte sighash to sign"},
+                {RPCResult::Type::ARR, "ring_ml", "Multi-layer ring members",
+                    {{RPCResult::Type::OBJ, "", "",
+                      {{RPCResult::Type::STR_HEX, "P", ""},
+                       {RPCResult::Type::STR_HEX, "W", ""}}}}},
+                {RPCResult::Type::NUM, "pi", "Signer's index in the ring"},
+                {RPCResult::Type::STR_HEX, "z_self",
+                    "32-byte z-share for the spender (this party). Use as z_share in round1."},
+                {RPCResult::Type::STR_HEX, "z_other",
+                    "32-byte z-share to send to the counterparty. They use it as their z_share."},
+                {RPCResult::Type::STR_HEX, "joint_pubkey",
+                    "Echo: the one-time pubkey at ring[pi].P"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_jointspend_buildtx",
+            "<joint_txid> <vout> 4.2 <blind hex> <P hex> <stealth dest> 1.0 0.0001 4")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            interfaces::Chain& chain = wallet.chain();
+
+            const std::string joint_txid_hex = request.params[0].get_str();
+            const uint32_t joint_vout = request.params[1].getInt<uint32_t>();
+            const CAmount joint_value = AmountFromValue(request.params[2]);
+            const std::string joint_blind_hex = request.params[3].get_str();
+            const std::string joint_pubkey_hex = request.params[4].get_str();
+            const std::string dest_addr_str = request.params[5].get_str();
+            const CAmount dest_amount = AmountFromValue(request.params[6]);
+            const CAmount fee = AmountFromValue(request.params[7]);
+            const int ring_size = request.params[8].isNull() ? 4 : request.params[8].getInt<int>();
+            if (ring_size < 2) throw JSONRPCError(RPC_INVALID_PARAMETER, "ring_size must be >= 2");
+
+            auto joint_txid_opt = uint256::FromHex(joint_txid_hex);
+            if (!joint_txid_opt) throw JSONRPCError(RPC_INVALID_PARAMETER, "joint_txid not hex");
+            if (!IsHex(joint_blind_hex) || joint_blind_hex.size() != 64) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "joint_blind must be 32 bytes hex");
+            }
+            if (!IsHex(joint_pubkey_hex) || joint_pubkey_hex.size() != 66) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "joint_pubkey must be 33 bytes hex");
+            }
+            const auto blind_bytes = ParseHex(joint_blind_hex);
+            const auto pub_bytes = ParseHex(joint_pubkey_hex);
+            pricoin::ct::BlindingFactor joint_blind{};
+            std::memcpy(joint_blind.data(), blind_bytes.data(), 32);
+            pricoin::ct::SerializedPubKey33 joint_pubkey{};
+            std::memcpy(joint_pubkey.data(), pub_bytes.data(), 33);
+
+            auto stealth_dest = ::pricoin::stealth::Decode(dest_addr_str);
+            if (!stealth_dest) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "dest_address must be a stealth address");
+
+            // Sanity: prev coin's commitment must match Create(value, blind).
+            const COutPoint joint_outpoint{Txid::FromUint256(*joint_txid_opt), joint_vout};
+            Coin joint_coin;
+            {
+                std::map<COutPoint, Coin> coins{{joint_outpoint, Coin{}}};
+                chain.findCoins(coins);
+                joint_coin = coins[joint_outpoint];
+            }
+            if (joint_coin.IsSpent() || !joint_coin.IsConfidential()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "joint outpoint not a confirmed v4 output");
+            }
+            {
+                auto rebuilt = pricoin::ct::Commitment::Create(static_cast<uint64_t>(joint_value), joint_blind);
+                if (!rebuilt || *rebuilt != joint_coin.commitment) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        "joint_value+joint_blind do not reconstruct the on-chain commitment");
+                }
+            }
+            if (joint_coin.one_time_pubkey != joint_pubkey) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "joint_pubkey does not match the on-chain one_time_pubkey");
+            }
+
+            const CAmount target = dest_amount + fee;
+            if (target > joint_value) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "joint_value < dest_amount + fee");
+            }
+            const CAmount change_value = joint_value - target;
+
+            const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+            const int tip = chain.getHeight().value_or(-1);
+
+            // Build decoy pool — exclude the joint outpoint itself.
+            auto pool = CollectChainCTOutputs(chain);
+            std::vector<ChainCTOutput> decoy_pool;
+            for (auto& c : pool) {
+                if (c.ref.hash == joint_outpoint.hash.ToUint256()
+                    && c.ref.n == joint_outpoint.n) continue;
+                decoy_pool.push_back(std::move(c));
+            }
+            if ((int)decoy_pool.size() < ring_size - 1) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                    strprintf("Not enough chain CT outputs for ring_size=%d (have %d decoys)",
+                              ring_size, (int)decoy_pool.size()));
+            }
+            FastRandomContext rng;
+            auto decoys = SampleDecoysRecencyWeighted(
+                std::move(decoy_pool), static_cast<size_t>(ring_size - 1), tip, rng);
+
+            // Insert joint output at random pi.
+            const size_t pi = rng.randrange(static_cast<uint32_t>(ring_size));
+            std::vector<ChainCTOutput> ring(ring_size);
+            for (size_t k = 0, d = 0; k < (size_t)ring_size; ++k) {
+                if (k == pi) {
+                    ring[k] = ChainCTOutput{
+                        .ref = pricoin::ct::PrevoutRef{joint_outpoint.hash.ToUint256(), joint_outpoint.n},
+                        .commitment = joint_coin.commitment,
+                        .one_time_pubkey = joint_pubkey,
+                    };
+                } else {
+                    ring[k] = decoys[d++];
+                }
+            }
+
+            // Pseudo input commitment.
+            pricoin::ct::BlindingFactor pseudo_blind;
+            GetRandBytes(pseudo_blind);
+            auto pseudo = pricoin::ct::Commitment::Create(static_cast<uint64_t>(joint_value), pseudo_blind);
+            if (!pseudo) throw JSONRPCError(RPC_INTERNAL_ERROR, "pseudo commit failed");
+
+            // z_total = joint_blind − pseudo_blind (mod n).
+            pricoin::ringsig::Scalar z_total;
+            {
+                auto neg = pricoin::ct::NegateScalar(pseudo_blind);
+                if (!neg) throw JSONRPCError(RPC_INTERNAL_ERROR, "z negate failed");
+                auto sum = pricoin::ct::AddScalars(joint_blind, *neg);
+                if (!sum) throw JSONRPCError(RPC_INTERNAL_ERROR, "z add failed");
+                std::memcpy(z_total.data(), sum->data(), 32);
+            }
+            // Random split: z_other = r, z_self = z_total − r (mod n). Retry
+            // on the (negligible-probability) case where either side hits zero.
+            pricoin::ringsig::Scalar z_self_scalar{}, z_other_scalar{};
+            for (;;) {
+                pricoin::ct::BlindingFactor r_bf;
+                GetRandBytes(r_bf);
+                pricoin::ringsig::Scalar r;
+                std::memcpy(r.data(), r_bf.data(), 32);
+                pricoin::ct::BlindingFactor neg_r;
+                {
+                    auto neg = pricoin::ct::NegateScalar(r_bf);
+                    if (!neg) continue;
+                    neg_r = *neg;
+                }
+                pricoin::ct::BlindingFactor zt_bf;
+                std::memcpy(zt_bf.data(), z_total.data(), 32);
+                auto self_bf = pricoin::ct::AddScalars(zt_bf, neg_r);
+                if (!self_bf) continue;
+                z_other_scalar = r;
+                std::memcpy(z_self_scalar.data(), self_bf->data(), 32);
+                break;
+            }
+
+            // Build outputs: dest + change + (always 3 to mirror walletsendct_ring).
+            struct PendingOut {
+                const ::pricoin::stealth::StealthAddress* stealth;
+                CAmount amount;
+            };
+            std::vector<PendingOut> pending;
+            pending.reserve(3);
+            pending.push_back({&*stealth_dest, dest_amount});
+            pending.push_back({&id.public_address, change_value});
+            while (pending.size() < 3) pending.push_back({&id.public_address, 0});
+            FastRandomContext shuffle_rng;
+            std::shuffle(pending.begin(), pending.end(), shuffle_rng);
+
+            struct ResolvedOut {
+                CScript spk;
+                ::pricoin::stealth::PointBytes R;
+                ::pricoin::ct::BlindingFactor nonce;
+                ::pricoin::ct::SerializedPubKey33 otp;
+                CAmount amount;
+            };
+            std::vector<ResolvedOut> outs;
+            outs.reserve(pending.size());
+            for (size_t i = 0; i < pending.size(); ++i) {
+                CKey r; r.MakeNewKey(true);
+                CPubKey R = r.GetPubKey();
+                ResolvedOut ro;
+                ro.amount = pending[i].amount;
+                std::memcpy(ro.R.data(), R.data(), 33);
+                auto S = ::pricoin::stealth::ECDHPoint(r, pending[i].stealth->view);
+                if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth ECDH failed");
+                auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, static_cast<uint32_t>(i));
+                auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, pending[i].stealth->spend);
+                if (!P) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth onetime failed");
+                ro.spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
+                std::memcpy(ro.otp.data(), P->data(), 33);
+                auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, static_cast<uint32_t>(i));
+                std::memcpy(ro.nonce.data(), rp_nonce.data(), 32);
+                outs.push_back(std::move(ro));
+            }
+
+            // Output blinds sum to pseudo_blind.
+            const size_t Nout = outs.size();
+            std::vector<pricoin::ct::BlindingFactor> out_blinds(Nout);
+            for (size_t i = 0; i + 1 < Nout; ++i) GetRandBytes(out_blinds[i]);
+            {
+                std::span<const pricoin::ct::BlindingFactor> other_outs{out_blinds.data(), Nout - 1};
+                auto last = pricoin::ct::BalancingBlind(
+                    std::array<pricoin::ct::BlindingFactor, 1>{pseudo_blind},
+                    other_outs);
+                if (!last) throw JSONRPCError(RPC_INTERNAL_ERROR, "blind sum failed");
+                out_blinds.back() = *last;
+            }
+
+            std::vector<pricoin::ct::CTOutput> ct_outputs;
+            ct_outputs.reserve(Nout);
+            for (size_t i = 0; i < Nout; ++i) {
+                auto commit = pricoin::ct::Commitment::Create(static_cast<uint64_t>(outs[i].amount), out_blinds[i]);
+                if (!commit) throw JSONRPCError(RPC_INTERNAL_ERROR, "output commit failed");
+                std::vector<unsigned char> spk_bytes(outs[i].spk.begin(), outs[i].spk.end());
+                auto proof = pricoin::ct::CreateRangeProof(
+                    static_cast<uint64_t>(outs[i].amount), out_blinds[i], *commit,
+                    std::span<const unsigned char>{spk_bytes}, outs[i].nonce);
+                if (!proof) throw JSONRPCError(RPC_INTERNAL_ERROR, "output rangeproof failed");
+                ct_outputs.push_back(pricoin::ct::CTOutput{
+                    *commit, *proof, std::move(spk_bytes), outs[i].R, outs[i].otp});
+            }
+
+            // Bundle.
+            pricoin::ct::CTRingInput ring_input;
+            ring_input.ring.reserve(ring_size);
+            for (const auto& m : ring) ring_input.ring.push_back(m.ref);
+            ring_input.pseudo_commitment = *pseudo;
+            // ring_input.sig stays empty — that's the whole point.
+
+            pricoin::ct::CTBundle bundle;
+            bundle.ring_inputs = {ring_input};
+            bundle.outputs = std::move(ct_outputs);
+            bundle.transparent_fee = static_cast<uint64_t>(fee);
+
+            CMutableTransaction mtx;
+            mtx.version = PRICOIN_CT_VERSION;
+            mtx.nLockTime = 0;
+            const COutPoint marker_outpoint{
+                Txid::FromUint256(ring_input.ring[0].hash), ring_input.ring[0].n};
+            mtx.vin.emplace_back(marker_outpoint, CScript{}, 0xfffffffe);
+            for (const auto& o : outs) mtx.vout.emplace_back(0, o.spk);
+            mtx.ct_bundle = std::move(bundle);
+
+            // Compute the deterministic sighash that the cooperative CLSAG
+            // must commit to (= ComputeRingMessage in validation.cpp).
+            CMutableTransaction sig_input_tx{mtx};
+            for (auto& ri : sig_input_tx.ct_bundle.ring_inputs) {
+                ri.sig = pricoin::ringsig::Signature{};
+            }
+            HashWriter hw{};
+            hw << TX_NO_WITNESS(CTransaction{sig_input_tx});
+            const uint256 sighash = hw.GetSHA256();
+
+            // Multi-layer ring members for the cooperative protocol.
+            UniValue ring_ml_arr{UniValue::VARR};
+            for (size_t k = 0; k < (size_t)ring_size; ++k) {
+                auto W = pricoin::ct::SubtractCommitments(ring[k].commitment, *pseudo);
+                if (!W) throw JSONRPCError(RPC_INTERNAL_ERROR, "W computation failed");
+                UniValue m{UniValue::VOBJ};
+                m.pushKV("P", HexStr(ring[k].one_time_pubkey));
+                m.pushKV("W", HexStr(*W));
+                ring_ml_arr.push_back(std::move(m));
+            }
+
+            // Serialise the skeleton (with empty sig).
+            DataStream ds;
+            ds << TX_WITH_WITNESS(CTransaction{std::move(mtx)});
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("tx_hex", HexStr(ds));
+            // Raw-byte hex (NOT uint256::ToString, which reverses for
+            // display); the cooperative-CLSAG RPCs interpret 32-byte hex
+            // as raw bytes, matching how validation.cpp's ComputeRingMessage
+            // consumes the sighash internally.
+            out.pushKV("sighash",
+                HexStr(std::span<const unsigned char>{sighash.data(), 32}));
+            out.pushKV("ring_ml", std::move(ring_ml_arr));
+            out.pushKV("pi", static_cast<int>(pi));
+            out.pushKV("z_self", HexStr(z_self_scalar));
+            out.pushKV("z_other", HexStr(z_other_scalar));
+            out.pushKV("joint_pubkey", HexStr(joint_pubkey));
+            return out;
+        }
+    };
+}
+
+// Atomic-swap stage 2b — inject an externally-supplied (cooperative)
+// CLSAG signature into a tx skeleton produced by buildtx and broadcast.
+RPCMethod pricoin_jointspend_submittx()
+{
+    return RPCMethod{
+        "pricoin_jointspend_submittx",
+        "Inject a cooperatively-assembled CLSAG signature into the tx skeleton\n"
+        "produced by pricoin_jointspend_buildtx and broadcast the result.\n"
+        "Returns the broadcast txid on success.\n",
+        {
+            {"tx_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Skeleton tx hex from pricoin_jointspend_buildtx"},
+            {"signature_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Hex-encoded pricoin::ringsig::Signature from pricoin_jointspend_assemble"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "txid", "Broadcast tx id"},
+                {RPCResult::Type::NUM, "size", "Final tx size with signature"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_jointspend_submittx", "<tx_hex> <signature_hex>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+
+            const std::string tx_hex = request.params[0].get_str();
+            const std::string sig_hex = request.params[1].get_str();
+
+            CMutableTransaction mtx;
+            if (!DecodeHexTx(mtx, tx_hex, /*try_no_witness=*/true, /*try_witness=*/true)) {
+                throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "tx hex failed to decode");
+            }
+            if (mtx.version != PRICOIN_CT_VERSION) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "tx is not a v4 confidential tx");
+            }
+            if (mtx.ct_bundle.ring_inputs.size() != 1) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "expected exactly one ring input (joint-spend convention)");
+            }
+
+            auto sig_bytes = TryParseHex<unsigned char>(sig_hex);
+            if (!sig_bytes) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "signature_hex invalid");
+            }
+            DataStream ds{std::span<const unsigned char>{*sig_bytes}};
+            pricoin::ringsig::Signature sig;
+            try {
+                ds >> sig;
+            } catch (const std::exception& e) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    std::string("signature deserialise failed: ") + e.what());
+            }
+
+            mtx.ct_bundle.ring_inputs[0].sig = std::move(sig);
+
+            CTransactionRef tx_ref = MakeTransactionRef(std::move(mtx));
+            std::string err_str;
+            if (!wallet.chain().broadcastTransaction(
+                    tx_ref, MAX_MONEY,
+                    node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL,
+                    err_str)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "broadcast failed: " + err_str);
+            }
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("txid", tx_ref->GetHash().ToString());
+            out.pushKV("size", (int)::GetSerializeSize(TX_WITH_WITNESS(*tx_ref)));
+            return out;
+        }
+    };
+}
+
 // Atomic-swap stage 2b — load this wallet's spend-secret share for a
 // joint stealth output. The caller will pass the returned x_share into
 // pricoin_jointspend_round1 as part of the cooperative signing
@@ -2311,6 +2723,8 @@ RPCMethod pricoin_buildjointstealthaddress_export() { return pricoin_buildjoints
 RPCMethod pricoin_jointscan_partial_export() { return pricoin_jointscan_partial(); }
 RPCMethod pricoin_jointscan_recover_export() { return pricoin_jointscan_recover(); }
 RPCMethod pricoin_jointspend_loadshare_export() { return pricoin_jointspend_loadshare(); }
+RPCMethod pricoin_jointspend_buildtx_export()   { return pricoin_jointspend_buildtx(); }
+RPCMethod pricoin_jointspend_submittx_export()  { return pricoin_jointspend_submittx(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

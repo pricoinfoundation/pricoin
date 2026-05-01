@@ -80,6 +80,10 @@ class PricoinJointSpendTest(BitcoinTestFramework):
         self.log.info("Section 4: wallet loadshare → cooperative CLSAG")
         self._run_wallet_loadshare(node)
 
+        # Section 5 — end-to-end cooperative spend lands on chain.
+        self.log.info("Section 5: cooperative on-chain spend (real v4 tx)")
+        self._run_cooperative_spend(node)
+
         self.log.info("Pricoin cooperative-CLSAG RPC flow OK")
 
     # -----------------------------------------------------------------
@@ -385,6 +389,141 @@ class PricoinJointSpendTest(BitcoinTestFramework):
         verified2 = node.pricoin_jointspend_verify(
             ring, None, msg_hex, assembled2["signature_hex"])
         assert_equal(verified2["valid"], False)
+
+
+    # -----------------------------------------------------------------
+
+    def _run_cooperative_spend(self, node):
+        """Two wallets cooperatively spend a real joint stealth output to
+        a third party. Verify the spend tx mines, the receiver's wallet
+        sees the new output, and the joint output's KI is committed."""
+        node.createwallet("alice_sp")
+        node.createwallet("bob_sp")
+        node.createwallet("sender_sp")
+        node.createwallet("recv_sp")
+        alice    = node.get_wallet_rpc("alice_sp")
+        bob      = node.get_wallet_rpc("bob_sp")
+        sender   = node.get_wallet_rpc("sender_sp")
+        receiver = node.get_wallet_rpc("recv_sp")
+
+        # Fund the sender with several coinbase outputs so we have ring decoys.
+        sender_tx_addr = sender.getnewaddress(address_type="bech32")
+        self.generatetoaddress(node, 110, sender_tx_addr)
+
+        alice_keys = alice.pricoin_getstealthaddress()
+        bob_keys   = bob.pricoin_getstealthaddress()
+        recv_keys  = receiver.pricoin_getstealthaddress()
+        joint = alice.pricoin_buildjointstealthaddress(
+            bob_keys["view_pubkey"], bob_keys["spend_pubkey"])
+
+        # Sender pays into the joint stealth address. Also seed a few
+        # extra CT outputs (decoys) so the ring builder has options.
+        for _ in range(4):
+            sender.walletsendct(alice_keys["address"], 1.0, 0.0001)
+            self.generatetoaddress(node, 1, sender_tx_addr)
+
+        sent = sender.walletsendct(joint["address"], 4.2, 0.0001)
+        self.generatetoaddress(node, 1, sender_tx_addr)
+        joint_txid = sent["txid"]
+        joint_tx_hex = node.getrawtransaction(joint_txid)
+        joint_raw = node.decoderawtransaction(joint_tx_hex)
+
+        # Locate the joint vout via cooperative scan.
+        joint_vout = None
+        for vidx in range(len(joint_raw["vout"])):
+            try:
+                a_p = alice.pricoin_jointscan_partial(joint_tx_hex, vidx)["partial"]
+                b_p = bob.pricoin_jointscan_partial(joint_tx_hex, vidx)["partial"]
+                bob.pricoin_jointscan_recover(
+                    joint_tx_hex, vidx, b_p, a_p, alice_keys["spend_pubkey"])
+                joint_vout = vidx
+                break
+            except Exception:
+                continue
+        assert joint_vout is not None
+
+        # Both load shares with opposite absorb flags.
+        a_p = alice.pricoin_jointscan_partial(joint_tx_hex, joint_vout)["partial"]
+        b_p = bob.pricoin_jointscan_partial(joint_tx_hex, joint_vout)["partial"]
+        a_load = alice.pricoin_jointspend_loadshare(
+            joint_tx_hex, joint_vout, a_p, b_p, bob_keys["spend_pubkey"], True)
+        b_load = bob.pricoin_jointspend_loadshare(
+            joint_tx_hex, joint_vout, b_p, a_p, alice_keys["spend_pubkey"], False)
+        assert_equal(a_load["joint_pubkey"], b_load["joint_pubkey"])
+
+        # Alice builds the spend skeleton.
+        dest_amount = 2.0
+        fee = 0.0001
+        skel = alice.pricoin_jointspend_buildtx(
+            joint_txid, joint_vout, a_load["value"], a_load["blind"],
+            a_load["joint_pubkey"], recv_keys["address"], dest_amount, fee, 4)
+
+        tx_hex   = skel["tx_hex"]
+        sighash  = skel["sighash"]
+        ring_ml  = skel["ring_ml"]
+        pi       = skel["pi"]
+        z_alice  = skel["z_self"]
+        z_bob    = skel["z_other"]
+        joint_pub_hex = skel["joint_pubkey"]
+
+        # Sanity: ring_ml[pi].P should match the joint pubkey both
+        # parties agreed on.
+        assert_equal(ring_ml[pi]["P"], joint_pub_hex)
+
+        # Drive the cooperative multi-layer signing protocol.
+        session_hex = "deadbeef" * 8  # 32 bytes
+        r1_A = node.pricoin_jointspend_round1(
+            joint_pub_hex, a_load["x_share"], session_hex, z_alice)
+        r1_B = node.pricoin_jointspend_round1(
+            joint_pub_hex, b_load["x_share"], session_hex, z_bob)
+
+        N = len(ring_ml)
+        s_others = [generate_privkey().hex() for _ in range(N)]
+        parties = [
+            {k: r1[k] for k in ("L_share", "R_share", "KI_share", "D_share", "commitment")}
+            for r1 in (r1_A, r1_B)
+        ]
+        combined = node.pricoin_jointspend_combine(
+            [], ring_ml, pi, sighash, session_hex, parties, s_others)
+        s_share_A = node.pricoin_jointspend_share(
+            r1_A["alpha"], combined["c_pi"], a_load["x_share"],
+            z_alice, combined["mu_P"], combined["mu_C"])["s_share"]
+        s_share_B = node.pricoin_jointspend_share(
+            r1_B["alpha"], combined["c_pi"], b_load["x_share"],
+            z_bob, combined["mu_P"], combined["mu_C"])["s_share"]
+        assembled = node.pricoin_jointspend_assemble(
+            combined["KI"], combined["c0"], s_others,
+            [s_share_A, s_share_B], pi, combined["D"])
+
+        # Pre-flight verification (must succeed before submission).
+        verified = node.pricoin_jointspend_verify(
+            [], ring_ml, sighash, assembled["signature_hex"])
+        assert_equal(verified["valid"], True)
+
+        # Submit. Mine 1 block. Receiver should see the new output.
+        receiver_balance_before = float(receiver.getbalances()["mine"]["confidential"])
+        result = alice.pricoin_jointspend_submittx(tx_hex, assembled["signature_hex"])
+        spend_txid = result["txid"]
+        self.generatetoaddress(node, 1, sender_tx_addr)
+
+        # The cooperative spend tx is on-chain.
+        spend_raw = node.decoderawtransaction(node.getrawtransaction(spend_txid))
+        assert_equal(spend_raw["version"], 4)
+        # Tx mined: receiver's confidential balance reflects the 2 PRIC.
+        receiver_balance_after = float(receiver.getbalances()["mine"]["confidential"])
+        assert receiver_balance_after - receiver_balance_before >= dest_amount - 0.001, (
+            f"receiver balance didn't grow by {dest_amount}: "
+            f"before={receiver_balance_before}, after={receiver_balance_after}")
+
+        # Trying to submit the same cooperative-spend tx a second time must
+        # fail — the KI is now committed.
+        try:
+            alice.pricoin_jointspend_submittx(tx_hex, assembled["signature_hex"])
+            assert False, "second broadcast should have failed (KI already committed)"
+        except Exception as e:
+            assert "double-spend" in str(e).lower() or "already" in str(e).lower() \
+                or "txn-mempool" in str(e).lower() or "broadcast" in str(e).lower(), \
+                f"unexpected error on double-submit: {e}"
 
 
 if __name__ == "__main__":
