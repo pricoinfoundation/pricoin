@@ -1,10 +1,13 @@
-# Adaptor-CLSAG protocol spec (revision 2 — post-review)
+# Adaptor-CLSAG protocol spec (revision 3 — post round-2 review)
 
-**Status: research draft, revision 2.** Round-1 AI review (archived
-in `doc/adaptor-clsag-review-responses.md`) flagged two BROKEN items
-in revision 1 plus several real spec gaps. This revision addresses
-them. **NOT IMPLEMENTED. Pending re-review of revision 2 before
-implementation.**
+**Status: research draft, revision 3.** Round-2 AI review (archived
+in `doc/adaptor-clsag-review-responses.md`) caught a real bug
+introduced in revision 2 — the `H_session(...)` step-challenge
+approach broke byte-compatibility with the existing CLSAG
+verifier. Revision 3 fixes it cleanly by binding SESSION through
+the *message digest* instead of the challenge hash, plus addresses
+several other real findings. **NOT IMPLEMENTED. Pending round-3
+review.**
 
 > **Standing caveat.** This document is reviewed by AI models, not
 > by a human cryptographer with publication record in adaptor
@@ -23,6 +26,36 @@ in this codebase (`pricoin/ringsig.cpp`, `pricoin/joint_ringsig.cpp`):
 3. Adaptor-signature semantics (pre-signature + adapt + extract).
 
 ## Revision history
+
+* **rev 3 (2026-05-01).** Round-2 review revisions. Highlights:
+  * **Transcript binding moved from step-challenge to message
+    digest.** Revision 2's `H_session(...)` step-challenge
+    contradicted the "byte-identical to ordinary CLSAG" claim and
+    would have produced signatures the existing verifier rejects.
+    Replaced with:
+    ```
+    msg_adaptor = H("pricoin/adaptor-clsag/msg-v1"
+                   ‖ canonical_SESSION
+                   ‖ tx_sighash)
+    ```
+    The CLSAG layer signs `msg_adaptor` using its existing
+    challenge hash (`StepChallenge` / `StepChallengeML`) without
+    modification. Adapted on-chain signatures verify against the
+    deployed `ringsig::Verify` / `ringsig::VerifyMultiLayer`
+    unchanged.
+  * **Multi-layer share-consistency DLEQs now MANDATORY.**
+    Removed the "optional" framing in §4.2; rev 2 was internally
+    inconsistent (§4.2 said optional, §5.3 said mandatory).
+  * **§6.3 atomicity rewritten as liveness-dependent.** "Holds
+    under bounded-delay, bounded-reorg, and successful-claim
+    assumptions" — matches industry-standard atomic-swap framing.
+  * **§6.1 restricts v1 to Schnorr/Taproot chains.** Adaptor-ECDSA
+    is significantly harder (Lindell-style two-party ECDSA), out
+    of scope for v1.
+  * **§2.1 SESSION uses unsigned tx-template hashes / sighashes**,
+    not txids — closes the chicken-and-egg circularity.
+  * **Rogue-key defense for joint stealth setup** added in §6.0.
+  * **Mandatory test vectors** added as §13.
 
 * **rev 2 (2026-05-01).** Round-1 review revisions. Highlights:
   * **§6 atomic-swap protocol completely rewritten.** The previous
@@ -111,27 +144,65 @@ used in `T_G` and `T_H` (without revealing `t`). Construction in
 
 ### 2.1 Session transcript and domain separation
 
-Every adaptor / ring / DLEQ challenge hash in this spec MUST bind a
-**session transcript** that includes, at minimum:
+The protocol uses a **canonical session transcript** that pins
+every parameter the parties have agreed on, so adversarial
+manipulation of any field invalidates the resulting signatures.
+The transcript binds at the **message-digest** layer (not the
+CLSAG step-challenge layer); this preserves byte-compatibility
+with the deployed `ringsig::Verify` / `ringsig::VerifyMultiLayer`.
 
 ```
-SESSION = network ‖ asset_pair ‖ role_label ‖ session_id
-        ‖ ring_hash ‖ pi ‖ msg_or_txdigest
-        ‖ KI ‖ D_or_zero
-        ‖ T_G ‖ T_H
-        ‖ pric_refund_txid ‖ pric_claim_txid
-        ‖ foreign_refund_txid ‖ foreign_claim_txid
+SESSION = "pricoin/adaptor-clsag/v1"
+        ‖ network                 (bytes)
+        ‖ asset_pair              (bytes, e.g., "pric/btc")
+        ‖ role_label              (bytes, "buyer-pric" | "seller-pric")
+        ‖ session_id              (32 bytes, random, agreed at setup)
+        ‖ ring_hash               (32 bytes, SHA256 of canonical ring)
+        ‖ pi                      (uint32 LE)
+        ‖ KI                      (33 bytes)
+        ‖ D_or_zero               (33 bytes; all-zero for single-layer)
+        ‖ T_G                     (33 bytes)
+        ‖ T_H                     (33 bytes)
+        ‖ pric_claim_template     (32 bytes, hash of unsigned pric-claim
+                                  tx template — outputs, locktimes,
+                                  amounts, scripts; NO sig fields)
+        ‖ pric_refund_template    (32 bytes, same form)
+        ‖ foreign_claim_template  (32 bytes, same form)
+        ‖ foreign_refund_template (32 bytes, same form)
+        ‖ pric_refund_locktime    (uint64 LE)
+        ‖ foreign_refund_locktime (uint64 LE)
 ```
 
-with explicit byte-length prefixes between fields and ASCII tag
-prefixes (e.g., `"pricoin/adaptor-clsag/v1"`) to prevent
-cross-protocol confusion. `H_session(label, payload)` =
-`SHA256(tag ‖ label ‖ SESSION ‖ payload)` with `tag` being a
-per-call literal (e.g., `"dleq-challenge-v1"`,
-`"step-challenge-v1"`).
+**Crucial fix (rev 3).** All template fields are hashes of
+**unsigned** transaction templates — outputs, locktimes, amounts,
+scripts. They explicitly do NOT include the signature or witness
+fields, so they don't depend on the signatures we're about to
+produce (no chicken-and-egg). Templates are sufficient to bind
+the swap intent without circularity. Round-2 reviewer Q1.
 
-This is the structural requirement raised by Findings A, B, F in
-the round-1 review.
+The canonical SESSION must be agreed and signed/acknowledged by
+all participants **before round 1** of any cooperative protocol.
+Any field change after round 1 invalidates all produced commitments
+and proofs.
+
+`H_session(label, payload)` = `SHA256(label ‖ SESSION ‖ payload)`
+where `label` is a per-call literal (e.g.,
+`"dleq-challenge-v1"`, `"nonce-commit-ml-v2"`,
+`"s-others-derivation-v1"`). Used for off-chain helper hashes
+(DLEQ challenge, nonce commitments, deterministic `s_others`).
+
+For the **on-chain CLSAG signature**, SESSION is bound through
+the message digest, NOT the step challenge:
+```
+msg_adaptor = H("pricoin/adaptor-clsag/msg-v1" ‖ SESSION
+              ‖ tx_sighash)
+```
+where `tx_sighash` is the standard sighash of the spending
+transaction. The CLSAG layer signs `msg_adaptor` exactly as it
+signs any other 32-byte digest. Adapted signatures verify against
+the deployed `ringsig::Verify(ring, sig, msg_adaptor)` /
+`ringsig::VerifyMultiLayer(ring, sig, msg_adaptor)` without any
+verifier changes. **Round-2 reviewer Finding A — fixed.**
 
 ## 3. Single-party adaptor-CLSAG (single-layer)
 
@@ -185,31 +256,33 @@ SESSION prevents replay across sessions/chains/roles.
 
 **Steps:**
 1. Verify `π_t` against `(T_G, T_H)` per §3.0a. If invalid, abort.
-2. Sample nonce `α ← R`.
-3. Compute `L_pi = α · G`, `R_pi = α · H_p(P_pi)`.
-4. Compute the *shifted* anchors:
+2. Compute `msg_adaptor = H("pricoin/adaptor-clsag/msg-v1" ‖
+   SESSION ‖ tx_sighash)`. SESSION binding lives here, **not** in
+   the step challenge.
+3. Sample nonce `α ← R`.
+4. Compute `L_pi = α · G`, `R_pi = α · H_p(P_pi)`.
+5. Compute the *shifted* anchors:
      `L'_pi = L_pi + T_G`
      `R'_pi = R_pi + T_H`
    Reject if either is the point at infinity.
-5. Compute the key image `KI = x_pi · H_p(P_pi)`.
-6. Walk the ring as in standard CLSAG, but:
-   - At index `pi`, use `L'_pi` and `R'_pi` as the anchors (NOT
-     the un-shifted `L_pi, R_pi`).
-   - Every step-challenge hash binds the full SESSION:
+6. Compute the key image `KI = x_pi · H_p(P_pi)`.
+7. Walk the ring using **the existing CLSAG step-challenge
+   function** with `msg = msg_adaptor`. At index `pi`, anchor on
+   `L'_pi, R'_pi` (NOT `L_pi, R_pi`):
      ```
-     c_{pi+1} = H_session("step-challenge-v1",
-                          ring ‖ msg ‖ L'_pi ‖ R'_pi ‖ KI)
+     c_{pi+1} = StepChallenge(ring, msg_adaptor, L'_pi, R'_pi, KI)
      ```
-     For `i = pi+1, …, pi-1` (mod N):
+   For `i = pi+1, …, pi-1` (mod N):
      ```
      s_i ← deterministic (see §4.1 for cooperative case;
                           single-party can sample fresh)
      L_i = s_i · G + c_i · P_i
      R_i = s_i · H_p(P_i) + c_i · KI
-     c_{i+1} = H_session("step-challenge-v1",
-                          ring ‖ msg ‖ L_i ‖ R_i ‖ KI)
+     c_{i+1} = StepChallenge(ring, msg_adaptor, L_i, R_i, KI)
      ```
-7. Compute the closing scalar:
+   `StepChallenge` is the existing function in
+   `pricoin::ringsig` — no changes.
+8. Compute the closing scalar:
      `ŝ_pi = α - c_pi · x_pi   (mod n)`
 
 **Pre-signature object** (off-chain, between cooperating parties):
@@ -226,7 +299,9 @@ is byte-identical in shape to a normal CLSAG.
 
 The verifier holds the pre-sig object and SESSION. They check:
 1. Verify `π_t` against `(T_G, T_H)`.
-2. Walk the ring N steps, starting from `c_0`. At each step:
+2. Recompute `msg_adaptor` from SESSION + tx_sighash and confirm
+   it matches the value the prover used.
+3. Walk the ring N steps, starting from `c_0`. At each step:
    ```
    L_i = s_i · G + c_i · P_i             (where s_pi := ŝ_pi)
    R_i = s_i · H_p(P_i) + c_i · KI
@@ -238,10 +313,9 @@ The verifier holds the pre-sig object and SESSION. They check:
    ```
    Then:
    ```
-   c_{i+1} = H_session("step-challenge-v1",
-                        ring ‖ msg ‖ L_i ‖ R_i ‖ KI)
+   c_{i+1} = StepChallenge(ring, msg_adaptor, L_i, R_i, KI)
    ```
-3. Accept iff `c_N == c_0`.
+4. Accept iff `c_N == c_0`.
 
 The verifier MUST know `pi` (it's in the pre-sig object). This
 leaks `pi` to the off-chain receiver — acceptable because in the
@@ -266,13 +340,14 @@ bogus, or implementation bug).
 
 ### 3.4 Standard verification of the adapted signature
 
-The on-chain signature is standard CLSAG. Recompute the walk with
-`s_pi` substituted for `ŝ_pi` and **no shift** at any index:
+The on-chain signature is **byte-identical in shape** to a normal
+CLSAG. The verifier is the deployed `pricoin::ringsig::Verify(ring,
+sig, msg_adaptor)` — no adaptor-specific code path. Standard
+CLSAG verification computes:
 ```
 L_i = s_i · G + c_i · P_i
 R_i = s_i · H_p(P_i) + c_i · KI
-c_{i+1} = H_session("step-challenge-v1",
-                    ring ‖ msg ‖ L_i ‖ R_i ‖ KI)
+c_{i+1} = StepChallenge(ring, msg_adaptor, L_i, R_i, KI)
 ```
 
 At index `pi`:
@@ -369,25 +444,46 @@ combiner sums to `ŝ_pi = Σ ŝ_share_X`.
 **Pre-signature object** (as in §3.1) plus the `(T_G, T_H, π_t)`
 tuple. The full SESSION must be archived alongside.
 
-### 4.2 Cooperative-share consistency (optional hardening)
+### 4.2 Cooperative-share consistency DLEQs
 
-The protocol above is **abort-only secure**: a malformed share by
-party X causes the cooperative signature to fail verification, but
-no honest party loses funds. This is acceptable for the swap
-ceremony's threat model (Bob just doesn't get paid; he refunds).
+**Round-2 review:** revision 2 was internally inconsistent —
+§4.2 said "optional", §5.3 said "mandatory in multi-layer". This
+revision picks one consistent answer:
 
-For **identifiable abort** — proving on-chain that party X
-misbehaved — each party should also publish DLEQ proofs that:
-* `L_share_X` and `R_share_X` use the same `α_X` (across `G` and
-  `H_p(P_pi)`).
-* `(x_X · G)` (their public spend share, known from setup) and
-  `KI_share_X` use the same `x_X` (across `G` and `H_p(P_pi)`).
+* **For single-layer adaptor signing**, share-consistency DLEQs
+  are **OPTIONAL** in v1. A malformed share causes the
+  cooperative signature to fail — abort-only safety. Acceptable
+  for small-value prototypes where the threat model is "the
+  counterparty might disconnect" rather than "the counterparty
+  will mount sophisticated cryptographic attacks."
 
-Both are standard Chaum-Pedersen DLEQs of the form in §3.0a. Adds
-two DLEQ proofs per party per session.
+* **For multi-layer adaptor signing**, share-consistency DLEQs
+  are **MANDATORY**. See §5.2 for the reason: without them, a
+  malicious party can grind their `KI_share, D_share` to bias µ,
+  reopening the µ-aggregation attack surface. This isn't
+  hypothetical-attack-deterrence; the µ argument doesn't close
+  without these proofs.
 
-For v1, abort-only is enough; identifiable abort is a future
-hardening for when reputation/slashing exists (phase 7).
+**The proofs.** Each party X publishes:
+
+* DLEQ-1: `L_share_X = α_X · G` and `R_share_X = α_X · H_p(P_pi)`
+  use the same `α_X`. Standard Chaum-Pedersen (§3.0a) over
+  generators `(G, H_p(P_pi))` and points `(L_share_X, R_share_X)`.
+* DLEQ-2: `X_pub_X = x_X · G` (the party's pre-committed public
+  spend share, fixed at swap setup) and `KI_share_X = x_X ·
+  H_p(P_pi)` use the same `x_X`. Same form.
+* DLEQ-3 (multi-layer only): `Z_pub_X = z_X · G` and `D_share_X
+  = z_X · H_p(P_pi)` use the same `z_X`. Same form.
+
+All DLEQs bind the canonical SESSION via `H_session(...)`.
+
+For abort-only single-layer use, the proofs are skipped; if
+a counterparty's share is malformed, the joint signature simply
+fails verification and no funds move. This is safe but not
+identifiable.
+
+Identifiable abort (proving on-chain that party X misbehaved) is
+deferred to phase 7's reputation/slashing infrastructure.
 
 ### 4.3 Adapt + Extract
 
@@ -410,7 +506,10 @@ In multi-layer:
   `W_pi = z_pi·G`.
 * `KI = x_pi · H_p(P_pi)`, `D = z_pi · H_p(P_pi)` are both
   published.
-* `µ_P = H_session("agg-P-v2", ring ‖ KI ‖ D)`, similarly `µ_C`.
+* `µ_P, µ_C` derive exactly as in the existing
+  `pricoin::ringsig::SignMultiLayer` (`MultiLayerMu` —
+  `H_s(tag ‖ ring ‖ KI ‖ D)` with separate tags for P and C).
+  No adaptor-specific changes.
 * Aggregated ring: `T_i = µ_P · P_i + µ_C · W_i`.
 * Aggregated priv at pi: `a = µ_P · x_pi + µ_C · z_pi`.
 * Aggregated image: `I_agg = µ_P · KI + µ_C · D = a · H_p(P_pi)`.
@@ -421,12 +520,11 @@ For the adaptor variant, shift `L_pi` and `R_pi` by `T_G`, `T_H`
 * `L'_pi = L_pi + T_G`
 * `R'_pi = R_pi + T_H`
 
-Walk uses `L'_pi`, `R'_pi`, and step challenges depend on
-`(KI, D)`:
-```
-c_{i+1} = H_session("step-ml-v2",
-                    ring ‖ msg ‖ L_i ‖ R_i ‖ KI ‖ D)
-```
+Walk uses `L'_pi`, `R'_pi`, and the existing
+`StepChallengeML(ring, msg_adaptor, L_i, R_i, KI, D)` from
+`pricoin::ringsig` — no changes to the multi-layer challenge
+function. SESSION binding is at the message-digest layer
+(§2.1).
 
 Closing: `ŝ_pi = α - c_pi · a`.
 
@@ -439,15 +537,21 @@ round-trips. ✓
 
 ### 5.2 Cooperative multi-layer
 
-Same as §4.1 but each party holds shares of BOTH `x` and `z`. The
-NonceCommit MUST bind `D_share` in addition to `KI_share` —
-**reviewer Section 4 hazard #9, not in current cooperative code.**
-Update:
-```
-commit_X = H_session("nonce-commit-ml-v2",
-                     L_share_X ‖ R_share_X
-                  ‖ KI_share_X ‖ D_share_X)
-```
+Same as §4.1 but each party holds shares of BOTH `x` and `z`. Two
+mandatory differences:
+
+1. **NonceCommit binds `D_share`** in addition to `L_share,
+   R_share, KI_share`. Existing `joint_ringsig.cpp::NonceCommit`
+   doesn't, and **must be updated** before any adaptor multi-
+   layer code uses it. Round-2 reviewer hazard #6.
+   ```
+   commit_X = H_session("nonce-commit-ml-v2",
+                        L_share_X ‖ R_share_X
+                     ‖ KI_share_X ‖ D_share_X)
+   ```
+2. **Share-consistency DLEQs (§4.2) are mandatory**, not optional.
+   Each party publishes DLEQ-1, DLEQ-2, DLEQ-3 alongside their
+   round-2 reveal.
 
 The aggregated priv share: `a_share_X = µ_P · x_X + µ_C · z_X`.
 Closing share: `ŝ_share_X = α_X - c_pi · a_share_X`.
@@ -473,55 +577,101 @@ manipulate `µ` may obtain attack surface. Round-1 review found
 no concrete counter-example but flagged this as the weakest part
 of the spec.
 
-**Mitigation in this revision:** §4.2's cooperative-share
-consistency proofs (DLEQs tying x_X·G to x_X·H_p(P_pi), and
-z_X·G to z_X·H_p(P_pi)) eliminate the grinding surface — once
-each party's `KI_share, D_share` is provably consistent with
-their public spend / commitment shares (which were committed
-at swap setup, before `t` was chosen), no party can manipulate
-`µ` adversarially. The optional hardening becomes mandatory for
-multi-layer adaptor signing.
+**Mitigation (mandatory in revision 3):** §5.2's share-consistency
+DLEQs (DLEQ-2 ties `x_X · G` to `KI_share_X = x_X · H_p(P_pi)`;
+DLEQ-3 ties `z_X · G` to `D_share_X = z_X · H_p(P_pi)`) close the
+grinding surface. Each party's contribution to `(KI, D)` is
+proved consistent with their public shares, which were committed
+at swap setup before `t` was chosen. No party can manipulate `µ`
+adversarially — they can only DoS the protocol (which the abort
+path handles).
 
-## 6. Atomic-swap protocol (revision 2)
+**Round-2 reviewer Q4:** "I do not see a way to make extraction
+fail with mandatory share-consistency DLEQs and precommitted
+shares" — the spec now requires both. Q4 still flagged for a
+human cryptographer's formal proof if/when value scales up.
 
-This section was rewritten end-to-end after round-1 review found
-the previous SHA-256-HTLC-on-BTC + adaptor-CLSAG-on-PRIC
-construction unverifiable (Finding B). The fix is to use **adaptor
-signatures on both legs**, sharing the same scalar `t`.
+## 6. Atomic-swap protocol (revision 3)
 
-### 6.1 Foreign-chain leg: adaptor-Schnorr or adaptor-ECDSA
+Section rewritten end-to-end across two review rounds. Round 1
+caught the SHA-256-HTLC + adaptor-scalar binding gap; round 2
+caught the timelock direction error and demanded a tighter
+atomicity-claim phrasing. This revision incorporates both.
 
-The foreign chain is BTC, LTC, or another Bitcoin-derived chain.
+### 6.0 Joint-stealth setup: rogue-key defense
 
-**Post-taproot chains (BTC since 2021, LTC since 2024):** use
-**adaptor-Schnorr** on a P2TR output. The output is a 2-of-2
-MuSig2-aggregated key `P_AB = MuSig2(P_A, P_B)`. The spend tx is
-pre-signed cooperatively as a Schnorr adaptor signature with
-adaptor scalar `t`. Standard, well-studied construction (Aumayr et
-al. ASIACRYPT 2021 for the abstraction; Nick-Ruffing-Seurin
-Crypto 2021 for the MuSig2 multi-sig layer). Implementation
-references: `secp256k1-zkp` (already a dependency of this
-project) has `secp256k1_ecdsa_adaptor_*` and Schnorr adaptor
-helpers; rust-secp256k1's `adaptor` module is the reference.
+The cooperative joint-stealth construction in
+`pricoin::joint_stealth` adds Alice's and Bob's spend pubkeys
+additively: `B_J = B_A + B_B`. In a plain additive multisig with
+unbounded share selection, this is vulnerable to rogue-key
+attacks: after seeing `B_A`, an attacker can pick
+`B_B' = B_B - B_A` so that `B_J = B_B'`, giving them sole
+control of the joint key. Round-2 reviewer Finding B.
 
-**Pre-taproot chains (legacy BTC P2WSH/P2WPKH, DOGE, BCH non-Schnorr
-paths):** use **adaptor-ECDSA** on a 2-of-2 P2WSH multisig. ECDSA
-adaptors are less elegant than Schnorr (require Paillier or
-class-group commitments — see Lindell-style two-party ECDSA) but
-are deployed in production by Farcaster, COMIT, and others.
+**Defense (mandatory for trustless atomic swaps):** the joint-
+stealth setup MUST use one of:
 
-The existing `src/swap/btc_htlc.cpp` primitive in this codebase
-implements the **plain SHA-256 HTLC** approach. **It is suitable
-only for trust-based swaps** (e.g., friends-and-family, or systems
-with external slashing). It is NOT suitable as the foreign-chain
-leg of a trustless atomic swap as designed in this revision. We
-keep `btc_htlc.cpp` as-is for its existing trust-based use, but a
-new module — `src/swap/btc_adaptor_schnorr.cpp` and possibly
-`src/swap/btc_adaptor_ecdsa.cpp` — is needed for trustless swaps.
+1. **Proof of possession.** Each party publishes a Schnorr
+   signature on a fixed-format challenge `H("pricoin/joint-
+   stealth/PoP-v1" ‖ session_id ‖ counterparty_pub)` using their
+   spend privkey. Counterparty verifies before computing `B_J`.
+   This is the simplest fix and is what we'll implement.
 
-That work is **out of scope for this spec**; this spec covers only
-the PRIC-side adaptor primitive. The foreign-chain spec lives in
-a separate document (TBD: `doc/btc-adaptor.md`) once we get there.
+2. **Commit-before-reveal.** Both parties commit to their pubkey
+   hashes first; reveal the actual pubkeys only after both
+   commitments are exchanged. Prevents the after-the-fact pubkey
+   selection.
+
+3. **Coefficient-weighted (MuSig-style) aggregation.**
+   `B_J = h_A · B_A + h_B · B_B` where `h_X = H(B_A ‖ B_B ‖ X)`
+   bind each party's contribution to both pubkeys. Heaviest fix;
+   changes the joint-stealth wire format. Out of scope for v1.
+
+**Decision: option 1 (proof of possession).** Wallet-side helper:
+both parties exchange `(B_X, sig_X)` where `sig_X` is a Schnorr
+signature on the PoP challenge under `B_X`. Verifying the PoP
+before constructing the joint address blocks the `B_B' = B_B -
+B_A` rogue-key attack. The existing `pricoin_buildjointstealthaddress`
+RPC must be extended with a PoP requirement before use in any
+adaptor swap — this is a **must-do before atomic-swap implementation**.
+
+### 6.1 Foreign-chain leg — Schnorr/Taproot only in v1
+
+The foreign chain (BTC, LTC, or another Bitcoin-derived chain)
+must support **adaptor-Schnorr signatures**. In practice this
+means **post-taproot mainnets only**:
+
+* BTC mainnet: taproot active since November 2021. ✓
+* LTC mainnet: taproot active since 0.21.4 (May 2024). ✓
+* DOGE: no taproot. ✗ — out of scope for v1.
+* BCH: Schnorr (non-taproot) since 2019; possible but uses a
+  different output format. Out of scope for v1.
+
+**Construction.** The output is a 2-of-2 MuSig2-aggregated P2TR
+key `P_AB = MuSig2(P_A, P_B)`. The spend tx is pre-signed
+cooperatively as a Schnorr adaptor signature with adaptor scalar
+`t`. References: Aumayr et al. ASIACRYPT 2021 for the adaptor
+abstraction; Nick-Ruffing-Seurin Crypto 2021 for the MuSig2
+multi-sig layer. Implementation reference:
+[`rust-secp256k1`'s `adaptor` module](https://github.com/RustCrypto/elliptic-curves)
+or `secp256k1-zkp`'s `schnorrsig_adaptor_*` (already a
+dependency of this project).
+
+**Adaptor-ECDSA explicitly deferred.** ECDSA adaptors require
+Lindell-style two-party ECDSA + Paillier or class-group
+commitments. Round-2 reviewer Finding F + hazard #20: too much
+extra crypto + new assumptions for v1. A separate spec document
+will cover them when (if) v2 expands chain coverage.
+
+**Status of existing primitives.** `src/swap/btc_htlc.cpp`
+implements **plain SHA-256 HTLC** — explicitly NOT suitable as
+the foreign-chain leg of a trustless atomic swap (see round-1
+Finding B, fixed by switching to Schnorr adaptors). It remains
+useful for **trust-based swaps only** (friends-and-family,
+slashing-deposit systems). A new module
+`src/swap/btc_adaptor_schnorr.cpp` is required before any
+trustless atomic-swap code uses the foreign leg. Out of scope for
+this spec; tracked as a separate phase-5 deliverable.
 
 ### 6.2 The protocol
 
@@ -606,47 +756,86 @@ a separate document (TBD: `doc/btc-adaptor.md`) once we get there.
   Bob can broadcast `tx_foreign_refund` after `T_foreign_refund`.
   Foreign coin returns to Bob.
 
-### 6.3 Atomicity argument (revision 2)
+### 6.3 Atomicity argument (revision 3)
 
-**Bob's strategies.**
+**Headline claim (rev 3 — revised after round-2 review):**
+atomicity holds **under bounded-delay, bounded-reorg, and
+successful-claim assumptions**. Specifically:
 
-* Bob refuses to participate after step 4: PRIC is still locked.
-  Alice refunds at `T_pric_refund`. Bob refunds foreign coin at
-  `T_foreign_refund`. Both end where they started.
-* Bob completes pre-sig 1 (step 8): PRIC moves to Bob; `t` revealed
-  on PRIC chain. Alice extracts and claims foreign coin (she has
-  `T_foreign_refund - T_pric_refund > δ` time, by the timelock
-  constraint). Both win.
-* Bob does NOT complete pre-sig 1 but waits past `T_pric_refund`:
-  At `T_pric_refund`, Alice refunds PRIC. The PRIC joint output
-  is gone; Bob's pre-sig 1 is now a double-spend attempt and
-  invalid. Bob has no claim on PRIC. Bob refunds foreign coin at
-  `T_foreign_refund`. Both end at start.
-* **Crucial scenario from revision-1 break:** Bob refunds foreign
-  coin at `T_foreign_refund`, then attempts to complete pre-sig 1.
-  This is now blocked by the timelock direction: `T_foreign_refund
-  > T_pric_refund + δ`, so by the time Bob can refund foreign,
-  Alice has already refunded PRIC, and the joint output is gone.
-  Bob's pre-sig 1 is invalid. **Theft vector closed.**
+> Given that Alice's wallet is online, monitors the PRIC chain,
+> and can confirm her foreign-chain claim within δ blocks of Bob
+> revealing `t` (where δ is calibrated to the foreign chain's
+> reorg depth and worst-case fee/confirmation conditions during
+> the swap window), no party can be strictly worse off than their
+> starting position without their counterparty also losing.
 
-**Alice's strategies.**
+This is the same liveness-dependent atomicity claim as every
+practical atomic-swap protocol (Bisq, Farcaster, COMIT,
+submarine swaps). It is NOT absolute atomicity under arbitrary
+network conditions. Round-2 reviewer Q7 + Finding E.
 
-* Alice doesn't lock PRIC after step 3 (Bob locks foreign first):
-  Alice has done nothing. Bob refunds foreign coin at
-  `T_foreign_refund`. No loss to either.
-* Alice can't complete step 9 (Bob has already revealed `t`):
-  Alice has lost PRIC. She knew `t` was being revealed but couldn't
-  act. Bob refunds foreign coin (no, wait — Bob has PRIC; Alice
-  was supposed to claim foreign with `t`).
-  In this case, Alice has lost PRIC with no recourse. **This is
-  the residual liveness risk.** Mitigations: long enough δ; auto-
-  retry on the PRIC node; Alice's wallet must be online during
-  the swap window.
+**Watcher-model requirements.** For the atomicity claim to hold,
+Alice's wallet (or her swap-coordinator service) must:
 
-**Conclusion.** Modulo the residual liveness risk for Alice,
-no party can be strictly worse off than start without their
-counterparty also losing. This is the standard atomic-swap
-guarantee.
+1. **Persist the cooperative pre-signatures.** If the wallet is
+   destroyed mid-swap, Alice cannot complete the foreign-claim
+   leg even if `t` is revealed.
+2. **Monitor the PRIC chain** for `tx_pric_claim` (the spend that
+   reveals `t`) at least once per `T_pric_refund - now` interval.
+3. **Have foreign-chain wallet keys + funded-fee inputs** ready
+   to broadcast `tx_foreign_claim` on demand.
+4. **Implement fee-bumping** (CPFP / RBF) on the foreign chain
+   in case fees spike during the claim window.
+5. **Tolerate reorgs up to depth `D_reorg`** on both chains —
+   `δ` must exceed `D_reorg + safety_margin` blocks at the
+   foreign chain's expected block rate.
+
+A concrete starting calibration (BTC at 10-min blocks; PRIC at
+180-sec blocks):
+```
+T_pric_refund    = funding_height + 480 PRIC blocks  (~24 hours)
+T_foreign_refund = T_pric_refund_walltime + 48 hours
+                 ~ +288 BTC blocks beyond T_pric_refund
+                 — gives δ ≈ 144 BTC blocks (~24 hours) for Alice
+                   to claim foreign coin.
+D_reorg          = 6 BTC blocks (standard); δ ≫ D_reorg ✓
+```
+
+**Strategy tree (Bob's options).** Same as rev 2 but with the
+liveness assumption made explicit:
+
+* Bob refuses to participate: both refund. No loss.
+* Bob completes `tx_pric_claim`: Alice extracts `t`, claims
+  foreign. **Liveness assumption:** Alice's claim confirms
+  before `T_foreign_refund`. If it doesn't, Alice has lost PRIC.
+* Bob waits past `T_pric_refund` without completing: Alice
+  refunds PRIC. Bob's pre-sig is now a double-spend attempt —
+  invalid. Bob refunds foreign coin at `T_foreign_refund`.
+* **Closed vs revision 1:** Bob cannot refund foreign coin at
+  `T_foreign_refund` and *then* claim PRIC. By the timelock
+  constraint, `T_foreign_refund > T_pric_refund + δ`, so by the
+  time Bob can refund foreign, Alice has already refunded PRIC
+  and the joint output is gone.
+
+**Strategy tree (Alice's options).**
+
+* Alice doesn't lock PRIC: Bob refunds foreign coin. No loss.
+* Alice fails to complete `tx_foreign_claim` after `t` is revealed:
+  she has lost PRIC. **This is the residual liveness risk.** It
+  cannot be eliminated without a stronger model (e.g., on-chain
+  watchtower service with slashing). v1 documents the
+  requirement; v2 may add watchtower support.
+
+**What "atomic" means here.** The protocol provides:
+* No party can lose funds while their counterparty also loses
+  nothing (no asymmetric theft).
+* Bob's BTC-refund-then-claim-PRIC scam from rev 1 is closed.
+* The residual risk is concentrated on Alice's *availability*:
+  if she's online and her transactions confirm, she gets her
+  target asset; if not, she may lose her source asset.
+
+This is the standard atomic-swap guarantee, not a defect of this
+specific protocol.
 
 ## 7. Security claims
 
@@ -839,3 +1028,95 @@ suggested names, transferred verbatim:
 
 These recommendations are pointers, not endorsements — confirm
 current availability and engagement terms directly.
+
+## 13. Mandatory test vectors
+
+Round-2 reviewer Section 6 #8: implementation must include test
+vectors that catch each known sign / hash / composition error.
+The implementation pull request **MUST** include passing tests
+for every item below. Failure of any test is a release blocker.
+
+### 13.1 Math vectors
+
+* **TV-M1: Single-layer adapt/extract round-trip.** Generate a
+  pre-sig + adaptor pair, Adapt, verify on-chain compatibility,
+  Extract, confirm `t · G == T_G ∧ t · H_p(P_pi) == T_H`.
+* **TV-M2: Multi-layer adapt/extract round-trip.** Same flow
+  with µ-aggregated 2-row signing.
+* **TV-M3: Single-party Adapt-with-wrong-sign.** Implementation
+  computes `s_pi = ŝ_pi - t` (sign flip). Resulting signature
+  MUST fail standard CLSAG verification.
+* **TV-M4: Single-party Extract-with-wrong-sign.** Compute
+  `t' = ŝ_pi - s_pi` (flipped). Verify `t' · G != T_G` — test
+  catches it.
+* **TV-M5: Wrong T_H base.** Construct a pre-sig with
+  `T_H = t · I_agg` instead of `t · H_p(P_pi)` (a likely
+  implementation slip in multi-layer). Confirm pre-sig
+  verification fails.
+* **TV-M6: Adapted signature under standard CLSAG verifier.**
+  After Adapt, run `pricoin::ringsig::Verify` /
+  `VerifyMultiLayer` with `msg_adaptor` as the message. Must
+  pass — confirms byte-compatibility (round-2 Finding A check).
+
+### 13.2 DLEQ vectors
+
+* **TV-D1: Honest DLEQ verifies.** `(T_G, T_H, π_t)` produced
+  with same `t`. Verifier accepts.
+* **TV-D2: Mismatched DLEQ rejected.** `T_G = t · G`, `T_H = t' ·
+  H_p(P_pi)` for `t' ≠ t`. Verifier rejects.
+* **TV-D3: DLEQ replay rejected.** Take `(T_G, T_H, π_t)` from
+  session A; submit in session B (different `session_id` /
+  `ring`). Verifier rejects (transcript binding).
+* **TV-D4: Malformed DLEQ rejected.** `A_G = ∞`, `z = 0`, or
+  invalid encoding. Verifier rejects.
+
+### 13.3 Cooperative vectors
+
+* **TV-C1: Honest 2-party cooperative single-layer adapt.** Both
+  parties contribute correctly. Result verifies; Extract works.
+* **TV-C2: Honest 2-party cooperative multi-layer adapt.** Same
+  with multi-layer + share-consistency DLEQs.
+* **TV-C3: Multi-layer NonceCommit must bind D_share.** Construct
+  a session where party-B's `D_share` differs at commit-time vs
+  reveal-time. Combine MUST reject (existing
+  `joint_ringsig.cpp::NonceCommit` doesn't include `D_share` —
+  test confirms the upgrade landed).
+* **TV-C4: Malformed `KI_share` rejected (multi-layer mandatory).**
+  Party-B publishes `KI_share_B = x_B' · H_p(P_pi)` for `x_B' ≠
+  x_B`. Their DLEQ-2 must fail; combine rejects.
+* **TV-C5: Malformed `D_share` rejected (multi-layer mandatory).**
+  Party-B publishes `D_share_B` inconsistent with `Z_pub_B`.
+  DLEQ-3 fails; combine rejects.
+* **TV-C6: Single-layer abort-only mode.** With share-consistency
+  DLEQs disabled, malformed shares cause Verify to fail (not
+  identifiable but safe). Confirms abort-only safety claim.
+
+### 13.4 Rogue-key vectors
+
+* **TV-R1: Joint-stealth PoP required before swap.** A counterparty
+  presenting `B_B' = B_B - B_A` (rogue) without a valid PoP
+  signature is rejected by the joint-stealth setup helper.
+* **TV-R2: PoP replay across sessions rejected.** PoP signature
+  for session A replayed into session B fails (challenge binds
+  `session_id`).
+
+### 13.5 Watcher-model simulation
+
+* **TV-W1: Bob refunds foreign first.** Simulate the rev-1 attack:
+  Bob refunds foreign at `T_foreign_refund`, then attempts to
+  publish `tx_pric_claim`. With rev-3 timelocks (`T_foreign_refund
+  > T_pric_refund + δ`), Alice has already refunded PRIC and Bob's
+  pre-sig is invalid. Test confirms.
+* **TV-W2: Alice timeout.** Simulate Alice failing to claim
+  foreign coin within δ. Verify Alice loses PRIC (residual
+  liveness risk). Documents the protocol's stated guarantee.
+
+### 13.6 Compatibility vectors
+
+* **TV-X1: Existing CLSAG signatures still verify after
+  introducing adaptor code.** Run all existing
+  `feature_pricoin_ct.py` and `feature_pricoin_jointspend.py` tests
+  unchanged. No regression.
+* **TV-X2: `msg_adaptor`-signed CLSAG verifies under deployed
+  `Verify` / `VerifyMultiLayer`.** Pure compatibility check;
+  TV-M6 covers it explicitly.

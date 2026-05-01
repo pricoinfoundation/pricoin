@@ -210,3 +210,149 @@ Concrete revisions:
 > Final verdict: the adaptor-CLSAG primitive is worth continuing,
 > but the current atomic-swap spec should fail review until the
 > timelock and BTC-hash/adaptor-secret binding issues are fixed.
+
+---
+
+## Round 2, response 1 — 2026-05-01
+
+Run against revision 2 of `doc/adaptor-clsag.md` (post-round-1
+revisions). Verdict: not ready to implement as written. Most
+serious finding: revision 2 introduced a transcript / challenge-
+hash mismatch — `§3.4` and `§5.1` use `H_session(...)` step
+challenges, but the existing CLSAG verifier hashes
+`(ring, msg, L, R, KI, D)` with no SESSION. As written, adapted
+signatures wouldn't be byte-compatible with the deployed verifier.
+
+### Headline findings
+
+1. **Spec/code challenge-hash mismatch (Finding A).** SESSION must
+   be bound through the **message digest** the CLSAG signs, not
+   into the step-challenge hash. Recommended construction:
+   ```
+   msg_adaptor = H("pricoin/adaptor-clsag/msg-v1"
+                  || canonical_SESSION
+                  || tx_sighash)
+   ```
+   Then `ringsig::VerifyMultiLayer(ring, sig, msg_adaptor)` works
+   unchanged.
+
+2. **Atomicity is liveness-dependent, not absolute (§6.3).** The
+   guarantee should be phrased as: holds under bounded-delay,
+   bounded-reorg, and successful-claim assumptions, with Alice
+   monitoring PRIC and able to confirm her foreign claim within
+   δ after Bob reveals t. Industry-standard for atomic swaps,
+   but the rev-2 prose was overstated.
+
+3. **µ-aggregation × adaptor (Q4).** No concrete counter-example,
+   but informal argument leans heavily on share-consistency DLEQs
+   being mandatory in the cooperative multi-layer setting. Rev 2
+   is ambiguous (§4.2 says "optional", §5.3 says "mandatory in
+   multi-layer"); rev 3 should pick one.
+
+### Q1–Q9 verdicts (rev 2)
+
+* **Q1 — transcript binding:** CONCERN. Two issues: (a) txid
+  circularity — pre-sig hash inputs can't include final txids
+  because txid depends on signature, use unsigned template / sighash
+  instead; (b) the H_session-in-step-challenge approach breaks
+  consensus-verifier compatibility (Finding A).
+* **Q2 — DLEQ:** OK. Standard Chaum-Pedersen as specified. Final
+  spec must commit P_pi, ring, asset pair, role, tx-template hash
+  in challenge transcript.
+* **Q3 — H_p:** CONCERN, not a blocker. Try-and-increment is the
+  inherited construction; spec should explicitly say adaptor
+  inherits H_p's existing security/side-channel profile.
+* **Q4 — µ × adaptor:** CONCERN, no concrete break. Mandatory
+  share-consistency DLEQs + precommitted public shares appear to
+  close the obvious attack surface.
+* **Q5 — concurrent-session attacks:** OK for 3-round; CONCERN
+  that current `joint_ringsig.cpp` NonceCommit doesn't include
+  D_share (must be fixed before adaptor multi-layer use).
+* **Q6 — identifiable abort vs share-consistency:** must
+  unambiguously require share-consistency DLEQs for multi-layer
+  adaptor signing; remove "optional" framing.
+* **Q7 — timelock direction:** correct; atomicity claim still
+  overstated. Need explicit liveness assumption text.
+* **Q8 — pre-sig leaks π:** OK, with operational caveat (logging,
+  RPC, dispute transcripts must be private).
+* **Q9 — side-channel:** CONCERN, manageable. New surfaces in
+  DLEQ generation, Adapt, Extract, H_p variable-time. Wallet
+  context probably OK; hardware/remote signing needs more care.
+
+### Additional findings (rev 2)
+
+* **Finding A (re):** challenge-hash mismatch is the biggest
+  blocker. Fix via `msg_adaptor` as above.
+* **Finding B:** rogue-key / key-share selection in cooperative
+  joint-stealth setup needs explicit treatment. Options:
+  proof-of-possession for shares, commit-share-before-reveal,
+  or coefficient-weighted (MuSig-style) aggregation.
+* **Finding C:** deterministic `s_others` is fine but transcript
+  fragility — all participants must sign/acknowledge a canonical
+  session transcript before round 1.
+* **Finding D:** `(T_G, T_H, π_t)` is valid only for one specific
+  `P_pi` and one specific session. Make explicit.
+* **Finding E:** atomic swap needs an explicit watcher model
+  (chain monitoring, reorg handling, fee bumping, persistent
+  pre-sig storage).
+* **Finding F:** adaptor-ECDSA is significantly harder than
+  adaptor-Schnorr (drags in two-party ECDSA machinery + extra
+  assumptions). Restrict v1 to Schnorr/Taproot-capable chains.
+
+### Confidence ratings (rev 2)
+
+* (a) Math correctness: **4/5.** Algebra closes assuming pre-
+  signing and final verification hash the same challenge transcript
+  — currently they don't.
+* (b) µ-aggregation safety: **3/5.** No concrete attack with
+  mandatory share-consistency DLEQs + precommitted shares.
+* (c) §6.3 atomicity: **2.5/5.** Direction correct; guarantee
+  liveness-dependent.
+* (d) Safe to deploy with $1k verbatim: **2/5.** Not verbatim.
+  With rev-3 revisions, small-value guarded prototype reasonable.
+
+### Required revisions for rev 3
+
+1. Resolve transcript binding via `msg_adaptor` (don't fork CLSAG
+   challenge hashing).
+2. Separate off-chain adaptor transcript from consensus signature
+   transcript explicitly.
+3. Mandatory share-consistency DLEQs for multi-layer adaptor —
+   no "optional" wording.
+4. Add rogue-key defenses for joint stealth setup.
+5. Spec the DLEQ exactly with canonical transcript.
+6. Rewrite atomicity as liveness-dependent.
+7. Restrict v1 to Schnorr/Taproot foreign chains.
+8. Add mandatory test vectors as a deliverable.
+
+### Implementation hazards (severity ordered, rev 2)
+
+**Critical**
+1. Using `H_session` in pre-signing but normal step-challenge
+   on-chain. Will produce signatures that look valid in the
+   adaptor verifier but fail standard CLSAG verification.
+2. Not committing the full adaptor session into the signed tx
+   digest.
+3. Wrong adaptor sign convention.
+4. Using `T_H = t·I_agg` instead of `t·H_p(P_pi)`.
+5. Accepting DLEQ without binding exact P_pi, ring/session,
+   role, tx template.
+6. Omitting D_share from multi-layer nonce commitments.
+7. Allowing key-share mutation after t or nonce commitments.
+8. Failing to verify the adapted signature before broadcast.
+
+**High**
+9. Treating share-consistency DLEQs as optional in multi-layer.
+10. Using txids in SESSION when txid depends on signature.
+11. Failing to check extracted t against both T_G and T_H.
+12. Not rejecting invalid points / infinity / aggregate-infinity.
+13. Not checking scalar validity after add/subtract.
+14. Nonce reuse across cooperative sessions.
+15. Inconsistent serialization/endianness.
+16. Logging pre-sigs / exposing via RPC.
+
+**Medium**
+17. Variable-time H_p, branch-on-π behavior.
+18. No fee-bump plan for Alice's foreign claim.
+19. No reorg policy.
+20. Supporting adaptor-ECDSA before Schnorr is solid.
