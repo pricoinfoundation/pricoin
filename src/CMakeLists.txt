@@ -275,9 +275,11 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   rpc/output_script.cpp
   rpc/pricoin_ct.cpp
   rpc/rawtransaction.cpp
+  swap/btc_htlc.cpp
   swap/chain_backend.cpp
   swap/esplora_backend.cpp
   rpc/swap_chains.cpp
+  rpc/swap_htlc.cpp
   rpc/server.cpp
   rpc/server_util.cpp
   rpc/signmessage.cpp

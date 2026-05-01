@@ -22,6 +22,7 @@ void RegisterRawTransactionRPCCommands(CRPCTable &tableRPC);
 void RegisterSignMessageRPCCommands(CRPCTable&);
 void RegisterPricoinCTRPCCommands(CRPCTable&);
 void RegisterPricoinChainwatchRPCCommands(CRPCTable&);
+void RegisterPricoinHTLCRPCCommands(CRPCTable&);
 void RegisterSignerRPCCommands(CRPCTable &tableRPC);
 void RegisterTxoutProofRPCCommands(CRPCTable&);
 
@@ -38,6 +39,7 @@ static inline void RegisterAllCoreRPCCommands(CRPCTable &t)
     RegisterSignMessageRPCCommands(t);
     RegisterPricoinCTRPCCommands(t);
     RegisterPricoinChainwatchRPCCommands(t);
+    RegisterPricoinHTLCRPCCommands(t);
 #ifdef ENABLE_EXTERNAL_SIGNER
     RegisterSignerRPCCommands(t);
 #endif // ENABLE_EXTERNAL_SIGNER
