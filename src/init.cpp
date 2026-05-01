@@ -70,6 +70,7 @@
 #include <pricoin/validation.h>
 #ifdef ENABLE_WALLET
 #include <wallet/pricoin_stealth.h>
+#include <wallet/pricoin_swap_session.h>
 #endif
 #include <protocol.h>
 #include <rpc/blockchain.h>
@@ -434,6 +435,7 @@ void Shutdown(NodeContext& node)
     // pool has been torn down, and `memory_cleanse(keydata)` segfaults
     // inside libc's vectorized memset.
     try { wallet::pricoin_stealth::Shutdown(); } catch (...) {}
+    try { wallet::pricoin_swap_session::Shutdown(); } catch (...) {}
 #endif
 
     RemovePidFile(*node.args);

@@ -84,6 +84,10 @@ class PricoinJointSpendTest(BitcoinTestFramework):
         self.log.info("Section 5: cooperative on-chain spend (real v4 tx)")
         self._run_cooperative_spend(node)
 
+        # Section 6 — swap session lifecycle + identifiable blame.
+        self.log.info("Section 6: swap session lifecycle + identifiable blame")
+        self._run_swap_session_lifecycle(node)
+
         self.log.info("Pricoin cooperative-CLSAG RPC flow OK")
 
     # -----------------------------------------------------------------
@@ -524,6 +528,141 @@ class PricoinJointSpendTest(BitcoinTestFramework):
             assert "double-spend" in str(e).lower() or "already" in str(e).lower() \
                 or "txn-mempool" in str(e).lower() or "broadcast" in str(e).lower(), \
                 f"unexpected error on double-submit: {e}"
+
+
+    # -----------------------------------------------------------------
+
+    def _run_swap_session_lifecycle(self, node):
+        """Two wallets create matched sessions, sign + verify each
+        other's payloads, complete one happy-path session, abort
+        another with a verifying blame ticket, and reject a blame
+        ticket that doesn't actually verify.
+
+        Identity model: each wallet has ONE stable swap-identity
+        pubkey (`pricoin_swap_identity`) that's reused across all
+        sessions. In production this is what you'd advertise in an
+        order book listing.
+        """
+        node.createwallet("alice_ss")
+        node.createwallet("bob_ss")
+        alice = node.get_wallet_rpc("alice_ss")
+        bob   = node.get_wallet_rpc("bob_ss")
+
+        # Each wallet's stealth identity is derived lazily; ask for
+        # the stealth address once to prime the cache.
+        alice.pricoin_getstealthaddress()
+        bob.pricoin_getstealthaddress()
+
+        alice_pub = alice.pricoin_swap_identity()["pubkey"]
+        bob_pub   = bob.pricoin_swap_identity()["pubkey"]
+
+        # ---- Happy path ----
+        a = alice.pricoin_swap_session_create(bob_pub, "alice<->bob test")
+        sid = a["session_id"]
+        assert_equal(a["my_pubkey"], alice_pub)
+        assert_equal(a["counterparty_pubkey"], bob_pub)
+        assert_equal(a["role"], "initiator")
+        assert_equal(a["state"], "active")
+
+        b = bob.pricoin_swap_session_attach(sid, alice_pub, "from alice")
+        assert_equal(b["session_id"], sid)
+        assert_equal(b["my_pubkey"], bob_pub)
+        assert_equal(b["counterparty_pubkey"], alice_pub)
+        assert_equal(b["role"], "responder")
+        assert_equal(b["state"], "active")
+
+        # Round-message signing: Alice signs a payload, Bob verifies.
+        payload_hex = "deadbeef" * 8  # 32 bytes
+        sig_a = alice.pricoin_swap_session_sign(sid, payload_hex)["signature"]
+        assert_equal(
+            bob.pricoin_swap_session_verify(sid, payload_hex, sig_a)["valid"],
+            True)
+        # Bob signs, Alice verifies.
+        sig_b = bob.pricoin_swap_session_sign(sid, payload_hex)["signature"]
+        assert_equal(
+            alice.pricoin_swap_session_verify(sid, payload_hex, sig_b)["valid"],
+            True)
+        # Tamper detection: flip one bit in the payload.
+        bad_payload = "ee" + payload_hex[2:]
+        assert_equal(
+            bob.pricoin_swap_session_verify(sid, bad_payload, sig_a)["valid"],
+            False)
+
+        # Complete the session.
+        fake_txid = "ab" * 32
+        completed = alice.pricoin_swap_session_complete(sid, fake_txid)
+        assert_equal(completed["state"], "complete")
+        assert_equal(completed["spend_txid"], fake_txid)
+        # State guard: completing twice should reject.
+        try:
+            alice.pricoin_swap_session_complete(sid, fake_txid)
+            assert False, "double-complete should have rejected"
+        except Exception as e:
+            assert "not in Active" in str(e), f"unexpected: {e}"
+
+        # ---- Identifiable blame on a fresh session ----
+        a2 = alice.pricoin_swap_session_create(bob_pub, "blame test")
+        sid2 = a2["session_id"]
+        bob.pricoin_swap_session_attach(sid2, alice_pub, "blame test")
+
+        # Bob signs a payload that we'll designate as malicious.
+        bad_payload_hex = "cafe" * 16
+        bob_sig = bob.pricoin_swap_session_sign(sid2, bad_payload_hex)["signature"]
+        assert_equal(
+            alice.pricoin_swap_session_verify(sid2, bad_payload_hex, bob_sig)["valid"],
+            True)
+
+        # Alice records blame: signed-by-Bob message + reason. Abort
+        # MUST verify the sig against Bob's identity pubkey first.
+        aborted = alice.pricoin_swap_session_abort(sid2, {
+            "reason": "commitment_mismatch",
+            "payload": bad_payload_hex,
+            "signature": bob_sig,
+            "detail": "round-1 KI_share doesn't open to commitment",
+        })
+        assert_equal(aborted["state"], "aborted")
+        assert "blame" in aborted
+        assert_equal(aborted["blame"]["reason"], "commitment_mismatch")
+        assert_equal(aborted["blame"]["payload"], bad_payload_hex)
+        assert_equal(aborted["blame"]["signature"], bob_sig)
+
+        # ---- Reject hearsay blame ----
+        a3 = alice.pricoin_swap_session_create(bob_pub, "hearsay test")
+        sid3 = a3["session_id"]
+        bob.pricoin_swap_session_attach(sid3, alice_pub, "hearsay test")
+
+        forged_sig = "30" + "44" * 35  # garbage that won't ECDSA-verify
+        try:
+            alice.pricoin_swap_session_abort(sid3, {
+                "reason": "commitment_mismatch",
+                "payload": "00" * 32,
+                "signature": forged_sig,
+                "detail": "fabricated",
+            })
+            assert False, "abort with unverifiable blame should have rejected"
+        except Exception as e:
+            assert "verify" in str(e).lower() or "blame" in str(e).lower(), \
+                f"unexpected: {e}"
+        s = alice.pricoin_swap_session_get(sid3)
+        assert_equal(s["state"], "active")
+
+        # ---- Persistence: list shows all sessions ----
+        states = [s["state"] for s in alice.pricoin_swap_session_list()]
+        assert "complete" in states
+        assert "aborted" in states
+        assert "active" in states
+
+        # ---- Voluntary abort (no blame) ----
+        a4 = alice.pricoin_swap_session_create(bob_pub, "voluntary abort")
+        sid4 = a4["session_id"]
+        a4_aborted = alice.pricoin_swap_session_abort(sid4)
+        assert_equal(a4_aborted["state"], "aborted")
+        assert "blame" not in a4_aborted
+
+        # ---- Identity is stable across wallet sessions ----
+        # Call pricoin_swap_identity again and confirm same pubkey.
+        assert_equal(alice.pricoin_swap_identity()["pubkey"], alice_pub)
+        assert_equal(bob.pricoin_swap_identity()["pubkey"], bob_pub)
 
 
 if __name__ == "__main__":

@@ -89,6 +89,11 @@ extern const std::string POOL;
 extern const std::string PRICOIN_STEALTH;
 extern const std::string PRICOIN_STEALTH_SEED;
 extern const std::string PRICOIN_RECOVERY_CACHE;
+// Atomic-swap stage 2b — per-wallet records tracking the lifecycle
+// of cooperative-CLSAG signing sessions. Multi-record per wallet,
+// keyed by uint256 session_id. Format: encrypted blob via the
+// EncryptWalletBlob pattern. See wallet/pricoin_swap_session.cpp.
+extern const std::string PRICOIN_SWAP_SESSION;
 extern const std::string PURPOSE;
 extern const std::string SETTINGS;
 extern const std::string TX;
@@ -298,6 +303,14 @@ public:
     bool WritePricoinRecoveryCache(const std::vector<unsigned char>& blob);
     bool ReadPricoinRecoveryCache(std::vector<unsigned char>& blob);
     bool ErasePricoinRecoveryCache();
+    // Per-session swap records. Multi-keyed by uint256 session_id.
+    bool WritePricoinSwapSession(const uint256& session_id,
+                                 const std::vector<unsigned char>& blob);
+    bool ErasePricoinSwapSession(const uint256& session_id);
+    // Read every swap session record into `out`. Returns false on
+    // cursor error; an empty wallet returns Ok with empty `out`.
+    bool ReadAllPricoinSwapSessions(
+        std::map<uint256, std::vector<unsigned char>>& out);
     //! Begin a new transaction
     bool TxnBegin();
     //! Commit current transaction

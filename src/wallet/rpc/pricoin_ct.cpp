@@ -36,6 +36,7 @@
 #include <wallet/coinselection.h>
 #include <wallet/pricoin_ct_send.h>
 #include <wallet/pricoin_stealth.h>
+#include <wallet/pricoin_swap_session.h>
 #include <wallet/rpc/util.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/spend.h>
@@ -2535,6 +2536,441 @@ RPCMethod pricoin_jointspend_submittx()
     };
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Atomic-swap stage 2b — swap session lifecycle RPCs.
+// Each RPC is wallet-level; sessions are persisted in this wallet's
+// DB (encrypted via the same EncryptWalletBlob pattern as the
+// stealth-identity record).
+// ─────────────────────────────────────────────────────────────────
+
+namespace ssh = ::wallet::pricoin_swap_session;
+
+namespace {
+
+// Convert a SwapSession to a UniValue object for RPC output. Strips
+// the per-session priv (it's secret).
+UniValue SwapSessionToJSON(const ssh::SwapSession& s)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("session_id", s.session_id.ToString());
+    out.pushKV("my_pubkey", HexStr(s.my_pub));
+    out.pushKV("counterparty_pubkey", HexStr(s.counterparty_pub));
+    out.pushKV("role", s.role == ssh::Role::Initiator ? "initiator" : "responder");
+    switch (s.state) {
+        case ssh::State::Active:   out.pushKV("state", "active"); break;
+        case ssh::State::Complete: out.pushKV("state", "complete"); break;
+        case ssh::State::Aborted:  out.pushKV("state", "aborted"); break;
+    }
+    if (s.state == ssh::State::Complete && !s.spend_txid.IsNull()) {
+        out.pushKV("spend_txid", s.spend_txid.ToString());
+    }
+    if (s.state == ssh::State::Aborted && s.blame.reason != ssh::BlameReason::None) {
+        UniValue blame{UniValue::VOBJ};
+        switch (s.blame.reason) {
+            case ssh::BlameReason::InvalidSignature:   blame.pushKV("reason", "invalid_signature"); break;
+            case ssh::BlameReason::CommitmentMismatch: blame.pushKV("reason", "commitment_mismatch"); break;
+            case ssh::BlameReason::InvalidShare:       blame.pushKV("reason", "invalid_share"); break;
+            case ssh::BlameReason::Other:              blame.pushKV("reason", "other"); break;
+            case ssh::BlameReason::None:               break;
+        }
+        blame.pushKV("payload",   HexStr(s.blame.payload));
+        blame.pushKV("signature", HexStr(s.blame.signature));
+        blame.pushKV("detail",    s.blame.detail);
+        out.pushKV("blame", std::move(blame));
+    }
+    out.pushKV("memo", s.memo);
+    out.pushKV("created_time", s.created_time);
+    out.pushKV("updated_time", s.updated_time);
+    return out;
+}
+
+ssh::BlameReason ParseBlameReason(const std::string& str)
+{
+    if (str == "invalid_signature")   return ssh::BlameReason::InvalidSignature;
+    if (str == "commitment_mismatch") return ssh::BlameReason::CommitmentMismatch;
+    if (str == "invalid_share")       return ssh::BlameReason::InvalidShare;
+    if (str == "other")               return ssh::BlameReason::Other;
+    return ssh::BlameReason::None;
+}
+
+CPubKey ParseSessionPubkey(const std::string& hex, const char* name)
+{
+    if (!IsHex(hex) || hex.size() != 66) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            strprintf("%s must be 66 hex characters (33 bytes)", name));
+    }
+    auto bytes = ParseHex(hex);
+    CPubKey pub{std::span<const unsigned char>{bytes.data(), bytes.size()}};
+    if (!pub.IsValid() || !pub.IsCompressed()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            strprintf("%s is not a valid compressed secp256k1 point", name));
+    }
+    return pub;
+}
+
+void ThrowFromCreateResult(ssh::CreateResult r)
+{
+    using R = ssh::CreateResult;
+    switch (r) {
+        case R::Ok: return;
+        case R::InvalidCounterpartyPubkey:
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid counterparty pubkey");
+        case R::DuplicateSessionId:
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Session id already exists in this wallet");
+        case R::Locked:
+            throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet is locked");
+        case R::DerivationFailed:
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Per-session key derivation failed");
+        case R::WriteFailed:
+            throw JSONRPCError(RPC_WALLET_ERROR, "Persistence failed");
+    }
+}
+
+void ThrowFromTransition(ssh::TransitionResult r)
+{
+    using R = ssh::TransitionResult;
+    switch (r) {
+        case R::Ok: return;
+        case R::NotFound:
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Session not found");
+        case R::InvalidState:
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Session is not in Active state");
+        case R::InvalidBlame:
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "Blame payload signature does not verify against counterparty pubkey");
+        case R::Locked:
+            throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet is locked");
+        case R::WriteFailed:
+            throw JSONRPCError(RPC_WALLET_ERROR, "Persistence failed");
+    }
+}
+
+} // namespace
+
+RPCMethod pricoin_swap_identity()
+{
+    return RPCMethod{
+        "pricoin_swap_identity",
+        "Return this wallet's stable swap-identity ECDSA pubkey. The same\n"
+        "pubkey is reused across all swap sessions; safe to advertise once\n"
+        "in an order book listing.\n"
+        "\n"
+        "Derivation: HMAC-SHA256(stealth_spend_priv, \"pricoin/swap/identity-v1\").\n"
+        "Recoverable from the wallet seed.\n",
+        {},
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "pubkey", "33-byte compressed secp256k1 pubkey"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_swap_identity", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            auto pub = ::wallet::pricoin_swap_session::GetSwapIdentityPubkey(*wallet_sp);
+            if (!pub) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED,
+                    "Wallet locked, or identity derivation failed");
+            }
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("pubkey", HexStr(*pub));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_swap_session_create()
+{
+    return RPCMethod{
+        "pricoin_swap_session_create",
+        "Create a new swap session as the initiator. Generates a fresh\n"
+        "32-byte session_id and derives a per-session ECDSA signing key\n"
+        "from the wallet's stealth spend priv + session_id. The caller\n"
+        "exposes (session_id, my_pubkey) to the counterparty out-of-band.\n",
+        {
+            {"counterparty_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Counterparty's session pubkey (33 bytes hex)"},
+            {"memo", RPCArg::Type::STR, RPCArg::Default{""}, "Free-form note for the user"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "session_id", "32-byte hex"},
+                {RPCResult::Type::STR_HEX, "my_pubkey",  "33-byte hex"},
+                {RPCResult::Type::STR_HEX, "counterparty_pubkey", "Echo"},
+                {RPCResult::Type::STR,     "role",       "initiator|responder"},
+                {RPCResult::Type::STR,     "state",      "active|complete|aborted"},
+                {RPCResult::Type::STR_HEX, "spend_txid", /*optional=*/true, "Set when state == complete"},
+                {RPCResult::Type::OBJ, "blame", /*optional=*/true, "Set when state == aborted with blame", {}},
+                {RPCResult::Type::STR,     "memo",       "Caller-supplied free-form note"},
+                {RPCResult::Type::NUM,     "created_time", "Unix seconds"},
+                {RPCResult::Type::NUM,     "updated_time", "Unix seconds"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_swap_session_create", "<counterparty_pubkey> \"swap with bob\"")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CPubKey cp = ParseSessionPubkey(request.params[0].get_str(), "counterparty_pubkey");
+            const std::string memo = request.params[1].isNull() ? "" : request.params[1].get_str();
+            ssh::SwapSession s;
+            ThrowFromCreateResult(ssh::Create(*wallet_sp, cp, memo, s));
+            return SwapSessionToJSON(s);
+        }
+    };
+}
+
+RPCMethod pricoin_swap_session_attach()
+{
+    return RPCMethod{
+        "pricoin_swap_session_attach",
+        "Adopt an existing swap session as the responder. Takes the\n"
+        "session_id and counterparty pubkey received from the initiator\n"
+        "out-of-band; derives this wallet's matching per-session key.\n",
+        {
+            {"session_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte session_id supplied by the initiator"},
+            {"counterparty_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Initiator's session pubkey (33 bytes hex)"},
+            {"memo", RPCArg::Type::STR, RPCArg::Default{""}, "Free-form note"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "session_id", "Echo"},
+                {RPCResult::Type::STR_HEX, "my_pubkey",  "33-byte hex"},
+                {RPCResult::Type::STR_HEX, "counterparty_pubkey", "Echo"},
+                {RPCResult::Type::STR,     "role",       "initiator|responder"},
+                {RPCResult::Type::STR,     "state",      "active|complete|aborted"},
+                {RPCResult::Type::STR_HEX, "spend_txid", /*optional=*/true, ""},
+                {RPCResult::Type::OBJ, "blame", /*optional=*/true, "", {}},
+                {RPCResult::Type::STR,     "memo",       ""},
+                {RPCResult::Type::NUM,     "created_time", ""},
+                {RPCResult::Type::NUM,     "updated_time", ""},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_swap_session_attach", "<session_id> <counterparty_pubkey>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            auto sid_opt = uint256::FromHex(request.params[0].get_str());
+            if (!sid_opt) throw JSONRPCError(RPC_INVALID_PARAMETER, "session_id must be 32-byte hex");
+            CPubKey cp = ParseSessionPubkey(request.params[1].get_str(), "counterparty_pubkey");
+            const std::string memo = request.params[2].isNull() ? "" : request.params[2].get_str();
+            ssh::SwapSession s;
+            ThrowFromCreateResult(ssh::Attach(*wallet_sp, *sid_opt, cp, memo, s));
+            return SwapSessionToJSON(s);
+        }
+    };
+}
+
+RPCMethod pricoin_swap_session_sign()
+{
+    return RPCMethod{
+        "pricoin_swap_session_sign",
+        "Sign an arbitrary payload with this wallet's per-session signing\n"
+        "key. Used to attest each round-message in the cooperative\n"
+        "protocol so the counterparty can attribute misbehaviour to a\n"
+        "specific (session_id, my_pubkey) pair.\n",
+        {
+            {"session_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"payload_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Arbitrary payload bytes"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "signature", "ECDSA-DER signature"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_swap_session_sign", "<session_id> <payload>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            auto sid_opt = uint256::FromHex(request.params[0].get_str());
+            if (!sid_opt) throw JSONRPCError(RPC_INVALID_PARAMETER, "session_id must be 32-byte hex");
+            auto payload = TryParseHex<unsigned char>(request.params[1].get_str());
+            if (!payload) throw JSONRPCError(RPC_INVALID_PARAMETER, "payload_hex invalid");
+            std::vector<unsigned char> sig;
+            if (!ssh::Sign(*wallet_sp, *sid_opt,
+                           std::span<const unsigned char>{*payload}, sig)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Sign failed (session not found, locked, or key invalid)");
+            }
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("signature", HexStr(sig));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_swap_session_verify()
+{
+    return RPCMethod{
+        "pricoin_swap_session_verify",
+        "Verify a payload signature against the session's stored\n"
+        "counterparty_pubkey. Returns valid=true iff the signature is\n"
+        "valid AND the session record exists locally.\n",
+        {
+            {"session_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"payload_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"signature_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::BOOL, "valid", ""}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_swap_session_verify", "<session_id> <payload> <sig>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            auto sid_opt = uint256::FromHex(request.params[0].get_str());
+            if (!sid_opt) throw JSONRPCError(RPC_INVALID_PARAMETER, "session_id must be 32-byte hex");
+            auto payload = TryParseHex<unsigned char>(request.params[1].get_str());
+            if (!payload) throw JSONRPCError(RPC_INVALID_PARAMETER, "payload_hex invalid");
+            auto sig = TryParseHex<unsigned char>(request.params[2].get_str());
+            if (!sig) throw JSONRPCError(RPC_INVALID_PARAMETER, "signature_hex invalid");
+            const bool ok = ssh::Verify(*wallet_sp, *sid_opt,
+                std::span<const unsigned char>{*payload},
+                std::span<const unsigned char>{*sig});
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("valid", ok);
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_swap_session_complete()
+{
+    return RPCMethod{
+        "pricoin_swap_session_complete",
+        "Mark a session as Complete with the on-chain spend txid.\n"
+        "Call this after pricoin_jointspend_submittx returns successfully.\n",
+        {
+            {"session_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"spend_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "On-chain spend tx id"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Session record (see pricoin_swap_session_create for shape)" },
+        RPCExamples{HelpExampleCli("pricoin_swap_session_complete", "<session_id> <spend_txid>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            auto sid_opt = uint256::FromHex(request.params[0].get_str());
+            if (!sid_opt) throw JSONRPCError(RPC_INVALID_PARAMETER, "session_id must be 32-byte hex");
+            auto txid_opt = uint256::FromHex(request.params[1].get_str());
+            if (!txid_opt) throw JSONRPCError(RPC_INVALID_PARAMETER, "spend_txid must be 32-byte hex");
+            ThrowFromTransition(ssh::Complete(*wallet_sp, *sid_opt, *txid_opt));
+            ssh::SwapSession s;
+            if (ssh::Get(*wallet_sp, *sid_opt, s) != ssh::LookupResult::Ok) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "Session vanished after Complete");
+            }
+            return SwapSessionToJSON(s);
+        }
+    };
+}
+
+RPCMethod pricoin_swap_session_abort()
+{
+    return RPCMethod{
+        "pricoin_swap_session_abort",
+        "Mark a session as Aborted. Optional blame ticket — payload +\n"
+        "signature from the counterparty plus a reason — must verify\n"
+        "against the counterparty's session pubkey or the call rejects.\n"
+        "An abort without a blame ticket is permitted (e.g., voluntary\n"
+        "timeout).\n",
+        {
+            {"session_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"blame", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED,
+                "Blame ticket — counterparty's signed misbehaviour message",
+                {{"reason", RPCArg::Type::STR, RPCArg::Optional::NO,
+                  "One of: invalid_signature, commitment_mismatch, invalid_share, other"},
+                 {"payload",   RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+                 {"signature", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+                 {"detail",    RPCArg::Type::STR,     RPCArg::Default{""}, ""}}},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Session record (see pricoin_swap_session_create for shape)" },
+        RPCExamples{HelpExampleCli("pricoin_swap_session_abort",
+            R"(<session_id> '{"reason":"commitment_mismatch","payload":"<hex>","signature":"<hex>"}')")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            auto sid_opt = uint256::FromHex(request.params[0].get_str());
+            if (!sid_opt) throw JSONRPCError(RPC_INVALID_PARAMETER, "session_id must be 32-byte hex");
+            std::optional<ssh::BlameTicket> blame;
+            if (!request.params[1].isNull()) {
+                const UniValue& b = request.params[1];
+                ssh::BlameTicket t;
+                t.reason = ParseBlameReason(b.find_value("reason").get_str());
+                if (t.reason == ssh::BlameReason::None) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "blame.reason invalid");
+                }
+                auto payload = TryParseHex<unsigned char>(b.find_value("payload").get_str());
+                if (!payload) throw JSONRPCError(RPC_INVALID_PARAMETER, "blame.payload invalid");
+                auto sig = TryParseHex<unsigned char>(b.find_value("signature").get_str());
+                if (!sig) throw JSONRPCError(RPC_INVALID_PARAMETER, "blame.signature invalid");
+                t.payload   = *payload;
+                t.signature = *sig;
+                const UniValue& d = b.find_value("detail");
+                t.detail = d.isStr() ? d.get_str() : "";
+                blame = std::move(t);
+            }
+            ThrowFromTransition(ssh::Abort(*wallet_sp, *sid_opt, std::move(blame)));
+            ssh::SwapSession s;
+            if (ssh::Get(*wallet_sp, *sid_opt, s) != ssh::LookupResult::Ok) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "Session vanished after Abort");
+            }
+            return SwapSessionToJSON(s);
+        }
+    };
+}
+
+RPCMethod pricoin_swap_session_get()
+{
+    return RPCMethod{
+        "pricoin_swap_session_get",
+        "Look up a single swap session by id.\n",
+        {{"session_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""}},
+        RPCResult{ RPCResult::Type::ANY, "", "Session record (see pricoin_swap_session_create for shape)" },
+        RPCExamples{HelpExampleCli("pricoin_swap_session_get", "<session_id>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            auto sid_opt = uint256::FromHex(request.params[0].get_str());
+            if (!sid_opt) throw JSONRPCError(RPC_INVALID_PARAMETER, "session_id must be 32-byte hex");
+            ssh::SwapSession s;
+            const auto r = ssh::Get(*wallet_sp, *sid_opt, s);
+            if (r == ssh::LookupResult::Locked) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet is locked");
+            }
+            if (r != ssh::LookupResult::Ok) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Session not found");
+            }
+            return SwapSessionToJSON(s);
+        }
+    };
+}
+
+RPCMethod pricoin_swap_session_list()
+{
+    return RPCMethod{
+        "pricoin_swap_session_list",
+        "List all swap sessions in this wallet.\n",
+        {},
+        RPCResult{
+            RPCResult::Type::ARR, "", "",
+            {{RPCResult::Type::ANY, "", "Session record"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_swap_session_list", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            std::vector<ssh::SwapSession> all;
+            const auto r = ssh::List(*wallet_sp, all);
+            if (r == ssh::LookupResult::Locked) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet is locked");
+            }
+            UniValue out{UniValue::VARR};
+            for (const auto& s : all) out.push_back(SwapSessionToJSON(s));
+            return out;
+        }
+    };
+}
+
 // Atomic-swap stage 2b — load this wallet's spend-secret share for a
 // joint stealth output. The caller will pass the returned x_share into
 // pricoin_jointspend_round1 as part of the cooperative signing
@@ -2725,6 +3161,15 @@ RPCMethod pricoin_jointscan_recover_export() { return pricoin_jointscan_recover(
 RPCMethod pricoin_jointspend_loadshare_export() { return pricoin_jointspend_loadshare(); }
 RPCMethod pricoin_jointspend_buildtx_export()   { return pricoin_jointspend_buildtx(); }
 RPCMethod pricoin_jointspend_submittx_export()  { return pricoin_jointspend_submittx(); }
+RPCMethod pricoin_swap_identity_export()         { return pricoin_swap_identity(); }
+RPCMethod pricoin_swap_session_create_export()   { return pricoin_swap_session_create(); }
+RPCMethod pricoin_swap_session_attach_export()   { return pricoin_swap_session_attach(); }
+RPCMethod pricoin_swap_session_sign_export()     { return pricoin_swap_session_sign(); }
+RPCMethod pricoin_swap_session_verify_export()   { return pricoin_swap_session_verify(); }
+RPCMethod pricoin_swap_session_complete_export() { return pricoin_swap_session_complete(); }
+RPCMethod pricoin_swap_session_abort_export()    { return pricoin_swap_session_abort(); }
+RPCMethod pricoin_swap_session_get_export()      { return pricoin_swap_session_get(); }
+RPCMethod pricoin_swap_session_list_export()     { return pricoin_swap_session_list(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

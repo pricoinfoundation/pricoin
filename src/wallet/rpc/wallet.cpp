@@ -912,6 +912,15 @@ RPCMethod pricoin_jointscan_recover_export();
 RPCMethod pricoin_jointspend_loadshare_export();
 RPCMethod pricoin_jointspend_buildtx_export();
 RPCMethod pricoin_jointspend_submittx_export();
+RPCMethod pricoin_swap_identity_export();
+RPCMethod pricoin_swap_session_create_export();
+RPCMethod pricoin_swap_session_attach_export();
+RPCMethod pricoin_swap_session_sign_export();
+RPCMethod pricoin_swap_session_verify_export();
+RPCMethod pricoin_swap_session_complete_export();
+RPCMethod pricoin_swap_session_abort_export();
+RPCMethod pricoin_swap_session_get_export();
+RPCMethod pricoin_swap_session_list_export();
 RPCMethod pricoin_listownct_export();
 RPCMethod walletsendct_from_ct_export();
 RPCMethod walletsendct_ring_export();
@@ -932,6 +941,15 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &pricoin_jointspend_loadshare_export},
         {"wallet", &pricoin_jointspend_buildtx_export},
         {"wallet", &pricoin_jointspend_submittx_export},
+        {"wallet", &pricoin_swap_identity_export},
+        {"wallet", &pricoin_swap_session_create_export},
+        {"wallet", &pricoin_swap_session_attach_export},
+        {"wallet", &pricoin_swap_session_sign_export},
+        {"wallet", &pricoin_swap_session_verify_export},
+        {"wallet", &pricoin_swap_session_complete_export},
+        {"wallet", &pricoin_swap_session_abort_export},
+        {"wallet", &pricoin_swap_session_get_export},
+        {"wallet", &pricoin_swap_session_list_export},
         {"wallet", &pricoin_listownct_export},
         {"wallet", &walletsendct_from_ct_export},
         {"wallet", &walletsendct_ring_export},
