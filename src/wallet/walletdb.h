@@ -100,6 +100,12 @@ extern const std::string PRICOIN_SWAP_CEREMONY;
 // (joint_output_id, ring_hash, role). Encrypted via EncryptWalletBlob
 // because the record contains the secret round-1 nonce alpha.
 extern const std::string PRICOIN_CLSAG_NONCE;
+// Phase-5 atomic-swap orchestration record. Multi-row, keyed by
+// uint256 swap_id. Encrypted at rest because the record contains
+// (Bob's role only) the adaptor secret t and (both roles) all the
+// pre-signatures, which are required to broadcast the swap's claim
+// or refund txs. See wallet/pricoin_adaptor_swap.cpp.
+extern const std::string PRICOIN_ADAPTOR_SWAP;
 extern const std::string PURPOSE;
 extern const std::string SETTINGS;
 extern const std::string TX;
@@ -330,6 +336,12 @@ public:
                                 const std::vector<unsigned char>& blob);
     bool ErasePricoinClsagNonce(const uint256& digest);
     bool ReadAllPricoinClsagNonces(
+        std::map<uint256, std::vector<unsigned char>>& out);
+    // Per-swap adaptor-swap records.
+    bool WritePricoinAdaptorSwap(const uint256& swap_id,
+                                  const std::vector<unsigned char>& blob);
+    bool ErasePricoinAdaptorSwap(const uint256& swap_id);
+    bool ReadAllPricoinAdaptorSwaps(
         std::map<uint256, std::vector<unsigned char>>& out);
     //! Begin a new transaction
     bool TxnBegin();

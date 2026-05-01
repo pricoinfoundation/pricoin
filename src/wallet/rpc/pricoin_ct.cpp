@@ -35,6 +35,7 @@
 #include <core_io.h>
 #include <wallet/coincontrol.h>
 #include <wallet/coinselection.h>
+#include <wallet/pricoin_adaptor_swap.h>
 #include <wallet/pricoin_clsag_nonce_records.h>
 #include <wallet/pricoin_ct_send.h>
 #include <wallet/pricoin_stealth.h>
@@ -4255,6 +4256,537 @@ RPCMethod pricoin_jointspend_loadshare()
     };
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Atomic-swap phase 5 — adaptor-swap orchestration RPCs.
+//
+// State-machine + persistence over the spec §6.2 protocol. RPCs are
+// "operator records what just happened" — the underlying cooperative
+// signing machinery is in the swap/btc_musig2_adaptor + adaptor_*
+// modules, plumbed in by a future commit.
+// ─────────────────────────────────────────────────────────────────
+
+namespace aas = ::wallet::pricoin_adaptor_swap;
+
+const char* AdaptorSwapStateName(aas::State s)
+{
+    switch (s) {
+    case aas::State::Setup:        return "setup";
+    case aas::State::AdaptorReady: return "adaptor_ready";
+    case aas::State::BtcFunded:    return "btc_funded";
+    case aas::State::BothFunded:   return "both_funded";
+    case aas::State::PreSigned:    return "pre_signed";
+    case aas::State::PricClaimed:  return "pric_claimed";
+    case aas::State::Complete:     return "complete";
+    case aas::State::Refunded:     return "refunded";
+    case aas::State::Aborted:      return "aborted";
+    }
+    return "unknown";
+}
+
+aas::Role ParseAdaptorSwapRole(const std::string& s)
+{
+    if (s == "alice") return aas::Role::Alice;
+    if (s == "bob")   return aas::Role::Bob;
+    throw JSONRPCError(RPC_INVALID_PARAMETER, "role must be \"alice\" or \"bob\"");
+}
+
+UniValue AdaptorSwapToJSON(const aas::AdaptorSwap& s)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("swap_id",            s.swap_id.ToString());
+    out.pushKV("role",               s.role == aas::Role::Alice ? "alice" : "bob");
+    out.pushKV("state",              AdaptorSwapStateName(s.state));
+    out.pushKV("counterparty_pubkey", HexStr(s.counterparty_pub));
+
+    UniValue foreign{UniValue::VOBJ};
+    foreign.pushKV("chain",          s.foreign_chain);
+    foreign.pushKV("amount_sat",     s.foreign_amount_sat);
+    if (!s.foreign_funding_txid.empty()) {
+        foreign.pushKV("funding_txid",   s.foreign_funding_txid);
+        foreign.pushKV("funding_vout",   s.foreign_funding_vout);
+        foreign.pushKV("funding_height", s.foreign_funding_height);
+    }
+    if (!s.foreign_claim_txid.empty())  foreign.pushKV("claim_txid",  s.foreign_claim_txid);
+    if (!s.foreign_refund_txid.empty()) foreign.pushKV("refund_txid", s.foreign_refund_txid);
+    out.pushKV("foreign", std::move(foreign));
+
+    UniValue pric{UniValue::VOBJ};
+    pric.pushKV("joint_stealth_address", s.pric_joint_stealth_address);
+    pric.pushKV("amount_sat",            s.pric_amount_sat);
+    if (!s.pric_funding_txid.IsNull()) {
+        pric.pushKV("funding_txid",   s.pric_funding_txid.ToString());
+        pric.pushKV("funding_vout",   s.pric_funding_vout);
+        pric.pushKV("funding_height", s.pric_funding_height);
+    }
+    if (!s.pric_claim_txid.IsNull())  pric.pushKV("claim_txid",  s.pric_claim_txid.ToString());
+    if (!s.pric_refund_txid.IsNull()) pric.pushKV("refund_txid", s.pric_refund_txid.ToString());
+    out.pushKV("pric", std::move(pric));
+
+    if (s.adaptor_set) {
+        UniValue ad{UniValue::VOBJ};
+        ad.pushKV("T_G", HexStr(s.T_G));
+        ad.pushKV("dleq_proof_blob", HexStr(s.dleq_proof_blob));
+        // We deliberately do NOT echo t_secret in JSON output — Bob's
+        // wallet has it on-disk; exposing it via JSON would risk it
+        // landing in operator logs.
+        ad.pushKV("has_t", s.has_t);
+        out.pushKV("adaptor", std::move(ad));
+    }
+    if (s.timelocks_set) {
+        UniValue tl{UniValue::VOBJ};
+        tl.pushKV("pric_refund_height",    s.pric_refund_height);
+        tl.pushKV("foreign_refund_height", s.foreign_refund_height);
+        tl.pushKV("delta_min_blocks",      s.delta_min_blocks);
+        out.pushKV("refund_timelocks", std::move(tl));
+    }
+    if (s.presigs.IsComplete()) {
+        UniValue ps{UniValue::VOBJ};
+        ps.pushKV("btc_claim_presig",      HexStr(s.presigs.btc_claim_presig));
+        ps.pushKV("btc_claim_session",     HexStr(s.presigs.btc_claim_session));
+        ps.pushKV("btc_claim_nonce_parity", s.presigs.btc_claim_nonce_parity);
+        ps.pushKV("pric_claim_presig_blob", HexStr(s.presigs.pric_claim_presig_blob));
+        ps.pushKV("btc_refund_sig",        HexStr(s.presigs.btc_refund_sig));
+        ps.pushKV("pric_refund_sig_blob",  HexStr(s.presigs.pric_refund_sig_blob));
+        out.pushKV("presigs", std::move(ps));
+    }
+
+    out.pushKV("memo",         s.memo);
+    out.pushKV("created_time", s.created_time);
+    out.pushKV("updated_time", s.updated_time);
+    if (!s.abort_reason.empty()) out.pushKV("abort_reason", s.abort_reason);
+    out.pushKV("next_action", aas::NextActionHint(s));
+    return out;
+}
+
+[[noreturn]] void ThrowFromAdaptorSwapCreate(aas::CreateResult r)
+{
+    using R = aas::CreateResult;
+    switch (r) {
+    case R::Ok: assert(false);
+    case R::InvalidCounterpartyPubkey:
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "counterparty_pubkey must be 33-byte compressed secp256k1 hex");
+    case R::InvalidForeignLeg:
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "foreign_chain must be btc/ltc/regtest and amount > 0");
+    case R::InvalidPricLeg:
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "pric_joint_stealth_address must be a valid joint-stealth string and amount > 0");
+    case R::Locked:
+        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+    case R::WriteFailed:
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "wallet write failed");
+    }
+    assert(false);
+}
+
+[[noreturn]] void ThrowFromAdaptorSwapTransition(aas::TransitionResult r)
+{
+    using R = aas::TransitionResult;
+    switch (r) {
+    case R::Ok: assert(false);
+    case R::NotFound:
+        throw JSONRPCError(RPC_INVALID_REQUEST, "no swap with that id");
+    case R::InvalidState:
+        throw JSONRPCError(RPC_INVALID_REQUEST, "current state does not permit this transition");
+    case R::InvalidInput:
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "invalid input for this transition");
+    case R::InvalidTimelocks:
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            "refund timelocks failed validation — see swap::refund::ValidateRefundTimelocks (foreign > pric + delta_min_blocks)");
+    case R::Locked:
+        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+    case R::WriteFailed:
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "wallet write failed");
+    }
+    assert(false);
+}
+
+uint256 ParseSwapId(const std::string& s)
+{
+    auto opt = uint256::FromHex(s);
+    if (!opt) throw JSONRPCError(RPC_INVALID_PARAMETER, "swap_id must be 32-byte hex");
+    return *opt;
+}
+
+RPCMethod pricoin_adaptor_swap_create()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_create",
+        "Atomic-swap phase 5 — create a new adaptor-based swap record.\n"
+        "Generates a fresh swap_id; initial state is \"setup\". Subsequently\n"
+        "advance via SetAdaptorMaterials, SetRefundTimelocks, SetBtcFunded,\n"
+        "SetPricFunded, SetPreSigned, SetPricClaimed, SetComplete or SetRefunded.\n",
+        {
+            {"role",                 RPCArg::Type::STR,     RPCArg::Optional::NO, "\"alice\" (sells PRIC) or \"bob\" (sells foreign)"},
+            {"counterparty_pubkey",  RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Counterparty's swap-identity pubkey (33-byte hex)"},
+            {"foreign_chain",        RPCArg::Type::STR,     RPCArg::Optional::NO, "\"btc\" | \"ltc\" | \"regtest\""},
+            {"foreign_amount_sat",   RPCArg::Type::NUM,     RPCArg::Optional::NO, "Foreign-leg amount, smallest unit"},
+            {"pric_joint_stealth_address", RPCArg::Type::STR, RPCArg::Optional::NO, "Joint stealth address (output of pricoin_buildjointstealthaddress)"},
+            {"pric_amount_sat",      RPCArg::Type::NUM,     RPCArg::Optional::NO, "PRIC-leg amount"},
+            {"memo",                 RPCArg::Type::STR,     RPCArg::Default{""}, "Free-form note"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Swap record" },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_create",
+            "alice <counterparty_pub> btc 100000000 <joint_stealth_addr> 50000000")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const aas::Role role = ParseAdaptorSwapRole(request.params[0].get_str());
+            CPubKey cp = ParseSessionPubkey(request.params[1].get_str(), "counterparty_pubkey");
+            const std::string chain  = request.params[2].get_str();
+            const int64_t f_amt      = request.params[3].getInt<int64_t>();
+            const std::string addr   = request.params[4].get_str();
+            const int64_t p_amt      = request.params[5].getInt<int64_t>();
+            const std::string memo   = request.params[6].isNull() ? "" : request.params[6].get_str();
+
+            aas::AdaptorSwap s;
+            aas::CreateResult r = aas::Create(*wallet_sp, role, cp, chain, f_amt, addr, p_amt, memo, s);
+            if (r != aas::CreateResult::Ok) ThrowFromAdaptorSwapCreate(r);
+            return AdaptorSwapToJSON(s);
+        }
+    };
+}
+
+RPCMethod pricoin_adaptor_swap_set_adaptor()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_set_adaptor",
+        "Record cross-chain adaptor materials (T_G + DLEQ proof, plus secret t for Bob).\n"
+        "Caller is responsible for verifying the DLEQ proof (e.g., via the\n"
+        "adaptor_ringsig::VerifyDLEQProof primitive) before invoking this\n"
+        "RPC — the persistence layer just stores the bytes.\n",
+        {
+            {"swap_id",          RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"T_G",              RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte compressed adaptor point"},
+            {"dleq_proof_blob",  RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Serialized DLEQ proof bytes"},
+            {"t_secret_for_bob", RPCArg::Type::STR_HEX, RPCArg::Default{""},
+                "Bob ONLY: the 32-byte secret t. Empty for Alice."},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated swap record" },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_set_adaptor",
+            "<swap_id> <T_G_hex> <dleq_blob_hex> [<t_hex>]")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseSwapId(request.params[0].get_str());
+            auto T_G_bytes = TryParseHex<unsigned char>(request.params[1].get_str());
+            if (!T_G_bytes || T_G_bytes->size() != 33) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "T_G must be 33-byte compressed pubkey hex");
+            }
+            std::array<unsigned char, 33> T_G{};
+            std::copy(T_G_bytes->begin(), T_G_bytes->end(), T_G.begin());
+            auto dleq = TryParseHex<unsigned char>(request.params[2].get_str());
+            if (!dleq || dleq->empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "dleq_proof_blob must be non-empty hex");
+            }
+            std::optional<std::array<unsigned char, 32>> t_secret;
+            const std::string t_hex = request.params[3].isNull() ? "" : request.params[3].get_str();
+            if (!t_hex.empty()) {
+                auto t_bytes = TryParseHex<unsigned char>(t_hex);
+                if (!t_bytes || t_bytes->size() != 32) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "t_secret_for_bob must be 32-byte hex");
+                }
+                std::array<unsigned char, 32> t_arr{};
+                std::copy(t_bytes->begin(), t_bytes->end(), t_arr.begin());
+                t_secret = t_arr;
+            }
+            auto r = aas::SetAdaptorMaterials(*wallet_sp, sid, T_G, *dleq, t_secret);
+            if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
+            aas::AdaptorSwap out;
+            (void)aas::Get(*wallet_sp, sid, out);
+            return AdaptorSwapToJSON(out);
+        }
+    };
+}
+
+RPCMethod pricoin_adaptor_swap_set_timelocks()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_set_timelocks",
+        "Record agreed refund timelocks. Validated against\n"
+        "swap::refund::ValidateRefundTimelocks (spec §6.2 step 7).\n",
+        {
+            {"swap_id",              RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"pric_refund_height",   RPCArg::Type::NUM,     RPCArg::Optional::NO, "PRIC absolute block height"},
+            {"foreign_refund_height", RPCArg::Type::NUM,    RPCArg::Optional::NO, "Foreign absolute block height (must exceed pric+delta_min)"},
+            {"delta_min_blocks",     RPCArg::Type::NUM,     RPCArg::Optional::NO, "Minimum buffer in foreign blocks"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated swap record" },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_set_timelocks", "<swap_id> 100000 100144 144")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseSwapId(request.params[0].get_str());
+            const int32_t p   = request.params[1].getInt<int32_t>();
+            const int32_t f   = request.params[2].getInt<int32_t>();
+            const int32_t d   = request.params[3].getInt<int32_t>();
+            auto r = aas::SetRefundTimelocks(*wallet_sp, sid, p, f, d);
+            if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
+            aas::AdaptorSwap out;
+            (void)aas::Get(*wallet_sp, sid, out);
+            return AdaptorSwapToJSON(out);
+        }
+    };
+}
+
+RPCMethod pricoin_adaptor_swap_set_btc_funded()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_set_btc_funded",
+        "Record foreign 2-of-2 funding tx confirmed. Transitions adaptor_ready → btc_funded.\n",
+        {
+            {"swap_id",              RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"foreign_funding_txid", RPCArg::Type::STR,     RPCArg::Optional::NO, "Foreign-chain txid (chain-native format)"},
+            {"foreign_funding_vout", RPCArg::Type::NUM,     RPCArg::Optional::NO, ""},
+            {"foreign_funding_height", RPCArg::Type::NUM,   RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated swap record" },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_set_btc_funded", "<swap_id> <txid> 0 800000")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseSwapId(request.params[0].get_str());
+            auto r = aas::SetBtcFunded(*wallet_sp, sid,
+                request.params[1].get_str(),
+                request.params[2].getInt<int32_t>(),
+                request.params[3].getInt<int32_t>());
+            if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
+            aas::AdaptorSwap out;
+            (void)aas::Get(*wallet_sp, sid, out);
+            return AdaptorSwapToJSON(out);
+        }
+    };
+}
+
+RPCMethod pricoin_adaptor_swap_set_pric_funded()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_set_pric_funded",
+        "Record PRIC joint-stealth funding tx confirmed. Transitions btc_funded → both_funded.\n",
+        {
+            {"swap_id",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"pric_funding_txid",  RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"pric_funding_vout",  RPCArg::Type::NUM,     RPCArg::Optional::NO, ""},
+            {"pric_funding_height", RPCArg::Type::NUM,    RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated swap record" },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_set_pric_funded", "<swap_id> <txid> 1 12345")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseSwapId(request.params[0].get_str());
+            auto txid = uint256::FromHex(request.params[1].get_str());
+            if (!txid) throw JSONRPCError(RPC_INVALID_PARAMETER, "pric_funding_txid must be 32-byte hex");
+            auto r = aas::SetPricFunded(*wallet_sp, sid, *txid,
+                request.params[2].getInt<int32_t>(),
+                request.params[3].getInt<int32_t>());
+            if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
+            aas::AdaptorSwap out;
+            (void)aas::Get(*wallet_sp, sid, out);
+            return AdaptorSwapToJSON(out);
+        }
+    };
+}
+
+RPCMethod pricoin_adaptor_swap_set_pre_signed()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_set_pre_signed",
+        "Record all 4 pre-signatures durably stored. Transitions both_funded → pre_signed.\n"
+        "After this transition, refund pre-sigs are recoverable from the wallet —\n"
+        "this is the watcher-model invariant of spec §6.3.\n",
+        {
+            {"swap_id",                 RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"btc_claim_presig",        RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "64-byte BTC adaptor pre-sig (hex)"},
+            {"btc_claim_session",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "133-byte musig session (hex)"},
+            {"btc_claim_nonce_parity",  RPCArg::Type::NUM,     RPCArg::Optional::NO, "0 or 1"},
+            {"pric_claim_presig_blob",  RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Serialized adaptor_ringsig::AdaptorPreSignature"},
+            {"btc_refund_sig",          RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "64-byte BIP340 sig (hex)"},
+            {"pric_refund_sig_blob",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Serialized ringsig::Signature"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated swap record" },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_set_pre_signed", "<swap_id> ...")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseSwapId(request.params[0].get_str());
+
+            auto parse_hex = [](const UniValue& v, const char* name) {
+                auto bytes = TryParseHex<unsigned char>(v.get_str());
+                if (!bytes) throw JSONRPCError(RPC_INVALID_PARAMETER, std::string(name) + " must be hex");
+                return *bytes;
+            };
+            aas::AdaptorSwapPreSigs ps;
+            ps.btc_claim_presig         = parse_hex(request.params[1], "btc_claim_presig");
+            ps.btc_claim_session        = parse_hex(request.params[2], "btc_claim_session");
+            ps.btc_claim_nonce_parity   = request.params[3].getInt<int32_t>();
+            ps.pric_claim_presig_blob   = parse_hex(request.params[4], "pric_claim_presig_blob");
+            ps.btc_refund_sig           = parse_hex(request.params[5], "btc_refund_sig");
+            ps.pric_refund_sig_blob     = parse_hex(request.params[6], "pric_refund_sig_blob");
+
+            auto r = aas::SetPreSigned(*wallet_sp, sid, ps);
+            if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
+            aas::AdaptorSwap out;
+            (void)aas::Get(*wallet_sp, sid, out);
+            return AdaptorSwapToJSON(out);
+        }
+    };
+}
+
+RPCMethod pricoin_adaptor_swap_set_pric_claimed()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_set_pric_claimed",
+        "Record Bob's PRIC claim tx confirmed (t now extractable from on-chain).\n"
+        "Transitions pre_signed → pric_claimed. For Bob, also wipes the in-wallet\n"
+        "copy of t_secret (no longer secret — it's on-chain).\n",
+        {
+            {"swap_id",          RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"pric_claim_txid",  RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte PRIC txid"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated swap record" },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_set_pric_claimed", "<swap_id> <txid>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseSwapId(request.params[0].get_str());
+            auto txid = uint256::FromHex(request.params[1].get_str());
+            if (!txid) throw JSONRPCError(RPC_INVALID_PARAMETER, "pric_claim_txid must be 32-byte hex");
+            auto r = aas::SetPricClaimed(*wallet_sp, sid, *txid);
+            if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
+            aas::AdaptorSwap out;
+            (void)aas::Get(*wallet_sp, sid, out);
+            return AdaptorSwapToJSON(out);
+        }
+    };
+}
+
+RPCMethod pricoin_adaptor_swap_set_complete()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_set_complete",
+        "Record Alice's foreign claim tx confirmed. Swap is done. pric_claimed → complete.\n",
+        {
+            {"swap_id",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"foreign_claim_txid", RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated swap record" },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_set_complete", "<swap_id> <foreign_txid>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseSwapId(request.params[0].get_str());
+            auto r = aas::SetComplete(*wallet_sp, sid, request.params[1].get_str());
+            if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
+            aas::AdaptorSwap out;
+            (void)aas::Get(*wallet_sp, sid, out);
+            return AdaptorSwapToJSON(out);
+        }
+    };
+}
+
+RPCMethod pricoin_adaptor_swap_set_refunded()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_set_refunded",
+        "Record refund tx confirmed (timelock expired). Allowed from both_funded,\n"
+        "pre_signed, or pric_claimed. Pass the txid for whichever leg refunded;\n"
+        "leave the other empty.\n",
+        {
+            {"swap_id",                   RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"pric_refund_txid_or_empty", RPCArg::Type::STR_HEX, RPCArg::Default{""}, "32-byte PRIC txid or empty"},
+            {"foreign_refund_txid_or_empty", RPCArg::Type::STR,  RPCArg::Default{""}, "Foreign txid or empty"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated swap record" },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_set_refunded", "<swap_id> <pric_txid> \"\"")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseSwapId(request.params[0].get_str());
+            uint256 pric_txid{};
+            const std::string pric_hex = request.params[1].isNull() ? "" : request.params[1].get_str();
+            if (!pric_hex.empty()) {
+                auto opt = uint256::FromHex(pric_hex);
+                if (!opt) throw JSONRPCError(RPC_INVALID_PARAMETER, "pric_refund_txid must be 32-byte hex if non-empty");
+                pric_txid = *opt;
+            }
+            const std::string foreign_txid = request.params[2].isNull() ? "" : request.params[2].get_str();
+            auto r = aas::SetRefunded(*wallet_sp, sid, pric_txid, foreign_txid);
+            if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
+            aas::AdaptorSwap out;
+            (void)aas::Get(*wallet_sp, sid, out);
+            return AdaptorSwapToJSON(out);
+        }
+    };
+}
+
+RPCMethod pricoin_adaptor_swap_abort()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_abort",
+        "Operator-initiated abort. Allowed from any non-terminal state.\n"
+        "Wipes any in-wallet copy of t_secret as a side-effect.\n",
+        {
+            {"swap_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"reason",  RPCArg::Type::STR,     RPCArg::Default{""}, "Free-form abort reason"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated swap record" },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_abort", "<swap_id> \"counterparty stalled\"")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseSwapId(request.params[0].get_str());
+            const std::string reason = request.params[1].isNull() ? "" : request.params[1].get_str();
+            auto r = aas::Abort(*wallet_sp, sid, reason);
+            if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
+            aas::AdaptorSwap out;
+            (void)aas::Get(*wallet_sp, sid, out);
+            return AdaptorSwapToJSON(out);
+        }
+    };
+}
+
+RPCMethod pricoin_adaptor_swap_get()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_get",
+        "Read a swap record.\n",
+        { {"swap_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""} },
+        RPCResult{ RPCResult::Type::ANY, "", "Swap record" },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_get", "<swap_id>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseSwapId(request.params[0].get_str());
+            aas::AdaptorSwap out;
+            auto r = aas::Get(*wallet_sp, sid, out);
+            if (r == aas::LookupResult::Locked) throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+            if (r == aas::LookupResult::NotFound) throw JSONRPCError(RPC_INVALID_REQUEST, "no swap with that id");
+            return AdaptorSwapToJSON(out);
+        }
+    };
+}
+
+RPCMethod pricoin_adaptor_swap_list()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_list",
+        "List all adaptor-swap records in this wallet.\n",
+        {},
+        RPCResult{ RPCResult::Type::ARR, "", "",
+            {{RPCResult::Type::ANY, "", "Swap record"}} },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_list", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            std::vector<aas::AdaptorSwap> all;
+            auto r = aas::List(*wallet_sp, all);
+            if (r == aas::LookupResult::Locked) throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+            UniValue out{UniValue::VARR};
+            for (const auto& s : all) out.push_back(AdaptorSwapToJSON(s));
+            return out;
+        }
+    };
+}
+
 } // namespace
 
 RPCMethod pricoin_getstealthaddress_export() { return pricoin_getstealthaddress(); }
@@ -4292,6 +4824,18 @@ RPCMethod pricoin_clsag_nonce_get_export()             { return pricoin_clsag_no
 RPCMethod pricoin_clsag_nonce_list_export()            { return pricoin_clsag_nonce_list(); }
 RPCMethod pricoin_clsag_nonce_erase_export()           { return pricoin_clsag_nonce_erase(); }
 RPCMethod pricoin_jointspend_round1_safe_export()      { return pricoin_jointspend_round1_safe(); }
+RPCMethod pricoin_adaptor_swap_create_export()           { return pricoin_adaptor_swap_create(); }
+RPCMethod pricoin_adaptor_swap_set_adaptor_export()      { return pricoin_adaptor_swap_set_adaptor(); }
+RPCMethod pricoin_adaptor_swap_set_timelocks_export()    { return pricoin_adaptor_swap_set_timelocks(); }
+RPCMethod pricoin_adaptor_swap_set_btc_funded_export()   { return pricoin_adaptor_swap_set_btc_funded(); }
+RPCMethod pricoin_adaptor_swap_set_pric_funded_export()  { return pricoin_adaptor_swap_set_pric_funded(); }
+RPCMethod pricoin_adaptor_swap_set_pre_signed_export()   { return pricoin_adaptor_swap_set_pre_signed(); }
+RPCMethod pricoin_adaptor_swap_set_pric_claimed_export() { return pricoin_adaptor_swap_set_pric_claimed(); }
+RPCMethod pricoin_adaptor_swap_set_complete_export()     { return pricoin_adaptor_swap_set_complete(); }
+RPCMethod pricoin_adaptor_swap_set_refunded_export()     { return pricoin_adaptor_swap_set_refunded(); }
+RPCMethod pricoin_adaptor_swap_abort_export()            { return pricoin_adaptor_swap_abort(); }
+RPCMethod pricoin_adaptor_swap_get_export()              { return pricoin_adaptor_swap_get(); }
+RPCMethod pricoin_adaptor_swap_list_export()             { return pricoin_adaptor_swap_list(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

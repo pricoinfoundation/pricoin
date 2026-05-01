@@ -141,8 +141,10 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   pricoin/adaptor_ringsig.cpp
   pricoin/clsag_nonce_policy.cpp
   pricoin/joint_ringsig.cpp
+  swap/atomic_swap_e2e_test.cpp
   swap/btc_adaptor_schnorr.cpp
   swap/btc_musig2_adaptor.cpp
+  swap/refund.cpp
   pricoin/joint_stealth.cpp
   pricoin/ringsig.cpp
   pricoin/stealth.cpp

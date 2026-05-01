@@ -938,6 +938,18 @@ RPCMethod pricoin_clsag_nonce_get_export();
 RPCMethod pricoin_clsag_nonce_list_export();
 RPCMethod pricoin_clsag_nonce_erase_export();
 RPCMethod pricoin_jointspend_round1_safe_export();
+RPCMethod pricoin_adaptor_swap_create_export();
+RPCMethod pricoin_adaptor_swap_set_adaptor_export();
+RPCMethod pricoin_adaptor_swap_set_timelocks_export();
+RPCMethod pricoin_adaptor_swap_set_btc_funded_export();
+RPCMethod pricoin_adaptor_swap_set_pric_funded_export();
+RPCMethod pricoin_adaptor_swap_set_pre_signed_export();
+RPCMethod pricoin_adaptor_swap_set_pric_claimed_export();
+RPCMethod pricoin_adaptor_swap_set_complete_export();
+RPCMethod pricoin_adaptor_swap_set_refunded_export();
+RPCMethod pricoin_adaptor_swap_abort_export();
+RPCMethod pricoin_adaptor_swap_get_export();
+RPCMethod pricoin_adaptor_swap_list_export();
 RPCMethod pricoin_listownct_export();
 RPCMethod walletsendct_from_ct_export();
 RPCMethod walletsendct_ring_export();
@@ -984,6 +996,18 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &pricoin_clsag_nonce_list_export},
         {"wallet", &pricoin_clsag_nonce_erase_export},
         {"wallet", &pricoin_jointspend_round1_safe_export},
+        {"wallet", &pricoin_adaptor_swap_create_export},
+        {"wallet", &pricoin_adaptor_swap_set_adaptor_export},
+        {"wallet", &pricoin_adaptor_swap_set_timelocks_export},
+        {"wallet", &pricoin_adaptor_swap_set_btc_funded_export},
+        {"wallet", &pricoin_adaptor_swap_set_pric_funded_export},
+        {"wallet", &pricoin_adaptor_swap_set_pre_signed_export},
+        {"wallet", &pricoin_adaptor_swap_set_pric_claimed_export},
+        {"wallet", &pricoin_adaptor_swap_set_complete_export},
+        {"wallet", &pricoin_adaptor_swap_set_refunded_export},
+        {"wallet", &pricoin_adaptor_swap_abort_export},
+        {"wallet", &pricoin_adaptor_swap_get_export},
+        {"wallet", &pricoin_adaptor_swap_list_export},
         {"wallet", &pricoin_listownct_export},
         {"wallet", &walletsendct_from_ct_export},
         {"wallet", &walletsendct_ring_export},
