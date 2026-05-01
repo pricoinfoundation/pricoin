@@ -10,6 +10,7 @@
 
 #include <crypto/sha256.h>
 #include <logging.h>
+#include <pricoin/adaptor_ringsig.h>
 #include <pricoin/cttx.h>
 #include <pricoin/joint_ringsig.h>
 #include <pricoin/ringsig.h>
@@ -458,6 +459,10 @@ void RunSelfTest()
     // and multi-layer flows both exercised).
     ::pricoin::joint_ringsig::RunSelfTest();
     LogInfo("Pricoin joint_ringsig (cooperative CLSAG, single + multi-layer) self-test passed");
+
+    // Atomic-swap phase 5 — adaptor-CLSAG (single-party + DLEQ).
+    ::pricoin::adaptor_ringsig::RunSelfTest();
+    LogInfo("Pricoin adaptor_ringsig (adaptor-CLSAG single-party + DLEQ) self-test passed");
 }
 
 } // namespace pricoin::ct

@@ -137,6 +137,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   pow/randomx_pricoin.cpp
   pricoin/ct.cpp
   pricoin/cttx.cpp
+  pricoin/adaptor_ringsig.cpp
   pricoin/joint_ringsig.cpp
   pricoin/joint_stealth.cpp
   pricoin/ringsig.cpp
