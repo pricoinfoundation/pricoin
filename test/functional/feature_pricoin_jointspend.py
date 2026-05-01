@@ -57,8 +57,8 @@ class PricoinJointSpendTest(BitcoinTestFramework):
         self.extra_args = [["-txindex=1"]]
 
     def skip_test_if_missing_module(self):
-        # No wallet ops needed — these are node-level RPCs.
-        pass
+        # Sections 1–3 are node-level only; section 4 needs a wallet.
+        self.skip_if_no_wallet()
 
     def run_test(self):
         node = self.nodes[0]
@@ -74,6 +74,11 @@ class PricoinJointSpendTest(BitcoinTestFramework):
         # Section 3 — negative tests.
         self.log.info("Section 3: negative tests")
         self._run_negative_tests(node)
+
+        # Section 4 — wallet integration: real joint output + loadshare
+        # produces an x_share that drives the cooperative protocol.
+        self.log.info("Section 4: wallet loadshare → cooperative CLSAG")
+        self._run_wallet_loadshare(node)
 
         self.log.info("Pricoin cooperative-CLSAG RPC flow OK")
 
@@ -250,6 +255,136 @@ class PricoinJointSpendTest(BitcoinTestFramework):
         verified = node.pricoin_jointspend_verify(
             ring_pubs, None, msg_hex, assembled["signature_hex"])
         assert_equal(verified["valid"], False)
+
+
+    # -----------------------------------------------------------------
+
+    def _run_wallet_loadshare(self, node):
+        """Two wallets cooperatively load shares for a real joint output
+        and drive the cooperative-signing protocol on a constructed ring.
+        The signature is verified locally; on-chain spend is a follow-up
+        commit (needs v4 spend-tx integration with externally-supplied
+        CLSAG)."""
+        node.createwallet("alice_ld")
+        node.createwallet("bob_ld")
+        node.createwallet("sender_ld")
+        alice  = node.get_wallet_rpc("alice_ld")
+        bob    = node.get_wallet_rpc("bob_ld")
+        sender = node.get_wallet_rpc("sender_ld")
+
+        # Fund the sender from a fresh transparent coinbase.
+        sender_tx_addr = sender.getnewaddress(address_type="bech32")
+        self.generatetoaddress(node, 110, sender_tx_addr)
+
+        alice_keys = alice.pricoin_getstealthaddress()
+        bob_keys   = bob.pricoin_getstealthaddress()
+        joint = alice.pricoin_buildjointstealthaddress(
+            bob_keys["view_pubkey"], bob_keys["spend_pubkey"])
+
+        # Send 4.2 PRIC to the joint stealth address.
+        sent = sender.walletsendct(joint["address"], 4.2, 0.0001)
+        self.generatetoaddress(node, 1, sender_tx_addr)
+        joint_txid = sent["txid"]
+        joint_tx_hex = node.getrawtransaction(joint_txid)
+        joint_raw = node.decoderawtransaction(joint_tx_hex)
+
+        # Find the joint vout via brute-force cooperative scan.
+        joint_vout = None
+        for vidx in range(len(joint_raw["vout"])):
+            try:
+                a_partial = alice.pricoin_jointscan_partial(joint_tx_hex, vidx)["partial"]
+                b_partial = bob.pricoin_jointscan_partial(joint_tx_hex, vidx)["partial"]
+                bob.pricoin_jointscan_recover(
+                    joint_tx_hex, vidx, b_partial, a_partial,
+                    alice_keys["spend_pubkey"])
+                joint_vout = vidx
+                break
+            except Exception:
+                continue
+        assert joint_vout is not None, "joint output should be findable"
+
+        # Both parties run loadshare. Alice absorbs h_s; Bob does not.
+        a_partial = alice.pricoin_jointscan_partial(joint_tx_hex, joint_vout)["partial"]
+        b_partial = bob.pricoin_jointscan_partial(joint_tx_hex, joint_vout)["partial"]
+        a_load = alice.pricoin_jointspend_loadshare(
+            joint_tx_hex, joint_vout, a_partial, b_partial,
+            bob_keys["spend_pubkey"], True)
+        b_load = bob.pricoin_jointspend_loadshare(
+            joint_tx_hex, joint_vout, b_partial, a_partial,
+            alice_keys["spend_pubkey"], False)
+        # Both parties see the same value, blind, and joint pubkey.
+        assert_equal(a_load["value"], b_load["value"])
+        assert_equal(float(a_load["value"]), 4.2)
+        assert_equal(a_load["blind"], b_load["blind"])
+        assert_equal(a_load["joint_pubkey"], b_load["joint_pubkey"])
+        joint_pub_hex = a_load["joint_pubkey"]
+
+        # Sanity: x_share_A + x_share_B (mod n) · G == joint_pubkey.
+        x_A = a_load["x_share"]
+        x_B = b_load["x_share"]
+        joint_priv_int = (scalar_int(x_A) + scalar_int(x_B)) % ORDER
+        derived_pub = scalar_to_pubkey_bytes(joint_priv_int).hex()
+        assert_equal(derived_pub, joint_pub_hex)
+
+        # Build a 4-member ring with the real joint output's P at pi=0
+        # plus 3 random decoys. Drive the cooperative single-layer
+        # protocol; verify the assembled signature.
+        N = 4
+        pi = 0
+        msg_hex = "ab" * 32
+        session_hex = "deadbeef" * 4
+
+        decoy_keys = [generate_privkey() for _ in range(N - 1)]
+        decoy_pubs = [scalar_to_pubkey_bytes(scalar_int(k.hex())).hex() for k in decoy_keys]
+        ring = [joint_pub_hex] + decoy_pubs
+
+        r1_A = node.pricoin_jointspend_round1(joint_pub_hex, x_A, session_hex)
+        r1_B = node.pricoin_jointspend_round1(joint_pub_hex, x_B, session_hex)
+        s_others = [generate_privkey().hex() for _ in range(N)]
+        parties = [
+            {k: r[k] for k in ("L_share", "R_share", "KI_share", "commitment")}
+            for r in (r1_A, r1_B)
+        ]
+        combined = node.pricoin_jointspend_combine(
+            ring, None, pi, msg_hex, session_hex, parties, s_others)
+        s_share_A = node.pricoin_jointspend_share(
+            r1_A["alpha"], combined["c_pi"], x_A)["s_share"]
+        s_share_B = node.pricoin_jointspend_share(
+            r1_B["alpha"], combined["c_pi"], x_B)["s_share"]
+        assembled = node.pricoin_jointspend_assemble(
+            combined["KI"], combined["c0"], s_others, [s_share_A, s_share_B], pi)
+        verified = node.pricoin_jointspend_verify(
+            ring, None, msg_hex, assembled["signature_hex"])
+        assert_equal(verified["valid"], True)
+
+        # Negative: BOTH parties absorbing → x_shares sum to 2·h_s + b_J,
+        # which doesn't match joint_pub. The cooperative signature won't
+        # verify even though every individual RPC call succeeds.
+        a_double = alice.pricoin_jointspend_loadshare(
+            joint_tx_hex, joint_vout, a_partial, b_partial,
+            bob_keys["spend_pubkey"], True)
+        b_double = bob.pricoin_jointspend_loadshare(
+            joint_tx_hex, joint_vout, b_partial, a_partial,
+            alice_keys["spend_pubkey"], True)
+        x_A2, x_B2 = a_double["x_share"], b_double["x_share"]
+        r1_A2 = node.pricoin_jointspend_round1(joint_pub_hex, x_A2, session_hex)
+        r1_B2 = node.pricoin_jointspend_round1(joint_pub_hex, x_B2, session_hex)
+        parties2 = [
+            {k: r[k] for k in ("L_share", "R_share", "KI_share", "commitment")}
+            for r in (r1_A2, r1_B2)
+        ]
+        # KI from the (wrong) shares won't match the real joint pub's KI.
+        combined2 = node.pricoin_jointspend_combine(
+            ring, None, pi, msg_hex, session_hex, parties2, s_others)
+        s_A2 = node.pricoin_jointspend_share(
+            r1_A2["alpha"], combined2["c_pi"], x_A2)["s_share"]
+        s_B2 = node.pricoin_jointspend_share(
+            r1_B2["alpha"], combined2["c_pi"], x_B2)["s_share"]
+        assembled2 = node.pricoin_jointspend_assemble(
+            combined2["KI"], combined2["c0"], s_others, [s_A2, s_B2], pi)
+        verified2 = node.pricoin_jointspend_verify(
+            ring, None, msg_hex, assembled2["signature_hex"])
+        assert_equal(verified2["valid"], False)
 
 
 if __name__ == "__main__":

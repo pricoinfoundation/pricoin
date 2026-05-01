@@ -2123,6 +2123,185 @@ RPCMethod pricoin_jointscan_recover()
     };
 }
 
+// Atomic-swap stage 2b — load this wallet's spend-secret share for a
+// joint stealth output. The caller will pass the returned x_share into
+// pricoin_jointspend_round1 as part of the cooperative signing
+// protocol; one party should pass `absorb_shared_secret = true` and
+// the other `false` so that the two shares sum to the one-time priv.
+RPCMethod pricoin_jointspend_loadshare()
+{
+    return RPCMethod{
+        "pricoin_jointspend_loadshare",
+        "Compute this wallet's x_share (and read out the rangeproof blind\n"
+        "and recovered value) for a joint stealth output. Used to drive the\n"
+        "cooperative-signing flow in pricoin_jointspend_round1 et al.\n"
+        "\n"
+        "Inputs are the same as pricoin_jointscan_recover, plus a bool\n"
+        "controlling which party absorbs the stealth-derived h_s scalar:\n"
+        "exactly ONE of the two parties must pass absorb_shared_secret=true.\n"
+        "Their two x_shares then sum to the joint one-time priv (= h_s +\n"
+        "b_self + b_other), which is the spend secret for the joint output.\n"
+        "\n"
+        "WARNING: x_share embeds this wallet's stealth spend privkey. Treat\n"
+        "the returned hex with the same care as a wallet seed — any party\n"
+        "with both x_shares can sign solo. The cooperative-signing protocol\n"
+        "assumes the caller is trusted by this wallet.\n",
+        {
+            {"tx_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Raw v4 transaction containing the joint output (hex)"},
+            {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Index of the joint output within the tx"},
+            {"my_partial", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Self partial returned by pricoin_jointscan_partial"},
+            {"other_partial", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Counterparty's partial"},
+            {"other_spend_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Counterparty's spend pubkey (33 bytes hex)"},
+            {"absorb_shared_secret", RPCArg::Type::BOOL, RPCArg::Default{true},
+             "Whether THIS party absorbs the stealth-derived h_s into its\n"
+             "x_share. Exactly one of the two parties must pass true."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "x_share",
+                    "32-byte spend-secret share for the cooperative protocol"},
+                {RPCResult::Type::STR_HEX, "blind",
+                    "32-byte rangeproof blind (b_prev)"},
+                {RPCResult::Type::STR_AMOUNT, "value",
+                    "Recovered amount in PRIC"},
+                {RPCResult::Type::STR_HEX, "joint_pubkey",
+                    "33-byte one-time pubkey at the joint output (= ring[pi].P "
+                    "for cooperative signing)"},
+                {RPCResult::Type::NUM, "vout",
+                    "Echo of input vout (for caller convenience)"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("pricoin_jointspend_loadshare",
+                "\"<tx hex>\" 1 \"03...\" \"03...\" \"02...\" true")
+        },
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            if (wallet.HasEncryptionKeys() && wallet.IsLocked()) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED,
+                    "Cooperative load requires the wallet to be unlocked.");
+            }
+
+            const std::string tx_hex = request.params[0].get_str();
+            const uint32_t vout = request.params[1].getInt<uint32_t>();
+            const std::string my_partial_hex = request.params[2].get_str();
+            const std::string other_partial_hex = request.params[3].get_str();
+            const std::string other_spend_hex = request.params[4].get_str();
+            const bool absorb = request.params[5].isNull()
+                ? true : request.params[5].get_bool();
+
+            for (const auto& [name, hex] : {
+                    std::pair{"my_partial", my_partial_hex},
+                    std::pair{"other_partial", other_partial_hex},
+                    std::pair{"other_spend_pubkey", other_spend_hex}}) {
+                if (!IsHex(hex) || hex.size() != 66) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        strprintf("%s must be 66 hex characters (33 bytes)", name));
+                }
+            }
+            const std::vector<unsigned char> my_partial    = ParseHex(my_partial_hex);
+            const std::vector<unsigned char> other_partial = ParseHex(other_partial_hex);
+            const std::vector<unsigned char> other_spend_b = ParseHex(other_spend_hex);
+            CPubKey other_spend(std::span<const unsigned char>{other_spend_b});
+            if (!other_spend.IsValid() || !other_spend.IsCompressed()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "other_spend_pubkey is not a valid compressed secp256k1 point");
+            }
+
+            // Decode and sanity-check the tx.
+            CMutableTransaction mtx;
+            if (!DecodeHexTx(mtx, tx_hex, /*try_no_witness=*/true, /*try_witness=*/true)) {
+                throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "tx hex failed to decode");
+            }
+            CTransaction tx{std::move(mtx)};
+            if (tx.version != PRICOIN_CT_VERSION) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "tx is not a v4 confidential tx");
+            }
+            if (vout >= tx.vout.size() || vout >= tx.ct_bundle.outputs.size()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "vout out of range");
+            }
+
+            // Combine partials → joint ECDH point.
+            auto shared_point = ::pricoin::joint_stealth::CombinePartials(my_partial, other_partial);
+            if (!shared_point) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "partial combine failed");
+            }
+            auto shared = ::pricoin::stealth::DeriveSharedSecret(*shared_point, vout);
+
+            const auto& self_id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+            ::pricoin::stealth::StealthAddress other;
+            other.view  = self_id.public_address.view;   // dummy; not used downstream
+            other.spend = other_spend;
+            auto joint_addr = ::pricoin::joint_stealth::Combine(self_id.public_address, other);
+            if (!joint_addr) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "joint key combine failed");
+            }
+            auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, joint_addr->spend);
+            if (!P) throw JSONRPCError(RPC_INTERNAL_ERROR, "one-time pubkey derivation failed");
+
+            const CScript expected_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
+            if (tx.vout[vout].scriptPubKey != expected_spk) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "scriptPubKey mismatch — partials don't decode to this output");
+            }
+
+            // Rewind the rangeproof so the caller has b_prev.
+            auto rp_nonce = ::pricoin::stealth::DeriveRangeProofNonce(*shared_point, vout);
+            ::pricoin::ct::BlindingFactor nonce_arr{};
+            std::memcpy(nonce_arr.data(), rp_nonce.data(), 32);
+            const auto& outp = tx.ct_bundle.outputs[vout];
+            const auto& script = outp.script_pubkey;
+            auto rewound = ::pricoin::ct::RewindRangeProof(
+                outp.commitment,
+                std::span<const unsigned char>{outp.rangeproof.data(), outp.rangeproof.size()},
+                std::span<const unsigned char>{script.data(), script.size()},
+                nonce_arr);
+            if (!rewound) throw JSONRPCError(RPC_INTERNAL_ERROR, "rangeproof rewind failed");
+
+            // Compute this party's x_share. Two cases:
+            //   absorb=true  → x_share = b_self + h_s   (mod n)
+            //   absorb=false → x_share = b_self
+            // The two parties' x_shares sum to (b_self + b_other + h_s) =
+            // the implicit one-time priv for the joint output, regardless
+            // of which party absorbed.
+            std::array<unsigned char, 32> x_share_bytes{};
+            if (absorb) {
+                auto one_time = ::pricoin::stealth::DeriveOneTimePriv(shared, self_id.spend);
+                if (!one_time) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "one-time priv derivation failed");
+                }
+                std::memcpy(x_share_bytes.data(), one_time->begin(), 32);
+            } else {
+                std::memcpy(x_share_bytes.data(), self_id.spend.begin(), 32);
+            }
+
+            // Joint pubkey for the cooperative-signing ring (= the on-chain
+            // one-time pubkey, which is what `ring[pi].P` will be).
+            const ::pricoin::stealth::PointBytes joint_pub_bytes = [&] {
+                ::pricoin::stealth::PointBytes b{};
+                std::copy(P->begin(), P->end(), b.begin());
+                return b;
+            }();
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("x_share",      HexStr(x_share_bytes));
+            out.pushKV("blind",        HexStr(rewound->blind));
+            out.pushKV("value",        ValueFromAmount(static_cast<CAmount>(rewound->value)));
+            out.pushKV("joint_pubkey", HexStr(joint_pub_bytes));
+            out.pushKV("vout",         static_cast<int>(vout));
+            return out;
+        }
+    };
+}
+
 } // namespace
 
 RPCMethod pricoin_getstealthaddress_export() { return pricoin_getstealthaddress(); }
@@ -2131,6 +2310,7 @@ RPCMethod pricoin_setstealthseed_export() { return pricoin_setstealthseed(); }
 RPCMethod pricoin_buildjointstealthaddress_export() { return pricoin_buildjointstealthaddress(); }
 RPCMethod pricoin_jointscan_partial_export() { return pricoin_jointscan_partial(); }
 RPCMethod pricoin_jointscan_recover_export() { return pricoin_jointscan_recover(); }
+RPCMethod pricoin_jointspend_loadshare_export() { return pricoin_jointspend_loadshare(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }
