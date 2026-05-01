@@ -2383,6 +2383,10 @@ RPCMethod pricoin_jointspend_buildtx()
             {"fee", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Transparent fee in PRIC"},
             {"ring_size", RPCArg::Type::NUM, RPCArg::Default{4},
                 "Total ring size (must have ring_size-1 chain decoys)"},
+            {"nlocktime", RPCArg::Type::NUM, RPCArg::Default{0},
+                "Absolute block-height nLockTime to bake into the tx. 0 = no\n"
+                "timelock (default — claim-tx behaviour). Set ≥ T_pric_refund\n"
+                "(spec §6.2 step 7) to produce a refund-tx skeleton."},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -2420,6 +2424,11 @@ RPCMethod pricoin_jointspend_buildtx()
             const CAmount fee = AmountFromValue(request.params[7]);
             const int ring_size = request.params[8].isNull() ? 4 : request.params[8].getInt<int>();
             if (ring_size < 2) throw JSONRPCError(RPC_INVALID_PARAMETER, "ring_size must be >= 2");
+            const int64_t nlocktime = request.params[9].isNull() ? 0 : request.params[9].getInt<int64_t>();
+            if (nlocktime < 0 || nlocktime > 0xffffffff) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "nlocktime must fit in uint32 (use 0 for no timelock)");
+            }
 
             auto joint_txid_opt = uint256::FromHex(joint_txid_hex);
             if (!joint_txid_opt) throw JSONRPCError(RPC_INVALID_PARAMETER, "joint_txid not hex");
@@ -2622,7 +2631,7 @@ RPCMethod pricoin_jointspend_buildtx()
 
             CMutableTransaction mtx;
             mtx.version = PRICOIN_CT_VERSION;
-            mtx.nLockTime = 0;
+            mtx.nLockTime = static_cast<uint32_t>(nlocktime);
             const COutPoint marker_outpoint{
                 Txid::FromUint256(ring_input.ring[0].hash), ring_input.ring[0].n};
             mtx.vin.emplace_back(marker_outpoint, CScript{}, 0xfffffffe);
