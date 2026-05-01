@@ -16,6 +16,7 @@
 #include <pricoin/joint_ringsig.h>
 #include <pricoin/joint_stealth.h>
 #include <pricoin/ringsig.h>
+#include <swap/btc_adaptor_schnorr.h>
 #include <primitives/transaction.h>
 #include <random.h>
 #include <script/script.h>
@@ -477,6 +478,10 @@ void RunSelfTest()
     // Atomic-swap phase 5 — joint-stealth proof-of-possession (rogue-key defense).
     ::pricoin::joint_stealth::RunPoPSelfTest();
     LogInfo("Pricoin joint_stealth PoP (rogue-key defense) self-test passed");
+
+    // Atomic-swap phase 5 — BIP340 adaptor-Schnorr (foreign-chain leg).
+    ::pricoin::swap::btc_adaptor_schnorr::RunSelfTest();
+    LogInfo("Pricoin btc_adaptor_schnorr (single-party BIP340 adaptor) self-test passed");
 }
 
 } // namespace pricoin::ct
