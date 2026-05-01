@@ -77,6 +77,7 @@
 #include <swap/chain_backend.h>
 #include <swap/esplora_backend.h>
 #endif
+#include <swap/btc_musig2_runtime.h>
 #include <protocol.h>
 #include <rpc/blockchain.h>
 #include <rpc/register.h>
@@ -448,6 +449,7 @@ void Shutdown(NodeContext& node)
     // Drop chain-watch backends (libevent state etc.). Independent of
     // the wallet — backends live at the process level.
     try { pricoin::swap::Shutdown(); } catch (...) {}
+    try { pricoin::swap::btc_musig2_runtime::Shutdown(); } catch (...) {}
 
     RemovePidFile(*node.args);
 

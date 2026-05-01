@@ -35,6 +35,8 @@
 #include <core_io.h>
 #include <wallet/coincontrol.h>
 #include <wallet/coinselection.h>
+#include <swap/btc_musig2_adaptor.h>
+#include <swap/btc_musig2_runtime.h>
 #include <wallet/pricoin_adaptor_swap.h>
 #include <wallet/pricoin_clsag_nonce_records.h>
 #include <wallet/pricoin_ct_send.h>
@@ -4787,6 +4789,497 @@ RPCMethod pricoin_adaptor_swap_list()
     };
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Atomic-swap phase 5 — BTC MuSig2 wire-protocol RPCs.
+//
+// Thin RPC wrappers around btc_musig2_adaptor primitives that expose
+// the BIP327 + adaptor flow as discrete steps callable by either
+// party's wallet during a 2-of-2 cooperative signing session.
+//
+// FLOW (matches doc/adaptor-clsag.md §6.2 step 6 + step 7 BTC leg):
+//
+//   1.  pricoin_btc_musig2_keyagg            → keyagg_cache + agg xonly pub
+//   2.  pricoin_btc_musig2_round1   (× each party)
+//                                            → pubnonce + secnonce_handle
+//   3.  pricoin_btc_musig2_aggregate_nonces  → aggnonce
+//   4.  pricoin_btc_musig2_process           → session + nonce_parity
+//                                              (with optional adaptor T_G)
+//   5.  pricoin_btc_musig2_partial_sign  (× each party)
+//                                            → partial sig (consumes handle)
+//   6.  pricoin_btc_musig2_aggregate_partials → 64-byte (pre-)sig
+//   7.  pricoin_btc_musig2_adapt             → BIP340 sig (from pre-sig + t)
+//   8.  pricoin_btc_musig2_extract           → t (from sig + pre-sig)
+//
+// Step 7 is only used when an adaptor was supplied at step 4.
+//
+// SECNONCE LIFETIME
+//   The secnonce produced at round 1 is held in process memory keyed
+//   by an opaque 32-byte handle (see swap/btc_musig2_runtime). It's
+//   destroyed by partial_sign (libsecp256k1 invalidates the buffer)
+//   and on daemon shutdown. Caller MUST NOT call round1 twice with
+//   the same swap context expecting two distinct secnonces — that's
+//   the standard MuSig2 nonce-reuse footgun. A future commit will
+//   add a §4.1a-style commitment record to enforce this across
+//   crashes.
+// ─────────────────────────────────────────────────────────────────
+
+namespace bma = ::pricoin::swap::btc_musig2_adaptor;
+namespace btr = ::pricoin::swap::btc_musig2_runtime;
+
+namespace {
+
+std::vector<CPubKey> ParseBtcPubKeys(const UniValue& arr)
+{
+    if (!arr.isArray() || arr.empty()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "pubkeys must be a non-empty array of 33-byte hex strings");
+    }
+    std::vector<CPubKey> out;
+    out.reserve(arr.size());
+    for (size_t i = 0; i < arr.size(); ++i) {
+        auto bytes = TryParseHex<unsigned char>(arr[i].get_str());
+        if (!bytes || bytes->size() != 33) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "pubkeys[" + std::to_string(i) + "] must be 33-byte compressed hex");
+        }
+        out.emplace_back(std::span<const unsigned char>(bytes->data(), 33));
+        if (!out.back().IsValid() || !out.back().IsCompressed()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "pubkeys[" + std::to_string(i) + "] is not a valid compressed pubkey");
+        }
+    }
+    return out;
+}
+
+template <typename Array>
+Array ParseFixedHex(const std::string& s, const char* what)
+{
+    auto bytes = TryParseHex<unsigned char>(s);
+    if (!bytes || bytes->size() != Array{}.size()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            std::string(what) + " must be " + std::to_string(Array{}.size()) + "-byte hex");
+    }
+    Array out;
+    std::copy(bytes->begin(), bytes->end(), out.begin());
+    return out;
+}
+
+// Helpers for parsing/serializing the opaque blob types.
+bma::KeyAggCache ParseKeyAggCacheBlob(const std::string& s)
+{
+    auto bytes = TryParseHex<unsigned char>(s);
+    if (!bytes || bytes->size() != 197) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "keyagg_cache must be 197-byte hex");
+    }
+    bma::KeyAggCache out;
+    std::copy(bytes->begin(), bytes->end(), out.data.begin());
+    return out;
+}
+
+bma::Session ParseSessionBlob(const UniValue& session_obj)
+{
+    const auto data_hex = session_obj.find_value("data").get_str();
+    auto bytes = TryParseHex<unsigned char>(data_hex);
+    if (!bytes || bytes->size() != 133) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "session.data must be 133-byte hex");
+    }
+    bma::Session out;
+    std::copy(bytes->begin(), bytes->end(), out.data.begin());
+    out.nonce_parity = session_obj.find_value("nonce_parity").getInt<int>();
+    return out;
+}
+
+UniValue SessionToJSON(const bma::Session& s)
+{
+    UniValue o{UniValue::VOBJ};
+    o.pushKV("data", HexStr(s.data));
+    o.pushKV("nonce_parity", s.nonce_parity);
+    return o;
+}
+
+RPCMethod pricoin_btc_musig2_keyagg()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_keyagg",
+        "BIP327 MuSig2 pubkey aggregation. Returns the 32-byte x-only\n"
+        "aggregate pubkey (used as the BTC 2-of-2 spend key) plus the\n"
+        "197-byte keyagg_cache that subsequent steps must echo back.\n"
+        "\n"
+        "PUBKEY ORDER MATTERS: both parties must call this with the\n"
+        "pubkeys in the same order. (BIP327 keyagg is order-sensitive.)\n",
+        {
+            {"pubkeys", RPCArg::Type::ARR, RPCArg::Optional::NO,
+                "Array of 33-byte compressed pubkeys, identical order on both parties.",
+                {
+                    {"pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "33-byte compressed pubkey hex"},
+                }
+            },
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "agg_xonly", "32-byte x-only aggregate pubkey"},
+                {RPCResult::Type::STR_HEX, "keyagg_cache", "197-byte cache to pass into subsequent calls"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_keyagg", "[\"<pub_a>\",\"<pub_b>\"]")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto pubs = ParseBtcPubKeys(request.params[0]);
+            bma::KeyAggCache cache;
+            auto agg = bma::AggregatePubkeys(pubs, cache);
+            if (!agg) throw JSONRPCError(RPC_INTERNAL_ERROR, "MuSig2 keyagg failed");
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("agg_xonly",    HexStr(*agg));
+            out.pushKV("keyagg_cache", HexStr(cache.data));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_musig2_round1()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_round1",
+        "Round 1 of BIP327 MuSig2 — generate this party's secret nonce + public\n"
+        "nonce. The secret nonce is stashed in process memory keyed by a fresh\n"
+        "32-byte handle (returned); the partial_sign call retrieves it.\n"
+        "\n"
+        "If `self_priv` and/or `msg` are supplied, libsecp256k1 binds them into\n"
+        "the nonce derivation per BIP327 — improves nonce-misuse resistance.\n"
+        "Both should be supplied when known.\n"
+        "\n"
+        "WARNING — secnonce lifecycle:\n"
+        "  * Lives in process memory only.\n"
+        "  * partial_sign consumes (and invalidates) it.\n"
+        "  * Daemon restart drops it. The in-flight session must be re-run\n"
+        "    from round 1 if that happens.\n"
+        "  * Calling round1 twice with the SAME swap context risks nonce reuse\n"
+        "    across rounds; the spec §4.1a / clsag_nonce_records pattern is the\n"
+        "    BTC-side analog of the defense (separate commit).\n",
+        {
+            {"self_pub",     RPCArg::Type::STR_HEX, RPCArg::Optional::NO,  "33-byte compressed self pubkey"},
+            {"keyagg_cache", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,  "197-byte cache from pricoin_btc_musig2_keyagg"},
+            {"session_seed", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,  "32-byte CSPRNG bytes — must be unique per call"},
+            {"self_priv",    RPCArg::Type::STR_HEX, RPCArg::Default{""},   "Optional 32-byte priv (binding for nonce derivation)"},
+            {"msg",          RPCArg::Type::STR_HEX, RPCArg::Default{""},   "Optional 32-byte sighash bound at this stage"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "pubnonce",        "66-byte serialized pubnonce"},
+                {RPCResult::Type::STR_HEX, "secnonce_handle", "32-byte opaque handle for partial_sign"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_round1",
+            "<self_pub> <keyagg_cache> <session_seed>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            // Parse self_pub.
+            auto pub_bytes = TryParseHex<unsigned char>(request.params[0].get_str());
+            if (!pub_bytes || pub_bytes->size() != 33) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "self_pub must be 33-byte hex");
+            }
+            CPubKey self_pub(std::span<const unsigned char>(pub_bytes->data(), 33));
+            if (!self_pub.IsValid() || !self_pub.IsCompressed()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "self_pub invalid");
+            }
+            // Parse keyagg_cache.
+            bma::KeyAggCache cache = ParseKeyAggCacheBlob(request.params[1].get_str());
+            // Parse session_seed (uint256-style).
+            auto seed_bytes = TryParseHex<unsigned char>(request.params[2].get_str());
+            if (!seed_bytes || seed_bytes->size() != 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "session_seed must be 32-byte hex");
+            }
+            uint256 session_seed;
+            std::copy(seed_bytes->begin(), seed_bytes->end(), session_seed.begin());
+            // Optional self_priv.
+            std::optional<bma::Scalar> self_priv;
+            const std::string priv_hex = request.params[3].isNull() ? "" : request.params[3].get_str();
+            if (!priv_hex.empty()) {
+                auto priv_bytes = TryParseHex<unsigned char>(priv_hex);
+                if (!priv_bytes || priv_bytes->size() != 32) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "self_priv must be 32-byte hex");
+                }
+                bma::Scalar s;
+                std::copy(priv_bytes->begin(), priv_bytes->end(), s.begin());
+                self_priv = s;
+            }
+            // Optional msg.
+            std::optional<uint256> msg;
+            const std::string msg_hex = request.params[4].isNull() ? "" : request.params[4].get_str();
+            if (!msg_hex.empty()) {
+                auto m = uint256::FromHex(msg_hex);
+                if (!m) throw JSONRPCError(RPC_INVALID_PARAMETER, "msg must be 32-byte hex");
+                msg = *m;
+            }
+
+            auto secnonce = std::make_unique<MuSig2SecNonce>();
+            auto pubnonce = bma::NonceGen(*secnonce, self_priv, self_pub, msg, cache, session_seed);
+            if (!pubnonce) throw JSONRPCError(RPC_INTERNAL_ERROR, "NonceGen failed");
+
+            // Generate a fresh handle for the secnonce.
+            uint256 handle;
+            GetStrongRandBytes(handle);
+            if (!btr::Stash(handle, std::move(secnonce))) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "secnonce handle collision");
+            }
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("pubnonce",        HexStr(*pubnonce));
+            out.pushKV("secnonce_handle", handle.ToString());
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_musig2_aggregate_nonces()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_aggregate_nonces",
+        "Aggregate all parties' 66-byte pubnonces into one 66-byte aggnonce.\n"
+        "Order-independent (BIP327 nonce aggregation is commutative).\n",
+        {
+            {"pubnonces", RPCArg::Type::ARR, RPCArg::Optional::NO, "Array of 66-byte pubnonce hex strings",
+                {
+                    {"pubnonce", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "66-byte pubnonce hex"},
+                }
+            },
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "aggnonce", "66-byte aggregate nonce"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_aggregate_nonces", "[\"<pn_a>\",\"<pn_b>\"]")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            const auto& arr = request.params[0];
+            if (!arr.isArray() || arr.empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "pubnonces must be a non-empty array");
+            }
+            std::vector<bma::PubNonce66> pns;
+            pns.reserve(arr.size());
+            for (size_t i = 0; i < arr.size(); ++i) {
+                pns.push_back(ParseFixedHex<bma::PubNonce66>(arr[i].get_str(), "pubnonce"));
+            }
+            auto agg = bma::AggregateNonces(pns);
+            if (!agg) throw JSONRPCError(RPC_INTERNAL_ERROR, "AggregateNonces failed");
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("aggnonce", HexStr(*agg));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_musig2_process()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_process",
+        "Bind the aggnonce + sighash + keyagg_cache into a session. Returns\n"
+        "the 133-byte session bytes plus the nonce_parity captured at this\n"
+        "step (needed later for adapt/extract).\n"
+        "\n"
+        "If `adaptor_T_G` is supplied, the resulting aggregated signature\n"
+        "will be a pre-signature requiring Adapt(t) before BIP340 verifies.\n"
+        "Omit it for plain (non-adaptor) MuSig2 — refund flow.\n",
+        {
+            {"aggnonce",     RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "66-byte aggregate nonce"},
+            {"msg",          RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte sighash"},
+            {"keyagg_cache", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "197-byte cache"},
+            {"adaptor_T_G",  RPCArg::Type::STR_HEX, RPCArg::Default{""}, "Optional 33-byte adaptor point T_G"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "data",         "133-byte session bytes"},
+                {RPCResult::Type::NUM,     "nonce_parity", "0 or 1 — needed for adapt/extract"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_process", "<aggnonce> <msg> <cache> [<T_G>]")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto aggn = ParseFixedHex<bma::AggNonce66>(request.params[0].get_str(), "aggnonce");
+            auto msg = uint256::FromHex(request.params[1].get_str());
+            if (!msg) throw JSONRPCError(RPC_INVALID_PARAMETER, "msg must be 32-byte hex");
+            bma::KeyAggCache cache = ParseKeyAggCacheBlob(request.params[2].get_str());
+            std::optional<bma::AdaptorPointCompressed> T_G;
+            const std::string tg_hex = request.params[3].isNull() ? "" : request.params[3].get_str();
+            if (!tg_hex.empty()) {
+                T_G = ParseFixedHex<bma::AdaptorPointCompressed>(tg_hex, "adaptor_T_G");
+            }
+            auto session = bma::ProcessNonces(aggn, *msg, cache, T_G);
+            if (!session) throw JSONRPCError(RPC_INTERNAL_ERROR, "ProcessNonces failed");
+            return SessionToJSON(*session);
+        }
+    };
+}
+
+RPCMethod pricoin_btc_musig2_partial_sign()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_partial_sign",
+        "Per-party partial sign. Consumes the secnonce stashed at round1\n"
+        "(by handle); emits a 32-byte partial signature.\n"
+        "\n"
+        "After this call the secnonce_handle is INVALIDATED — the same\n"
+        "handle cannot be re-used.\n",
+        {
+            {"secnonce_handle", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Handle from round1"},
+            {"self_priv",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte priv key"},
+            {"self_pub",        RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte compressed pub"},
+            {"keyagg_cache",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "197-byte cache"},
+            {"session", RPCArg::Type::OBJ, RPCArg::Optional::NO, "Session object from process",
+                {
+                    {"data",         RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+                    {"nonce_parity", RPCArg::Type::NUM,     RPCArg::Optional::NO, ""},
+                }
+            },
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "partial_sig", "32-byte partial signature"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_partial_sign",
+            "<handle> <priv> <pub> <cache> {\"data\":\"...\",\"nonce_parity\":0}")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto handle_opt = uint256::FromHex(request.params[0].get_str());
+            if (!handle_opt) throw JSONRPCError(RPC_INVALID_PARAMETER, "secnonce_handle must be 32-byte hex");
+            auto secnonce = btr::Take(*handle_opt);
+            if (!secnonce) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "secnonce_handle not found — already consumed, never created, or daemon restarted");
+            }
+            auto priv_bytes = TryParseHex<unsigned char>(request.params[1].get_str());
+            if (!priv_bytes || priv_bytes->size() != 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "self_priv must be 32-byte hex");
+            }
+            bma::Scalar self_priv;
+            std::copy(priv_bytes->begin(), priv_bytes->end(), self_priv.begin());
+
+            auto pub_bytes = TryParseHex<unsigned char>(request.params[2].get_str());
+            if (!pub_bytes || pub_bytes->size() != 33) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "self_pub must be 33-byte hex");
+            }
+            CPubKey self_pub(std::span<const unsigned char>(pub_bytes->data(), 33));
+
+            bma::KeyAggCache cache = ParseKeyAggCacheBlob(request.params[3].get_str());
+            bma::Session session = ParseSessionBlob(request.params[4]);
+
+            auto partial = bma::PartialSign(*secnonce, self_priv, self_pub, cache, session);
+            if (!partial) throw JSONRPCError(RPC_INTERNAL_ERROR, "PartialSign failed");
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("partial_sig", HexStr(*partial));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_musig2_aggregate_partials()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_aggregate_partials",
+        "Aggregate per-party partial sigs into a 64-byte (pre-)signature.\n"
+        "If the session was built without an adaptor, the result is a valid\n"
+        "BIP340 signature. With an adaptor, it's a pre-signature requiring\n"
+        "Adapt(t).\n",
+        {
+            {"session", RPCArg::Type::OBJ, RPCArg::Optional::NO, "Session object",
+                {
+                    {"data",         RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+                    {"nonce_parity", RPCArg::Type::NUM,     RPCArg::Optional::NO, ""},
+                }
+            },
+            {"partials", RPCArg::Type::ARR, RPCArg::Optional::NO, "Array of 32-byte partial-sig hex strings",
+                {
+                    {"partial", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""},
+                }
+            },
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "sig", "64-byte (pre-)signature"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_aggregate_partials",
+            "{\"data\":\"...\",\"nonce_parity\":0} [\"<p_a>\",\"<p_b>\"]")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            bma::Session session = ParseSessionBlob(request.params[0]);
+            const auto& arr = request.params[1];
+            if (!arr.isArray() || arr.empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "partials must be a non-empty array");
+            }
+            std::vector<bma::PartialSig32> ps;
+            ps.reserve(arr.size());
+            for (size_t i = 0; i < arr.size(); ++i) {
+                ps.push_back(ParseFixedHex<bma::PartialSig32>(arr[i].get_str(), "partial"));
+            }
+            auto sig = bma::AggregatePartials(session, ps);
+            if (!sig) throw JSONRPCError(RPC_INTERNAL_ERROR, "AggregatePartials failed");
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("sig", HexStr(*sig));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_musig2_adapt()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_adapt",
+        "Adapt a pre-signature with held secret t → 64-byte BIP340 signature.\n"
+        "Verifies under the deployed XOnlyPubKey::VerifySchnorr (= libsecp256k1\n"
+        "BIP340) — i.e., what real BTC nodes use.\n",
+        {
+            {"presig",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "64-byte pre-signature"},
+            {"t_secret",     RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte adaptor secret"},
+            {"nonce_parity", RPCArg::Type::NUM,     RPCArg::Optional::NO, "0 or 1 (from session)"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "sig", "64-byte BIP340 signature"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_adapt", "<presig> <t> 0")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto presig = ParseFixedHex<bma::SignatureBytes>(request.params[0].get_str(), "presig");
+            auto t      = ParseFixedHex<bma::Scalar>(request.params[1].get_str(), "t_secret");
+            const int parity = request.params[2].getInt<int>();
+            auto sig = bma::Adapt(presig, t, parity);
+            if (!sig) throw JSONRPCError(RPC_INTERNAL_ERROR, "Adapt failed");
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("sig", HexStr(*sig));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_musig2_extract()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_extract",
+        "Extract t from (presig, sig, nonce_parity). Caller must have\n"
+        "independently verified that `sig` is the published BIP340 signature\n"
+        "corresponding to `presig` — this RPC does NOT validate `sig`; if it's\n"
+        "invalid, the extracted scalar is nonsense (libsecp256k1 contract).\n",
+        {
+            {"presig",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "64-byte pre-signature"},
+            {"sig",          RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "64-byte BIP340 sig observed on-chain"},
+            {"nonce_parity", RPCArg::Type::NUM,     RPCArg::Optional::NO, "0 or 1"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "t_secret", "32-byte recovered scalar"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_extract", "<presig> <sig> 0")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto presig = ParseFixedHex<bma::SignatureBytes>(request.params[0].get_str(), "presig");
+            auto sig    = ParseFixedHex<bma::SignatureBytes>(request.params[1].get_str(), "sig");
+            const int parity = request.params[2].getInt<int>();
+            auto t = bma::Extract(presig, sig, parity);
+            if (!t) throw JSONRPCError(RPC_INTERNAL_ERROR, "Extract failed");
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("t_secret", HexStr(*t));
+            return out;
+        }
+    };
+}
+
+} // namespace (close BTC MuSig2 wire RPCs anonymous block)
+
 } // namespace
 
 RPCMethod pricoin_getstealthaddress_export() { return pricoin_getstealthaddress(); }
@@ -4836,6 +5329,14 @@ RPCMethod pricoin_adaptor_swap_set_refunded_export()     { return pricoin_adapto
 RPCMethod pricoin_adaptor_swap_abort_export()            { return pricoin_adaptor_swap_abort(); }
 RPCMethod pricoin_adaptor_swap_get_export()              { return pricoin_adaptor_swap_get(); }
 RPCMethod pricoin_adaptor_swap_list_export()             { return pricoin_adaptor_swap_list(); }
+RPCMethod pricoin_btc_musig2_keyagg_export()             { return pricoin_btc_musig2_keyagg(); }
+RPCMethod pricoin_btc_musig2_round1_export()             { return pricoin_btc_musig2_round1(); }
+RPCMethod pricoin_btc_musig2_aggregate_nonces_export()   { return pricoin_btc_musig2_aggregate_nonces(); }
+RPCMethod pricoin_btc_musig2_process_export()            { return pricoin_btc_musig2_process(); }
+RPCMethod pricoin_btc_musig2_partial_sign_export()       { return pricoin_btc_musig2_partial_sign(); }
+RPCMethod pricoin_btc_musig2_aggregate_partials_export() { return pricoin_btc_musig2_aggregate_partials(); }
+RPCMethod pricoin_btc_musig2_adapt_export()              { return pricoin_btc_musig2_adapt(); }
+RPCMethod pricoin_btc_musig2_extract_export()            { return pricoin_btc_musig2_extract(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

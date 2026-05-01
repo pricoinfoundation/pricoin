@@ -950,6 +950,14 @@ RPCMethod pricoin_adaptor_swap_set_refunded_export();
 RPCMethod pricoin_adaptor_swap_abort_export();
 RPCMethod pricoin_adaptor_swap_get_export();
 RPCMethod pricoin_adaptor_swap_list_export();
+RPCMethod pricoin_btc_musig2_keyagg_export();
+RPCMethod pricoin_btc_musig2_round1_export();
+RPCMethod pricoin_btc_musig2_aggregate_nonces_export();
+RPCMethod pricoin_btc_musig2_process_export();
+RPCMethod pricoin_btc_musig2_partial_sign_export();
+RPCMethod pricoin_btc_musig2_aggregate_partials_export();
+RPCMethod pricoin_btc_musig2_adapt_export();
+RPCMethod pricoin_btc_musig2_extract_export();
 RPCMethod pricoin_listownct_export();
 RPCMethod walletsendct_from_ct_export();
 RPCMethod walletsendct_ring_export();
@@ -1008,6 +1016,14 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &pricoin_adaptor_swap_abort_export},
         {"wallet", &pricoin_adaptor_swap_get_export},
         {"wallet", &pricoin_adaptor_swap_list_export},
+        {"wallet", &pricoin_btc_musig2_keyagg_export},
+        {"wallet", &pricoin_btc_musig2_round1_export},
+        {"wallet", &pricoin_btc_musig2_aggregate_nonces_export},
+        {"wallet", &pricoin_btc_musig2_process_export},
+        {"wallet", &pricoin_btc_musig2_partial_sign_export},
+        {"wallet", &pricoin_btc_musig2_aggregate_partials_export},
+        {"wallet", &pricoin_btc_musig2_adapt_export},
+        {"wallet", &pricoin_btc_musig2_extract_export},
         {"wallet", &pricoin_listownct_export},
         {"wallet", &walletsendct_from_ct_export},
         {"wallet", &walletsendct_ring_export},
