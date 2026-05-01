@@ -11,6 +11,7 @@
 #include <crypto/sha256.h>
 #include <logging.h>
 #include <pricoin/cttx.h>
+#include <pricoin/joint_ringsig.h>
 #include <pricoin/ringsig.h>
 #include <primitives/transaction.h>
 #include <random.h>
@@ -452,6 +453,11 @@ void RunSelfTest()
     // Phase 4a — exercise the CLSAG ring-signature primitives.
     ::pricoin::ringsig::RunSelfTest();
     LogInfo("Pricoin ringsig (CLSAG single-layer) self-test passed");
+
+    // Atomic-swap stage 2b — cooperative CLSAG signing (single-layer
+    // and multi-layer flows both exercised).
+    ::pricoin::joint_ringsig::RunSelfTest();
+    LogInfo("Pricoin joint_ringsig (cooperative CLSAG, single + multi-layer) self-test passed");
 }
 
 } // namespace pricoin::ct

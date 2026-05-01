@@ -100,6 +100,7 @@ BASE_SCRIPTS = [
     TOOL_BENCH_SANITY_CHECK,
     # Pricoin-specific tests.
     'feature_pricoin_ct.py',
+    'feature_pricoin_jointspend.py',
     # Scripts that are run by default.
     # Longest test should go first, to favor running tests in parallel
     # vv Tests less than 5m vv
