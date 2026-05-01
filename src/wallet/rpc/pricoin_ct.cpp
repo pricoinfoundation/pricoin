@@ -9,6 +9,7 @@
 #include <key.h>
 #include <key_io.h>
 #include <logging.h>
+#include <pricoin/joint_ringsig.h>
 #include <pricoin/ringsig.h>
 #include <pricoin/ct.h>
 #include <pricoin/cttx.h>
@@ -34,6 +35,7 @@
 #include <core_io.h>
 #include <wallet/coincontrol.h>
 #include <wallet/coinselection.h>
+#include <wallet/pricoin_clsag_nonce_records.h>
 #include <wallet/pricoin_ct_send.h>
 #include <wallet/pricoin_stealth.h>
 #include <wallet/pricoin_swap_ceremony.h>
@@ -3602,6 +3604,478 @@ RPCMethod pricoin_swap_ceremony_list()
     };
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Atomic-swap phase 5 — §4.1a CLSAG nonce-reuse defence (RPC layer).
+// Wallet-level RPCs to begin / mark-published / inspect / erase
+// per-joint-output round-1 nonce records. The actual signing flow
+// (currently in pricoin_jointspend_round1) will be retrofitted to
+// invoke pricoin_clsag_nonce_begin internally in a follow-up; for now
+// these RPCs are the user-facing surface that confirms persistence
+// works.
+// ─────────────────────────────────────────────────────────────────
+
+namespace cnr = ::wallet::pricoin_clsag_nonce_records;
+namespace cnp = ::pricoin::clsag_nonce_policy;
+
+namespace {
+
+cnp::Role ParseClsagRole(const std::string& s)
+{
+    if (s == "initiator") return cnp::Role::Initiator;
+    if (s == "responder") return cnp::Role::Responder;
+    throw JSONRPCError(RPC_INVALID_PARAMETER,
+        "role must be \"initiator\" or \"responder\"");
+}
+
+cnp::RecordKey ParseClsagRecordKey(const UniValue& joint_output_id_hex,
+                                    const UniValue& ring_hash_hex,
+                                    const UniValue& role_str)
+{
+    auto out_id = TryParseHex<unsigned char>(joint_output_id_hex.get_str());
+    if (!out_id || out_id->empty()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            "joint_output_id must be non-empty hex");
+    }
+    auto ring = uint256::FromHex(ring_hash_hex.get_str());
+    if (!ring) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "ring_hash must be 32-byte hex");
+    }
+    cnp::RecordKey k;
+    k.joint_output_id = std::move(*out_id);
+    k.ring_hash = *ring;
+    k.role = ParseClsagRole(role_str.get_str());
+    return k;
+}
+
+UniValue ClsagNonceRecordToJSON(const cnp::NonceRecord& r,
+                                 bool include_alpha)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("joint_output_id", HexStr(r.key.joint_output_id));
+    out.pushKV("ring_hash", r.key.ring_hash.ToString());
+    out.pushKV("role",
+        r.key.role == cnp::Role::Initiator ? "initiator" : "responder");
+    out.pushKV("session_id", r.session_id.ToString());
+    // commitment is treated as raw 32 bytes (matches the byte-order
+    // produced by joint_ringsig::NonceCommit and consumed by the
+    // existing pricoin_jointspend_round1 RPC). NOT uint256/big-endian
+    // display.
+    out.pushKV("commitment", HexStr(r.commitment));
+    out.pushKV("t_published", r.t_published);
+    out.pushKV("created_time", r.created_time);
+    out.pushKV("updated_time", r.updated_time);
+    out.pushKV("record_digest", cnp::RecordDigest(r.key).ToString());
+    if (include_alpha) {
+        out.pushKV("alpha", HexStr(r.alpha));
+    }
+    return out;
+}
+
+[[noreturn]] void ThrowFromBeginResult(cnr::BeginResult r)
+{
+    switch (r) {
+    case cnr::BeginResult::Ok: assert(false);  // caller checks Ok separately
+    case cnr::BeginResult::InvalidInput:
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            "joint_output_id and session_id must be non-empty / non-null");
+    case cnr::BeginResult::Locked:
+        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+    case cnr::BeginResult::ConflictDifferentSession:
+        throw JSONRPCError(RPC_INVALID_REQUEST,
+            "§4.1a: a record exists for this (joint_output_id, ring_hash, role) "
+            "under a DIFFERENT session_id — refusing to re-sign");
+    case cnr::BeginResult::ConflictSameSessionInFlight:
+        throw JSONRPCError(RPC_INVALID_REQUEST,
+            "§4.1a: a record exists for this (joint_output_id, ring_hash, role) "
+            "under the same session_id with t_published=false — already in flight");
+    case cnr::BeginResult::WriteFailed:
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+            "wallet write failed (encryption or DB error)");
+    }
+    assert(false);
+}
+
+[[noreturn]] void ThrowFromMutateResult(cnr::MutateResult r)
+{
+    switch (r) {
+    case cnr::MutateResult::Ok: assert(false);
+    case cnr::MutateResult::NotFound:
+        throw JSONRPCError(RPC_INVALID_REQUEST, "no record for this key");
+    case cnr::MutateResult::Locked:
+        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+    case cnr::MutateResult::WriteFailed:
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "wallet write failed");
+    }
+    assert(false);
+}
+
+} // namespace
+
+RPCMethod pricoin_clsag_nonce_begin()
+{
+    return RPCMethod{
+        "pricoin_clsag_nonce_begin",
+        "Atomic-swap phase 5 — §4.1a: persist a cooperative-CLSAG round-1\n"
+        "nonce record before broadcasting its commitment.\n"
+        "\n"
+        "The wallet REJECTS the call if a record already exists for the same\n"
+        "(joint_output_id, ring_hash, role) under a different session_id, OR\n"
+        "under the same session_id with t_published=false — these are the\n"
+        "preconditions for the catastrophic spend-share leak documented in\n"
+        "doc/adaptor-clsag.md §4.1a.\n"
+        "\n"
+        "Caller is responsible for:\n"
+        "  * generating alpha + commitment via the existing primitives\n"
+        "    (pricoin_jointspend_round1 / NonceCommit), then\n"
+        "  * calling THIS RPC to durably persist them BEFORE sending the\n"
+        "    commitment to the counterparty.\n",
+        {
+            {"joint_output_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Chain-specific UTXO id (e.g., txid:vout encoded as bytes)"},
+            {"ring_hash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte hash of the ring being signed over"},
+            {"role", RPCArg::Type::STR, RPCArg::Optional::NO,
+                "\"initiator\" or \"responder\""},
+            {"session_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte session id (from pricoin_swap_session_create)"},
+            {"alpha", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte secret round-1 nonce"},
+            {"commitment", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte hiding commitment over (alpha · G, alpha · H_p, KI_share, ...)"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Persisted nonce record (alpha redacted)" },
+        RPCExamples{HelpExampleCli("pricoin_clsag_nonce_begin",
+            "<joint_output_id> <ring_hash> initiator <session_id> <alpha> <commitment>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            cnp::RecordKey key = ParseClsagRecordKey(
+                request.params[0], request.params[1], request.params[2]);
+            auto sid = uint256::FromHex(request.params[3].get_str());
+            if (!sid) throw JSONRPCError(RPC_INVALID_PARAMETER, "session_id must be 32-byte hex");
+            auto alpha_bytes = TryParseHex<unsigned char>(request.params[4].get_str());
+            if (!alpha_bytes || alpha_bytes->size() != 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "alpha must be 32-byte hex");
+            }
+            auto commit_bytes = TryParseHex<unsigned char>(request.params[5].get_str());
+            if (!commit_bytes || commit_bytes->size() != 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "commitment must be 32-byte hex");
+            }
+            uint256 commit;
+            std::copy(commit_bytes->begin(), commit_bytes->end(), commit.begin());
+
+            cnp::Scalar alpha;
+            std::copy(alpha_bytes->begin(), alpha_bytes->end(), alpha.begin());
+
+            cnp::NonceRecord rec;
+            cnr::BeginResult r = cnr::Begin(*wallet_sp, key, *sid, alpha, commit, rec);
+            if (r != cnr::BeginResult::Ok) ThrowFromBeginResult(r);
+            return ClsagNonceRecordToJSON(rec, /*include_alpha=*/false);
+        }
+    };
+}
+
+RPCMethod pricoin_clsag_nonce_mark_published()
+{
+    return RPCMethod{
+        "pricoin_clsag_nonce_mark_published",
+        "Mark a CLSAG nonce record as t_published=true. Call this when the\n"
+        "adaptor secret t for the swap becomes public on-chain (PRIC side).\n"
+        "After this transition, future Begin under the SAME session_id is\n"
+        "permitted; under a different session_id the policy continues to\n"
+        "reject (strict reading of §4.1a — manual Erase is required to\n"
+        "fully reset the slot).\n",
+        {
+            {"joint_output_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"ring_hash",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"role",            RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated record" },
+        RPCExamples{HelpExampleCli("pricoin_clsag_nonce_mark_published",
+            "<joint_output_id> <ring_hash> initiator")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            cnp::RecordKey key = ParseClsagRecordKey(
+                request.params[0], request.params[1], request.params[2]);
+            cnr::MutateResult r = cnr::MarkTPublished(*wallet_sp, key);
+            if (r != cnr::MutateResult::Ok) ThrowFromMutateResult(r);
+            cnp::NonceRecord rec;
+            if (cnr::Get(*wallet_sp, key, rec) != cnr::LookupResult::Ok) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "post-mark Get failed");
+            }
+            return ClsagNonceRecordToJSON(rec, /*include_alpha=*/false);
+        }
+    };
+}
+
+RPCMethod pricoin_clsag_nonce_get()
+{
+    return RPCMethod{
+        "pricoin_clsag_nonce_get",
+        "Read a CLSAG nonce record. Includes alpha (secret) — the caller is\n"
+        "expected to be a wallet-internal cooperative-signing tool.\n",
+        {
+            {"joint_output_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"ring_hash",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"role",            RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Record (with alpha)" },
+        RPCExamples{HelpExampleCli("pricoin_clsag_nonce_get",
+            "<joint_output_id> <ring_hash> initiator")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            cnp::RecordKey key = ParseClsagRecordKey(
+                request.params[0], request.params[1], request.params[2]);
+            cnp::NonceRecord rec;
+            cnr::LookupResult r = cnr::Get(*wallet_sp, key, rec);
+            if (r == cnr::LookupResult::Locked) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+            }
+            if (r == cnr::LookupResult::NotFound) {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "no record for this key");
+            }
+            return ClsagNonceRecordToJSON(rec, /*include_alpha=*/true);
+        }
+    };
+}
+
+RPCMethod pricoin_clsag_nonce_list()
+{
+    return RPCMethod{
+        "pricoin_clsag_nonce_list",
+        "Enumerate all CLSAG nonce records in this wallet. Alpha is REDACTED\n"
+        "in list output — use pricoin_clsag_nonce_get for full record access.\n",
+        {},
+        RPCResult{ RPCResult::Type::ARR, "", "",
+            {{RPCResult::Type::ANY, "", "Record (alpha redacted)"}} },
+        RPCExamples{HelpExampleCli("pricoin_clsag_nonce_list", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            std::vector<cnp::NonceRecord> all;
+            auto r = cnr::List(*wallet_sp, all);
+            if (r == cnr::LookupResult::Locked) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+            }
+            UniValue out{UniValue::VARR};
+            for (const auto& rec : all) out.push_back(ClsagNonceRecordToJSON(rec, false));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_clsag_nonce_erase()
+{
+    return RPCMethod{
+        "pricoin_clsag_nonce_erase",
+        "DESTRUCTIVE: hard-delete a CLSAG nonce record. After erase, the\n"
+        "(joint_output_id, ring_hash, role) slot becomes a fresh starting\n"
+        "point for any session — the §4.1a safety rail is gone for that\n"
+        "slot. Use only when the joint output is permanently retired or\n"
+        "you have explicit operator approval.\n",
+        {
+            {"joint_output_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"ring_hash",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"role",            RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::BOOL, "erased", "true"}} },
+        RPCExamples{HelpExampleCli("pricoin_clsag_nonce_erase",
+            "<joint_output_id> <ring_hash> initiator")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            cnp::RecordKey key = ParseClsagRecordKey(
+                request.params[0], request.params[1], request.params[2]);
+            cnr::MutateResult r = cnr::Erase(*wallet_sp, key);
+            if (r != cnr::MutateResult::Ok) ThrowFromMutateResult(r);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("erased", true);
+            return out;
+        }
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────
+// pricoin_jointspend_round1_safe — wallet-tier wrapper around the
+// stateless pricoin_jointspend_round1 primitive that ALSO durably
+// persists the round-1 nonce record per §4.1a before returning.
+// Callers driving real swaps should always use this variant; the
+// stateless RPC is retained for unit testing and tools that don't
+// have a wallet context.
+// ─────────────────────────────────────────────────────────────────
+
+namespace {
+
+::pricoin::ringsig::Point ParseRingsigPoint33(
+    const std::string& hex, const char* what)
+{
+    auto bytes = TryParseHex<unsigned char>(hex);
+    if (!bytes || bytes->size() != 33) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            std::string(what) + " must be 33-byte hex");
+    }
+    ::pricoin::ringsig::Point p;
+    std::copy(bytes->begin(), bytes->end(), p.begin());
+    return p;
+}
+
+::pricoin::ringsig::Scalar ParseRingsigScalar32(
+    const std::string& hex, const char* what)
+{
+    auto bytes = TryParseHex<unsigned char>(hex);
+    if (!bytes || bytes->size() != 32) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            std::string(what) + " must be 32-byte hex");
+    }
+    ::pricoin::ringsig::Scalar s;
+    std::copy(bytes->begin(), bytes->end(), s.begin());
+    return s;
+}
+
+} // namespace
+
+RPCMethod pricoin_jointspend_round1_safe()
+{
+    return RPCMethod{
+        "pricoin_jointspend_round1_safe",
+        "Stage 2b round 1 — generate and durably persist this party's\n"
+        "cooperative-CLSAG nonce + image partials, atomically. Equivalent\n"
+        "to pricoin_jointspend_round1 followed by pricoin_clsag_nonce_begin,\n"
+        "but enforced as a single transaction: alpha is never returned to\n"
+        "the caller unless the persistence record is on disk.\n"
+        "\n"
+        "REJECTS per §4.1a if a record already exists for the same\n"
+        "(joint_output_id, ring_hash, role) under a different session_id\n"
+        "or under the same session_id with t_published=false.\n"
+        "\n"
+        "If z_share is provided, the call is multi-layer mode and D_share\n"
+        "is also returned.\n",
+        {
+            {"joint_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "33-byte compressed pubkey at ring[pi] (the joint spend pub)"},
+            {"x_share", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "This party's 32-byte spend-secret share"},
+            {"session_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte session id (typically from pricoin_swap_session_create)"},
+            {"joint_output_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "UTXO id being spent (e.g., txid:vout encoded as bytes)"},
+            {"ring_hash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte hash of the ring being signed over"},
+            {"role", RPCArg::Type::STR, RPCArg::Optional::NO,
+                "\"initiator\" or \"responder\""},
+            {"z_share", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED,
+                "Multi-layer: this party's 32-byte commitment-offset secret share"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "alpha", "32-byte private nonce — keep secret until round 3"},
+                {RPCResult::Type::STR_HEX, "L_share", "33-byte alpha · G"},
+                {RPCResult::Type::STR_HEX, "R_share", "33-byte alpha · H_p(P_pi)"},
+                {RPCResult::Type::STR_HEX, "KI_share", "33-byte x_share · H_p(P_pi)"},
+                {RPCResult::Type::STR_HEX, "D_share", /*optional=*/true,
+                    "33-byte z_share · H_p(P_pi) (multi-layer only)"},
+                {RPCResult::Type::STR_HEX, "commitment", "32-byte hash binding L/R/KI/D shares to session_id"},
+                {RPCResult::Type::STR_HEX, "record_digest",
+                    "32-byte digest of (joint_output_id, ring_hash, role) — DB key"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_jointspend_round1_safe",
+            "<P_pi> <x_share> <session_id> <joint_output_id> <ring_hash> initiator")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+
+            const auto P_pi    = ParseRingsigPoint33(request.params[0].get_str(), "joint_pubkey");
+            const auto x_share = ParseRingsigScalar32(request.params[1].get_str(), "x_share");
+            // session_id is parsed via uint256::FromHex for round-trip
+            // consistency with pricoin_clsag_nonce_begin / _get / _list
+            // (Bitcoin tx-hash display convention).
+            auto session_id_opt = uint256::FromHex(request.params[2].get_str());
+            if (!session_id_opt) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "session_id must be 32-byte hex");
+            }
+            const uint256 session_id = *session_id_opt;
+            // For passing into NonceCommit (which takes raw bytes),
+            // grab the original hex bytes via TryParseHex.
+            auto session_bytes = TryParseHex<unsigned char>(request.params[2].get_str());
+            if (!session_bytes || session_bytes->size() != 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "session_id must be 32-byte hex");
+            }
+
+            cnp::RecordKey key = ParseClsagRecordKey(
+                request.params[3], request.params[4], request.params[5]);
+
+            const bool multi_layer = !request.params[6].isNull();
+            ::pricoin::ringsig::Scalar z_share{};
+            if (multi_layer) {
+                z_share = ParseRingsigScalar32(request.params[6].get_str(), "z_share");
+            }
+
+            // ─── Math ───
+            auto noncepart = ::pricoin::joint_ringsig::NonceGen(P_pi);
+            if (!noncepart) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "NonceGen failed");
+            }
+            auto KI_share_opt = ::pricoin::joint_ringsig::KeyImageShare(P_pi, x_share);
+            if (!KI_share_opt) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "x_share invalid");
+            }
+            ::pricoin::ringsig::Point D_share{};
+            if (multi_layer) {
+                auto imgs = ::pricoin::joint_ringsig::KICommitImageShare(P_pi, x_share, z_share);
+                if (!imgs) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "x/z share invalid");
+                }
+                D_share = imgs->D_share;
+                if (imgs->KI_share != *KI_share_opt) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "KI share mismatch");
+                }
+            }
+
+            ::pricoin::ringsig::Scalar commit = ::pricoin::joint_ringsig::NonceCommit(
+                std::span<const unsigned char>{*session_bytes},
+                noncepart->L_share, noncepart->R_share, *KI_share_opt);
+            if (multi_layer) {
+                CSHA256 h;
+                static constexpr char kTag[] = "pricoin/joint_ringsig/commit-ml-v1";
+                h.Write(reinterpret_cast<const unsigned char*>(kTag), sizeof(kTag) - 1);
+                h.Write(session_bytes->data(), session_bytes->size());
+                h.Write(noncepart->L_share.data(), noncepart->L_share.size());
+                h.Write(noncepart->R_share.data(), noncepart->R_share.size());
+                h.Write(KI_share_opt->data(), KI_share_opt->size());
+                h.Write(D_share.data(), D_share.size());
+                h.Finalize(commit.data());
+            }
+
+            // ─── Persist BEFORE returning. If this fails the caller
+            // sees an error and alpha never leaves the wallet. ───
+            uint256 commit256;
+            std::copy(commit.begin(), commit.end(), commit256.begin());
+            cnp::NonceRecord rec;
+            cnr::BeginResult br = cnr::Begin(*wallet_sp, key, session_id,
+                                             noncepart->alpha, commit256, rec);
+            if (br != cnr::BeginResult::Ok) ThrowFromBeginResult(br);
+
+            // ─── Return ───
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("alpha",      HexStr(noncepart->alpha));
+            out.pushKV("L_share",    HexStr(noncepart->L_share));
+            out.pushKV("R_share",    HexStr(noncepart->R_share));
+            out.pushKV("KI_share",   HexStr(*KI_share_opt));
+            if (multi_layer) {
+                out.pushKV("D_share", HexStr(D_share));
+            }
+            out.pushKV("commitment",    HexStr(commit));
+            out.pushKV("record_digest", cnp::RecordDigest(key).ToString());
+            return out;
+        }
+    };
+}
+
 // Atomic-swap stage 2b — load this wallet's spend-secret share for a
 // joint stealth output. The caller will pass the returned x_share into
 // pricoin_jointspend_round1 as part of the cooperative signing
@@ -3812,6 +4286,12 @@ RPCMethod pricoin_swap_ceremony_set_pric_released_export()   { return pricoin_sw
 RPCMethod pricoin_swap_ceremony_abort_export()               { return pricoin_swap_ceremony_abort(); }
 RPCMethod pricoin_swap_ceremony_get_export()                 { return pricoin_swap_ceremony_get(); }
 RPCMethod pricoin_swap_ceremony_list_export()                { return pricoin_swap_ceremony_list(); }
+RPCMethod pricoin_clsag_nonce_begin_export()           { return pricoin_clsag_nonce_begin(); }
+RPCMethod pricoin_clsag_nonce_mark_published_export()  { return pricoin_clsag_nonce_mark_published(); }
+RPCMethod pricoin_clsag_nonce_get_export()             { return pricoin_clsag_nonce_get(); }
+RPCMethod pricoin_clsag_nonce_list_export()            { return pricoin_clsag_nonce_list(); }
+RPCMethod pricoin_clsag_nonce_erase_export()           { return pricoin_clsag_nonce_erase(); }
+RPCMethod pricoin_jointspend_round1_safe_export()      { return pricoin_jointspend_round1_safe(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

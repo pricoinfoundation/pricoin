@@ -315,6 +315,17 @@ private:
 /** Check that required EC support is available at runtime. */
 bool ECC_InitSanityCheck();
 
+struct secp256k1_context_struct;
+/**
+ * Returns the global signing-capable secp256k1 context. Only valid
+ * between ECC_Context construction and destruction.
+ *
+ * Used by signing helpers outside of CKey (e.g., musig wrappers in
+ * `swap/`) that need ecmult_gen capability — secp256k1_context_static
+ * does not have it, but `keypair_create` / `nonce_gen` do.
+ */
+const struct secp256k1_context_struct* GetSigningContext();
+
 /**
  * RAII class initializing and deinitializing global state for elliptic curve support.
  * Only one instance may be initialized at a time.

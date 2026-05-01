@@ -932,6 +932,12 @@ RPCMethod pricoin_swap_ceremony_set_pric_released_export();
 RPCMethod pricoin_swap_ceremony_abort_export();
 RPCMethod pricoin_swap_ceremony_get_export();
 RPCMethod pricoin_swap_ceremony_list_export();
+RPCMethod pricoin_clsag_nonce_begin_export();
+RPCMethod pricoin_clsag_nonce_mark_published_export();
+RPCMethod pricoin_clsag_nonce_get_export();
+RPCMethod pricoin_clsag_nonce_list_export();
+RPCMethod pricoin_clsag_nonce_erase_export();
+RPCMethod pricoin_jointspend_round1_safe_export();
 RPCMethod pricoin_listownct_export();
 RPCMethod walletsendct_from_ct_export();
 RPCMethod walletsendct_ring_export();
@@ -972,6 +978,12 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &pricoin_swap_ceremony_abort_export},
         {"wallet", &pricoin_swap_ceremony_get_export},
         {"wallet", &pricoin_swap_ceremony_list_export},
+        {"wallet", &pricoin_clsag_nonce_begin_export},
+        {"wallet", &pricoin_clsag_nonce_mark_published_export},
+        {"wallet", &pricoin_clsag_nonce_get_export},
+        {"wallet", &pricoin_clsag_nonce_list_export},
+        {"wallet", &pricoin_clsag_nonce_erase_export},
+        {"wallet", &pricoin_jointspend_round1_safe_export},
         {"wallet", &pricoin_listownct_export},
         {"wallet", &walletsendct_from_ct_export},
         {"wallet", &walletsendct_ring_export},

@@ -16,7 +16,9 @@
 #include <pricoin/joint_ringsig.h>
 #include <pricoin/joint_stealth.h>
 #include <pricoin/ringsig.h>
+#include <pricoin/clsag_nonce_policy.h>
 #include <swap/btc_adaptor_schnorr.h>
+#include <swap/btc_musig2_adaptor.h>
 #include <primitives/transaction.h>
 #include <random.h>
 #include <script/script.h>
@@ -482,6 +484,14 @@ void RunSelfTest()
     // Atomic-swap phase 5 — BIP340 adaptor-Schnorr (foreign-chain leg).
     ::pricoin::swap::btc_adaptor_schnorr::RunSelfTest();
     LogInfo("Pricoin btc_adaptor_schnorr (single-party BIP340 adaptor) self-test passed");
+
+    // Atomic-swap phase 5 — cooperative MuSig2 + adaptor (2-of-N foreign leg).
+    ::pricoin::swap::btc_musig2_adaptor::RunSelfTest();
+    LogInfo("Pricoin btc_musig2_adaptor (2-of-N MuSig2 + adaptor) self-test passed");
+
+    // Atomic-swap phase 5 — cooperative-CLSAG nonce-reuse policy (§4.1a).
+    ::pricoin::clsag_nonce_policy::RunSelfTest();
+    LogInfo("Pricoin clsag_nonce_policy (§4.1a nonce-reuse defence) self-test passed");
 }
 
 } // namespace pricoin::ct

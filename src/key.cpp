@@ -569,6 +569,11 @@ bool ECC_InitSanityCheck() {
     return key.VerifyPubKey(pubkey);
 }
 
+const secp256k1_context* GetSigningContext()
+{
+    return secp256k1_context_sign;
+}
+
 /** Initialize the elliptic curve support. May not be called twice without calling ECC_Stop first. */
 static void ECC_Start() {
     assert(secp256k1_context_sign == nullptr);

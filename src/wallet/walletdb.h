@@ -95,6 +95,11 @@ extern const std::string PRICOIN_RECOVERY_CACHE;
 // EncryptWalletBlob pattern. See wallet/pricoin_swap_session.cpp.
 extern const std::string PRICOIN_SWAP_SESSION;
 extern const std::string PRICOIN_SWAP_CEREMONY;
+// Per-record store for cooperative-CLSAG round-1 nonces (§4.1a in
+// doc/adaptor-clsag.md). Multi-row, keyed by a 32-byte digest of
+// (joint_output_id, ring_hash, role). Encrypted via EncryptWalletBlob
+// because the record contains the secret round-1 nonce alpha.
+extern const std::string PRICOIN_CLSAG_NONCE;
 extern const std::string PURPOSE;
 extern const std::string SETTINGS;
 extern const std::string TX;
@@ -317,6 +322,14 @@ public:
                                   const std::vector<unsigned char>& blob);
     bool ErasePricoinSwapCeremony(const uint256& ceremony_id);
     bool ReadAllPricoinSwapCeremonies(
+        std::map<uint256, std::vector<unsigned char>>& out);
+    // Per-record CLSAG round-1 nonce store (§4.1a). `digest` is the
+    // 32-byte deterministic key derived from (joint_output_id,
+    // ring_hash, role) — see pricoin/clsag_nonce_policy::RecordDigest.
+    bool WritePricoinClsagNonce(const uint256& digest,
+                                const std::vector<unsigned char>& blob);
+    bool ErasePricoinClsagNonce(const uint256& digest);
+    bool ReadAllPricoinClsagNonces(
         std::map<uint256, std::vector<unsigned char>>& out);
     //! Begin a new transaction
     bool TxnBegin();
