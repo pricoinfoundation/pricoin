@@ -13,8 +13,11 @@
 #include <node/context.h>
 #include <pricoin/ct.h>
 #include <pricoin/cttx.h>
+#include <pricoin/adaptor_joint_ringsig.h>
+#include <pricoin/adaptor_ringsig.h>
 #include <pricoin/joint_ringsig.h>
 #include <pricoin/ringsig.h>
+#include <streams.h>
 #include <primitives/transaction.h>
 #include <random.h>
 #include <rpc/register.h>
@@ -788,6 +791,565 @@ RPCMethod pricoin_jointspend_verify()
     };
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Atomic-swap phase 5 — cooperative adaptor-CLSAG wire RPCs.
+//
+// Mirror of the non-adaptor cooperative RPCs above, but for the
+// adaptor variant per doc/adaptor-clsag.md §4 (single-layer). The
+// adaptor flow embeds a cross-chain secret t (encoded as 33-byte
+// T_G + matching T_H + DLEQ proof binding them). Output is an
+// `AdaptorPreSignature` blob; once the holder of `t` calls Adapt
+// and broadcasts, anyone with the pre-sig can Extract t from the
+// on-chain CLSAG signature.
+//
+// Round-3 close-share computation is identical math to the
+// non-adaptor case (`s_share = α − c_pi · x` mod n) — callers
+// reuse the existing `pricoin_jointspend_share` for that step.
+//
+// FLOW:
+//   0.  pricoin_adaptor_compute_points(t, P_pi)        → {T_G, T_H}
+//       pricoin_adaptor_dleq_prove(t, P_pi, T_G, T_H, label, payload)
+//                                                       → dleq_t (hex)
+//       pricoin_adaptor_dleq_verify(...)               → {valid: bool}
+//   1.  pricoin_jointspend_adaptor_round1   (× each party)
+//                                            → AdaptorNonceShare-shaped JSON
+//   2.  pricoin_jointspend_adaptor_combine  (anyone)
+//                                            → c_pi + walk + shifted-anchor data
+//   3.  pricoin_jointspend_share            (× each party — reused)
+//   4.  pricoin_jointspend_adaptor_assemble (anyone)
+//                                            → AdaptorPreSignature blob
+//   5.  pricoin_jointspend_adaptor_verify_presig (off-chain)
+//   6.  pricoin_jointspend_adaptor_adapt    (the t holder)
+//                                            → standard CLSAG Signature blob
+//   7.  pricoin_jointspend_adaptor_extract  (the other party)
+//                                            → recovered t (32 bytes)
+// ─────────────────────────────────────────────────────────────────
+
+namespace par  = ::pricoin::adaptor_ringsig;
+namespace pajr = ::pricoin::adaptor_joint_ringsig;
+
+namespace adaptor_helpers {
+
+template <typename T>
+std::vector<unsigned char> SerializeBlob(const T& obj)
+{
+    DataStream ds;
+    ds << obj;
+    return std::vector<unsigned char>(UCharCast(ds.data()),
+                                       UCharCast(ds.data()) + ds.size());
+}
+
+template <typename T>
+std::optional<T> ParseBlob(const std::string& hex)
+{
+    auto bytes = TryParseHex<unsigned char>(hex);
+    if (!bytes) return std::nullopt;
+    DataStream ds{std::span<const unsigned char>{*bytes}};
+    T obj;
+    try {
+        ds >> obj;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    return obj;
+}
+
+std::span<const unsigned char> ToBytesSpan(const std::vector<unsigned char>& v)
+{
+    return std::span<const unsigned char>{v};
+}
+
+std::vector<unsigned char> ParseSessionLabel(const UniValue& v, const char* what)
+{
+    auto bytes = TryParseHex<unsigned char>(v.get_str());
+    if (!bytes) {
+        // Allow plaintext label too — convenient for tests.
+        const auto& s = v.get_str();
+        return std::vector<unsigned char>(s.begin(), s.end());
+    }
+    return *bytes;
+}
+
+} // namespace adaptor_helpers
+
+RPCMethod pricoin_adaptor_compute_points()
+{
+    return RPCMethod{
+        "pricoin_adaptor_compute_points",
+        "Compute the adaptor points T_G = t·G and T_H = t·H_p(P_pi) for a\n"
+        "scalar t and a ring-position pubkey P_pi. Both points use the same\n"
+        "t — the cross-chain binding (a foreign-chain leg uses T_G alone, the\n"
+        "PRIC leg uses both via the DLEQ proof).\n",
+        {
+            {"t",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte adaptor secret"},
+            {"P_pi", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte joint pubkey at signer index"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "T_G", "33-byte t·G"},
+                {RPCResult::Type::STR_HEX, "T_H", "33-byte t·H_p(P_pi)"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_compute_points", "<t> <P_pi>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            using namespace js_helpers;
+            auto t    = ParseScalar32(request.params[0].get_str(), "t");
+            auto P_pi = ParsePoint33(request.params[1].get_str(), "P_pi");
+            auto adaptor = par::ComputeAdaptorPoints(t, P_pi);
+            if (!adaptor) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "ComputeAdaptorPoints failed (invalid t or P_pi)");
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("T_G", PointHex(adaptor->T_G));
+            out.pushKV("T_H", PointHex(adaptor->T_H));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_adaptor_dleq_prove()
+{
+    return RPCMethod{
+        "pricoin_adaptor_dleq_prove",
+        "Construct a Chaum-Pedersen DLEQ proof binding (T_G, T_H) to the\n"
+        "same scalar t over generators (G, H_p(P_pi)). Both parties exchange\n"
+        "this in setup so the receiver can confirm the adaptor materials are\n"
+        "well-formed before committing nonces.\n",
+        {
+            {"t",                RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte adaptor secret"},
+            {"P_pi",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte joint pubkey"},
+            {"T_G",              RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte t·G"},
+            {"T_H",              RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte t·H_p(P_pi)"},
+            {"session_label",    RPCArg::Type::STR,     RPCArg::Optional::NO, "Domain tag (hex or raw string)"},
+            {"session_payload",  RPCArg::Type::STR,     RPCArg::Optional::NO, "Session bytes (hex or raw string)"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "dleq", "Serialized DLEQProof bytes"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_dleq_prove", "<t> <P_pi> <T_G> <T_H> <label> <payload>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            using namespace js_helpers;
+            using namespace adaptor_helpers;
+            auto t    = ParseScalar32(request.params[0].get_str(), "t");
+            auto P_pi = ParsePoint33(request.params[1].get_str(), "P_pi");
+            par::AdaptorPoints adaptor;
+            adaptor.T_G = ParsePoint33(request.params[2].get_str(), "T_G");
+            adaptor.T_H = ParsePoint33(request.params[3].get_str(), "T_H");
+            auto label   = ParseSessionLabel(request.params[4], "session_label");
+            auto payload = ParseSessionLabel(request.params[5], "session_payload");
+            auto proof = par::MakeDLEQProof(t, P_pi, adaptor, ToBytesSpan(label), ToBytesSpan(payload));
+            if (!proof) throw JSONRPCError(RPC_INVALID_PARAMETER, "MakeDLEQProof failed");
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("dleq", HexStr(SerializeBlob(*proof)));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_adaptor_dleq_verify()
+{
+    return RPCMethod{
+        "pricoin_adaptor_dleq_verify",
+        "Verify a DLEQ proof for (T_G, T_H, t).\n",
+        {
+            {"P_pi",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"T_G",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"T_H",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"dleq",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Serialized DLEQProof"},
+            {"session_label",   RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+            {"session_payload", RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::BOOL, "valid", "true iff the DLEQ verifies"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_dleq_verify", "<P_pi> <T_G> <T_H> <dleq> <label> <payload>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            using namespace js_helpers;
+            using namespace adaptor_helpers;
+            auto P_pi = ParsePoint33(request.params[0].get_str(), "P_pi");
+            par::AdaptorPoints adaptor;
+            adaptor.T_G = ParsePoint33(request.params[1].get_str(), "T_G");
+            adaptor.T_H = ParsePoint33(request.params[2].get_str(), "T_H");
+            auto dleq = ParseBlob<par::DLEQProof>(request.params[3].get_str());
+            if (!dleq) throw JSONRPCError(RPC_INVALID_PARAMETER, "dleq must be valid serialized DLEQProof hex");
+            auto label   = ParseSessionLabel(request.params[4], "session_label");
+            auto payload = ParseSessionLabel(request.params[5], "session_payload");
+            const bool ok = par::VerifyDLEQProof(P_pi, adaptor, *dleq, ToBytesSpan(label), ToBytesSpan(payload));
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("valid", ok);
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_jointspend_adaptor_round1()
+{
+    return RPCMethod{
+        "pricoin_jointspend_adaptor_round1",
+        "Adaptor-CLSAG round 1 — generate this party's adaptor nonce share\n"
+        "(α_X, L_share, R_share, KI_share) plus DLEQ-1 (binding α_X across\n"
+        "G and H_p(P_pi)) and DLEQ-2 (binding x_X across G and H_p(P_pi)),\n"
+        "plus the round-1 commitment.\n"
+        "\n"
+        "WARNING: alpha is SECRET — keep it on this party's side. Disclosing\n"
+        "it before round 3 lets a counterparty extract this party's spend\n"
+        "share via x_X = (α_X − ŝ_share_X) / c_pi.\n",
+        {
+            {"P_pi",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte joint pubkey at ring[pi]"},
+            {"X_pub_X",         RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte public spend share = x_X · G"},
+            {"x_X",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte spend-secret share"},
+            {"T_G",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"T_H",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"session_label",   RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+            {"session_payload", RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "alpha",       "32-byte private nonce — keep secret until round 3"},
+                {RPCResult::Type::STR_HEX, "L_share",     "33-byte α_X · G"},
+                {RPCResult::Type::STR_HEX, "R_share",     "33-byte α_X · H_p(P_pi)"},
+                {RPCResult::Type::STR_HEX, "KI_share",    "33-byte x_X · H_p(P_pi)"},
+                {RPCResult::Type::STR_HEX, "dleq_alpha",  "Serialized DLEQProof bytes (DLEQ-1)"},
+                {RPCResult::Type::STR_HEX, "dleq_x",      "Serialized DLEQProof bytes (DLEQ-2)"},
+                {RPCResult::Type::STR_HEX, "commitment",  "32-byte hiding hash bound to session"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_jointspend_adaptor_round1", "<P_pi> <X_pub_X> <x_X> <T_G> <T_H> <label> <payload>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            using namespace js_helpers;
+            using namespace adaptor_helpers;
+            auto P_pi    = ParsePoint33(request.params[0].get_str(), "P_pi");
+            auto X_pub_X = ParsePoint33(request.params[1].get_str(), "X_pub_X");
+            auto x_X     = ParseScalar32(request.params[2].get_str(), "x_X");
+            par::AdaptorPoints adaptor;
+            adaptor.T_G = ParsePoint33(request.params[3].get_str(), "T_G");
+            adaptor.T_H = ParsePoint33(request.params[4].get_str(), "T_H");
+            auto label   = ParseSessionLabel(request.params[5], "session_label");
+            auto payload = ParseSessionLabel(request.params[6], "session_payload");
+
+            auto share = pajr::NonceGenAdaptor(P_pi, X_pub_X, x_X, adaptor,
+                ToBytesSpan(label), ToBytesSpan(payload));
+            if (!share) throw JSONRPCError(RPC_INVALID_PARAMETER, "NonceGenAdaptor failed");
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("alpha",       ScalarHex(share->alpha));
+            out.pushKV("L_share",     PointHex(share->L_share));
+            out.pushKV("R_share",     PointHex(share->R_share));
+            out.pushKV("KI_share",    PointHex(share->KI_share));
+            out.pushKV("dleq_alpha",  HexStr(SerializeBlob(share->dleq_alpha)));
+            out.pushKV("dleq_x",      HexStr(SerializeBlob(share->dleq_x)));
+            out.pushKV("commitment",  ScalarHex(share->commitment));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_jointspend_adaptor_combine()
+{
+    return RPCMethod{
+        "pricoin_jointspend_adaptor_combine",
+        "Adaptor-CLSAG round 2 — verify each party's round-1 share (commitment\n"
+        "+ DLEQ-1 + DLEQ-2), aggregate, apply the adaptor shift to L_pi/R_pi,\n"
+        "and walk the ring deterministically. All parties run with identical\n"
+        "inputs and obtain identical outputs.\n",
+        {
+            {"ring", RPCArg::Type::ARR, RPCArg::Optional::NO,
+                "Array of 33-byte compressed pubkey hex strings (single-layer).",
+                {{"P", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+            {"pi",              RPCArg::Type::NUM,     RPCArg::Optional::NO, "Signer's index"},
+            {"msg",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte message hash"},
+            {"T_G",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"T_H",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"dleq_t",          RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Serialized DLEQProof bytes (binds T_G, T_H, t)"},
+            {"X_pub_shares",    RPCArg::Type::ARR, RPCArg::Optional::NO,
+                "Array of public spend shares (33-byte hex)",
+                {{"X_pub", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+            {"shares", RPCArg::Type::ARR, RPCArg::Optional::NO,
+                "Array of party round-1 outputs (without alpha)",
+                {{"share", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
+                  {{"L_share",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+                   {"R_share",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+                   {"KI_share",   RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+                   {"dleq_alpha", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+                   {"dleq_x",     RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+                   {"commitment", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""}}}}},
+            {"session_label",   RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+            {"session_payload", RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "KI",      "Joint key image (Σ KI_share)"},
+                {RPCResult::Type::STR_HEX, "L_pi",    "Σ L_share"},
+                {RPCResult::Type::STR_HEX, "R_pi",    "Σ R_share"},
+                {RPCResult::Type::STR_HEX, "L_prime", "L_pi + T_G  (shifted anchor)"},
+                {RPCResult::Type::STR_HEX, "R_prime", "R_pi + T_H  (shifted anchor)"},
+                {RPCResult::Type::STR_HEX, "c_pi",    "Closing challenge at the signer's index"},
+                {RPCResult::Type::STR_HEX, "c0",      "Initial challenge"},
+                {RPCResult::Type::ARR,     "s_others",
+                    "Per-index closing scalars for non-signer ring positions (entry at pi is filled by assemble)",
+                    {{RPCResult::Type::STR_HEX, "s", "32-byte"}}},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_jointspend_adaptor_combine", "<args>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            using namespace js_helpers;
+            using namespace adaptor_helpers;
+            auto ring = ParseRing(request.params[0]);
+            const size_t pi = static_cast<size_t>(request.params[1].getInt<int>());
+            const auto msg_scalar = ParseScalar32(request.params[2].get_str(), "msg");
+            uint256 msg;
+            std::copy(msg_scalar.begin(), msg_scalar.end(), msg.begin());
+
+            par::AdaptorPoints adaptor;
+            adaptor.T_G = ParsePoint33(request.params[3].get_str(), "T_G");
+            adaptor.T_H = ParsePoint33(request.params[4].get_str(), "T_H");
+            auto dleq_t = ParseBlob<par::DLEQProof>(request.params[5].get_str());
+            if (!dleq_t) throw JSONRPCError(RPC_INVALID_PARAMETER, "dleq_t must be serialized DLEQProof hex");
+
+            const UniValue& xs_arr = request.params[6];
+            if (!xs_arr.isArray() || xs_arr.size() < 2) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "X_pub_shares must be array of >=2 entries");
+            }
+            std::vector<::pricoin::ringsig::Point> X_pub_shares;
+            X_pub_shares.reserve(xs_arr.size());
+            for (size_t i = 0; i < xs_arr.size(); ++i) {
+                X_pub_shares.push_back(ParsePoint33(xs_arr[i].get_str(), "X_pub_share"));
+            }
+
+            const UniValue& shares_arr = request.params[7];
+            if (!shares_arr.isArray() || shares_arr.size() != xs_arr.size()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "shares.size() must match X_pub_shares.size()");
+            }
+            std::vector<pajr::AdaptorNonceShare> shares;
+            shares.reserve(shares_arr.size());
+            for (size_t i = 0; i < shares_arr.size(); ++i) {
+                const UniValue& s = shares_arr[i];
+                pajr::AdaptorNonceShare ns;
+                // alpha is intentionally not in the input — verifier doesn't have it.
+                std::memset(ns.alpha.data(), 0, ns.alpha.size());
+                ns.L_share  = ParsePoint33(s.find_value("L_share").get_str(),  "L_share");
+                ns.R_share  = ParsePoint33(s.find_value("R_share").get_str(),  "R_share");
+                ns.KI_share = ParsePoint33(s.find_value("KI_share").get_str(), "KI_share");
+                auto da = ParseBlob<par::DLEQProof>(s.find_value("dleq_alpha").get_str());
+                auto dx = ParseBlob<par::DLEQProof>(s.find_value("dleq_x").get_str());
+                if (!da || !dx) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    strprintf("party %u dleq_alpha/dleq_x must be serialized DLEQProof hex", static_cast<unsigned>(i)));
+                ns.dleq_alpha = *da;
+                ns.dleq_x     = *dx;
+                ns.commitment = ParseScalar32(s.find_value("commitment").get_str(), "commitment");
+                shares.push_back(ns);
+            }
+
+            auto label   = ParseSessionLabel(request.params[8], "session_label");
+            auto payload = ParseSessionLabel(request.params[9], "session_payload");
+
+            auto out_combined = pajr::CombineAndWalk(
+                std::span<const ::pricoin::ringsig::Point>{ring}, pi, msg,
+                adaptor, *dleq_t,
+                std::span<const ::pricoin::ringsig::Point>{X_pub_shares},
+                std::span<const pajr::AdaptorNonceShare>{shares},
+                ToBytesSpan(label), ToBytesSpan(payload));
+            if (!out_combined) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "CombineAndWalk failed (DLEQ verify, commitment mismatch, or ring walk error)");
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("KI",      PointHex(out_combined->KI));
+            out.pushKV("L_pi",    PointHex(out_combined->L_pi));
+            out.pushKV("R_pi",    PointHex(out_combined->R_pi));
+            out.pushKV("L_prime", PointHex(out_combined->L_prime));
+            out.pushKV("R_prime", PointHex(out_combined->R_prime));
+            out.pushKV("c_pi",    ScalarHex(out_combined->c_pi));
+            out.pushKV("c0",      ScalarHex(out_combined->c0));
+            UniValue arr_so{UniValue::VARR};
+            for (const auto& s : out_combined->s_others) arr_so.push_back(ScalarHex(s));
+            out.pushKV("s_others", arr_so);
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_jointspend_adaptor_assemble()
+{
+    return RPCMethod{
+        "pricoin_jointspend_adaptor_assemble",
+        "Assemble round-3 close shares + the round-2 combined output into an\n"
+        "AdaptorPreSignature blob. Caller passes back the round-2 output\n"
+        "fields (KI, c0, c_pi, s_others) plus the round-3 close shares from\n"
+        "each party (computed via pricoin_jointspend_share — the math is the\n"
+        "same as the non-adaptor case).\n",
+        {
+            {"KI",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "From adaptor_combine"},
+            {"L_pi",          RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"R_pi",          RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"L_prime",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"R_prime",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"c_pi",          RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"c0",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"s_others",      RPCArg::Type::ARR,     RPCArg::Optional::NO,
+                "Per-index closing scalars from adaptor_combine.",
+                {{"s", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+            {"close_shares",  RPCArg::Type::ARR,     RPCArg::Optional::NO,
+                "Per-party round-3 close shares (32-byte hex each).",
+                {{"s", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+            {"pi",            RPCArg::Type::NUM,     RPCArg::Optional::NO, "Signer's index"},
+            {"T_G",           RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"T_H",           RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"dleq_t",        RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "presig", "Serialized AdaptorPreSignature bytes"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_jointspend_adaptor_assemble", "<args>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            using namespace js_helpers;
+            using namespace adaptor_helpers;
+
+            pajr::AdaptorCombineOutput combined;
+            combined.KI      = ParsePoint33(request.params[0].get_str(), "KI");
+            combined.L_pi    = ParsePoint33(request.params[1].get_str(), "L_pi");
+            combined.R_pi    = ParsePoint33(request.params[2].get_str(), "R_pi");
+            combined.L_prime = ParsePoint33(request.params[3].get_str(), "L_prime");
+            combined.R_prime = ParsePoint33(request.params[4].get_str(), "R_prime");
+            combined.c_pi    = ParseScalar32(request.params[5].get_str(), "c_pi");
+            combined.c0      = ParseScalar32(request.params[6].get_str(), "c0");
+            combined.s_others = ParseScalarArray(request.params[7], "s_others");
+
+            const auto close_shares = ParseScalarArray(request.params[8], "close_shares");
+            const size_t pi = static_cast<size_t>(request.params[9].getInt<int>());
+
+            par::AdaptorPoints adaptor;
+            adaptor.T_G = ParsePoint33(request.params[10].get_str(), "T_G");
+            adaptor.T_H = ParsePoint33(request.params[11].get_str(), "T_H");
+            auto dleq_t = ParseBlob<par::DLEQProof>(request.params[12].get_str());
+            if (!dleq_t) throw JSONRPCError(RPC_INVALID_PARAMETER, "dleq_t must be serialized DLEQProof hex");
+
+            auto presig = pajr::AssembleAdaptorPreSig(combined,
+                std::span<const ::pricoin::ringsig::Scalar>{close_shares},
+                pi, adaptor, *dleq_t);
+            if (!presig) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "AssembleAdaptorPreSig failed (close shares didn't sum to a valid s_pi, etc.)");
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("presig", HexStr(SerializeBlob(*presig)));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_jointspend_adaptor_verify_presig()
+{
+    return RPCMethod{
+        "pricoin_jointspend_adaptor_verify_presig",
+        "Off-chain verify of an AdaptorPreSignature against a ring + msg.\n",
+        {
+            {"ring", RPCArg::Type::ARR, RPCArg::Optional::NO, "",
+                {{"P", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+            {"presig",          RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Serialized AdaptorPreSignature"},
+            {"msg",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"session_label",   RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+            {"session_payload", RPCArg::Type::STR,     RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::BOOL, "valid", ""}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_jointspend_adaptor_verify_presig", "<args>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            using namespace js_helpers;
+            using namespace adaptor_helpers;
+            auto ring = ParseRing(request.params[0]);
+            auto presig = ParseBlob<par::AdaptorPreSignature>(request.params[1].get_str());
+            if (!presig) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "presig must be valid serialized AdaptorPreSignature hex");
+            const auto msg_scalar = ParseScalar32(request.params[2].get_str(), "msg");
+            uint256 msg;
+            std::copy(msg_scalar.begin(), msg_scalar.end(), msg.begin());
+            auto label   = ParseSessionLabel(request.params[3], "session_label");
+            auto payload = ParseSessionLabel(request.params[4], "session_payload");
+            const bool ok = par::VerifyPreSignature(
+                std::span<const ::pricoin::ringsig::Point>{ring}, *presig, msg,
+                ToBytesSpan(label), ToBytesSpan(payload));
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("valid", ok);
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_jointspend_adaptor_adapt()
+{
+    return RPCMethod{
+        "pricoin_jointspend_adaptor_adapt",
+        "Adapt the pre-signature with the held secret t. Output is a standard\n"
+        "CLSAG Signature blob, broadcastable on-chain. Verifies before returning\n"
+        "(per spec §3.3 — t·G == T_G, s_pi != 0, full Verify under msg).\n",
+        {
+            {"presig", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"t",      RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte adaptor secret"},
+            {"ring",   RPCArg::Type::ARR,     RPCArg::Optional::NO, "",
+                {{"P", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+            {"msg",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "sig", "Serialized Signature bytes"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_jointspend_adaptor_adapt", "<presig> <t> <ring> <msg>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            using namespace js_helpers;
+            using namespace adaptor_helpers;
+            auto presig = ParseBlob<par::AdaptorPreSignature>(request.params[0].get_str());
+            if (!presig) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "presig must be serialized AdaptorPreSignature hex");
+            auto t = ParseScalar32(request.params[1].get_str(), "t");
+            auto ring = ParseRing(request.params[2]);
+            const auto msg_scalar = ParseScalar32(request.params[3].get_str(), "msg");
+            uint256 msg;
+            std::copy(msg_scalar.begin(), msg_scalar.end(), msg.begin());
+            auto sig = par::Adapt(*presig, t,
+                std::span<const ::pricoin::ringsig::Point>{ring}, msg);
+            if (!sig) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "Adapt failed (wrong t, degenerate s_pi, or post-Verify mismatch)");
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("sig", HexStr(SerializeBlob(*sig)));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_jointspend_adaptor_extract()
+{
+    return RPCMethod{
+        "pricoin_jointspend_adaptor_extract",
+        "Extract t = sig.s[pi] - presig.s[pi] (mod n) from an on-chain CLSAG\n"
+        "signature given the held pre-sig. Verifies t·G == T_G AND t·H_p(P_pi)\n"
+        "== T_H per spec §3.5; returns nullopt on either check failure.\n",
+        {
+            {"ring",   RPCArg::Type::ARR,     RPCArg::Optional::NO, "",
+                {{"P", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+            {"presig", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"sig",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "t", "32-byte recovered scalar"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_jointspend_adaptor_extract", "<ring> <presig> <sig>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            using namespace js_helpers;
+            using namespace adaptor_helpers;
+            auto ring   = ParseRing(request.params[0]);
+            auto presig = ParseBlob<par::AdaptorPreSignature>(request.params[1].get_str());
+            auto sig    = ParseBlob<::pricoin::ringsig::Signature>(request.params[2].get_str());
+            if (!presig || !sig) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "presig and sig must be serialized hex");
+            auto t = par::Extract(
+                std::span<const ::pricoin::ringsig::Point>{ring}, *presig, *sig);
+            if (!t) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "Extract failed (t·G != T_G or t·H_p(P_pi) != T_H)");
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("t", ScalarHex(*t));
+            return out;
+        }
+    };
+}
+
 } // namespace
 
 void RegisterPricoinCTRPCCommands(CRPCTable& t)
@@ -799,6 +1361,15 @@ void RegisterPricoinCTRPCCommands(CRPCTable& t)
         {"pricoin", &pricoin_jointspend_share},
         {"pricoin", &pricoin_jointspend_assemble},
         {"pricoin", &pricoin_jointspend_verify},
+        {"pricoin", &pricoin_adaptor_compute_points},
+        {"pricoin", &pricoin_adaptor_dleq_prove},
+        {"pricoin", &pricoin_adaptor_dleq_verify},
+        {"pricoin", &pricoin_jointspend_adaptor_round1},
+        {"pricoin", &pricoin_jointspend_adaptor_combine},
+        {"pricoin", &pricoin_jointspend_adaptor_assemble},
+        {"pricoin", &pricoin_jointspend_adaptor_verify_presig},
+        {"pricoin", &pricoin_jointspend_adaptor_adapt},
+        {"pricoin", &pricoin_jointspend_adaptor_extract},
     };
     for (const auto& c : commands) {
         t.appendCommand(c.name, &c);
