@@ -21,6 +21,7 @@
 #include <swap/atomic_swap_e2e_test.h>
 #include <swap/btc_adaptor_schnorr.h>
 #include <swap/btc_musig2_adaptor.h>
+#include <swap/btc_refund_tx.h>
 #include <swap/refund.h>
 #include <primitives/transaction.h>
 #include <random.h>
@@ -511,6 +512,13 @@ void RunSelfTest()
     // signing on both legs.
     ::pricoin::swap::refund::RunSelfTest();
     LogInfo("Pricoin swap refund (timelock policy + non-adaptor refund sigs) self-test passed");
+
+    // Atomic-swap phase 5 — BTC refund-tx skeleton + BIP341 sighash + witness assembly.
+    // Builds a real CTransaction, cooperatively signs the BIP341 sighash, attaches the
+    // 64-byte sig as a P2TR key-path-spend witness, verifies the witness sig under the
+    // aggregate XOnlyPubKey (= what bitcoind would do during script validation).
+    ::pricoin::swap::btc_refund_tx::RunSelfTest();
+    LogInfo("Pricoin btc_refund_tx (BIP341 sighash + cooperative witness assembly) self-test passed");
 }
 
 } // namespace pricoin::ct

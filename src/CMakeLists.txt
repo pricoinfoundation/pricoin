@@ -146,6 +146,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   swap/btc_adaptor_schnorr.cpp
   swap/btc_musig2_adaptor.cpp
   swap/btc_musig2_runtime.cpp
+  swap/btc_refund_tx.cpp
   swap/refund.cpp
   pricoin/joint_stealth.cpp
   pricoin/ringsig.cpp
