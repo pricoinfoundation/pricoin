@@ -25,6 +25,7 @@
 #include <wallet/feebumper.h>
 #include <wallet/fees.h>
 #include <wallet/load.h>
+#include <wallet/pricoin_adaptor_swap.h>
 #include <wallet/pricoin_ct_send.h>
 #include <wallet/pricoin_offer.h>
 #include <wallet/pricoin_stealth.h>
@@ -376,6 +377,119 @@ public:
         ::wallet::pricoin_offer::Order o;
         ::wallet::pricoin_offer::Get(*m_wallet, *oid, o);
         return ToSnapshot(o);
+    }
+
+    // ────── Phase-5/6 adaptor-swap orchestration ──────
+    static const char* AdaptorSwapRoleStr(::wallet::pricoin_adaptor_swap::Role r) {
+        return r == ::wallet::pricoin_adaptor_swap::Role::Alice ? "alice" : "bob";
+    }
+    static const char* AdaptorSwapStateStr(::wallet::pricoin_adaptor_swap::State s) {
+        using S = ::wallet::pricoin_adaptor_swap::State;
+        switch (s) {
+        case S::Setup:        return "setup";
+        case S::AdaptorReady: return "adaptor_ready";
+        case S::BtcFunded:    return "btc_funded";
+        case S::BothFunded:   return "both_funded";
+        case S::PreSigned:    return "pre_signed";
+        case S::PricClaimed:  return "pric_claimed";
+        case S::Complete:     return "complete";
+        case S::Refunded:     return "refunded";
+        case S::Aborted:      return "aborted";
+        }
+        return "unknown";
+    }
+
+    static PricoinAdaptorSwapSnapshot ToSwapSnapshot(
+        const ::wallet::pricoin_adaptor_swap::AdaptorSwap& s) {
+        PricoinAdaptorSwapSnapshot o;
+        o.swap_id = s.swap_id.ToString();
+        o.role = AdaptorSwapRoleStr(s.role);
+        o.state = AdaptorSwapStateStr(s.state);
+        o.counterparty_pubkey_hex = HexStr(s.counterparty_pub);
+        o.foreign_chain = s.foreign_chain;
+        o.foreign_amount_sat = s.foreign_amount_sat;
+        o.pric_joint_stealth_address = s.pric_joint_stealth_address;
+        o.pric_amount_sat = s.pric_amount_sat;
+        o.memo = s.memo;
+        o.abort_reason = s.abort_reason;
+        o.created_time = s.created_time;
+        o.updated_time = s.updated_time;
+        o.next_action = ::wallet::pricoin_adaptor_swap::NextActionHint(s);
+        return o;
+    }
+
+    std::vector<PricoinAdaptorSwapSnapshot> adaptorSwapList() override {
+        std::vector<PricoinAdaptorSwapSnapshot> out;
+        std::vector<::wallet::pricoin_adaptor_swap::AdaptorSwap> all;
+        auto r = ::wallet::pricoin_adaptor_swap::List(*m_wallet, all);
+        if (r != ::wallet::pricoin_adaptor_swap::LookupResult::Ok) return out;
+        out.reserve(all.size());
+        for (const auto& s : all) out.push_back(ToSwapSnapshot(s));
+        return out;
+    }
+
+    std::optional<PricoinAdaptorSwapSnapshot>
+    adaptorSwapGet(const std::string& swap_id) override {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return std::nullopt;
+        ::wallet::pricoin_adaptor_swap::AdaptorSwap s;
+        auto r = ::wallet::pricoin_adaptor_swap::Get(*m_wallet, *sid, s);
+        if (r != ::wallet::pricoin_adaptor_swap::LookupResult::Ok) return std::nullopt;
+        return ToSwapSnapshot(s);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot>
+    adaptorSwapCreate(const PricoinAdaptorSwapCreateParams& p) override {
+        const auto cp_bytes = TryParseHex<unsigned char>(p.counterparty_pubkey_hex);
+        if (!cp_bytes || cp_bytes->size() != 33) {
+            return util::Error{Untranslated("counterparty_pubkey must be 33-byte compressed hex")};
+        }
+        CPubKey cp(std::span<const unsigned char>(cp_bytes->data(), 33));
+        if (!cp.IsValid() || !cp.IsCompressed()) {
+            return util::Error{Untranslated("counterparty_pubkey not a valid compressed secp256k1 point")};
+        }
+        ::wallet::pricoin_adaptor_swap::Role role;
+        if (p.role == "alice")    role = ::wallet::pricoin_adaptor_swap::Role::Alice;
+        else if (p.role == "bob") role = ::wallet::pricoin_adaptor_swap::Role::Bob;
+        else return util::Error{Untranslated("role must be \"alice\" or \"bob\"")};
+
+        ::wallet::pricoin_adaptor_swap::AdaptorSwap s;
+        auto r = ::wallet::pricoin_adaptor_swap::Create(
+            *m_wallet, role, cp, p.foreign_chain, p.foreign_amount_sat,
+            p.pric_joint_stealth_address, p.pric_amount_sat, p.memo, s);
+        using CR = ::wallet::pricoin_adaptor_swap::CreateResult;
+        switch (r) {
+        case CR::Ok: return ToSwapSnapshot(s);
+        case CR::InvalidCounterpartyPubkey:
+            return util::Error{Untranslated("invalid counterparty pubkey")};
+        case CR::InvalidForeignLeg:
+            return util::Error{Untranslated("foreign chain must be btc/ltc/regtest and amount > 0")};
+        case CR::InvalidPricLeg:
+            return util::Error{Untranslated("pric_joint_stealth_address invalid or pric_amount <= 0")};
+        case CR::Locked:        return util::Error{Untranslated("wallet locked")};
+        case CR::WriteFailed:   return util::Error{Untranslated("wallet write failed")};
+        }
+        return util::Error{Untranslated("unknown create error")};
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot>
+    adaptorSwapAbort(const std::string& swap_id, const std::string& reason) override {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        auto r = ::wallet::pricoin_adaptor_swap::Abort(*m_wallet, *sid, reason);
+        using TR = ::wallet::pricoin_adaptor_swap::TransitionResult;
+        switch (r) {
+        case TR::Ok: break;
+        case TR::NotFound:        return util::Error{Untranslated("no swap with that id")};
+        case TR::InvalidState:    return util::Error{Untranslated("current state does not permit abort")};
+        case TR::InvalidInput:    return util::Error{Untranslated("invalid input")};
+        case TR::InvalidTimelocks:return util::Error{Untranslated("invalid timelocks")};
+        case TR::Locked:          return util::Error{Untranslated("wallet locked")};
+        case TR::WriteFailed:     return util::Error{Untranslated("wallet write failed")};
+        }
+        ::wallet::pricoin_adaptor_swap::AdaptorSwap s;
+        ::wallet::pricoin_adaptor_swap::Get(*m_wallet, *sid, s);
+        return ToSwapSnapshot(s);
     }
 
 private:

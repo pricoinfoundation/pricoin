@@ -77,6 +77,8 @@ public Q_SLOTS:
     void gotoSendCoinsPage(QString addr = "");
     /** Switch to Pricoin orderbook page */
     void gotoPricoinOrderbookPage();
+    /** Switch to Pricoin swaps page */
+    void gotoPricoinSwapsPage();
 
     /** Show Sign/Verify Message dialog and switch to sign message tab */
     void gotoSignMessageTab(QString addr = "");

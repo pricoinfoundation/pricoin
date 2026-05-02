@@ -194,6 +194,8 @@ if(ENABLE_WALLET)
       pricoin_nostr_client.h
       pricoin_relay_settings_dialog.cpp
       pricoin_relay_settings_dialog.h
+      pricoin_swaps_page.cpp
+      pricoin_swaps_page.h
       pricoinorderbookpage.cpp
       pricoinorderbookpage.h
       sendcoinsdialog.cpp

@@ -202,6 +202,42 @@ public:
     //! sorted best-first.
     virtual std::vector<PricoinMatchCandidate> offerFindMatches(const std::string& my_order_id) = 0;
 
+    // ────── Phase-5/6 adaptor-swap orchestration (read-only + create) ──────
+
+    struct PricoinAdaptorSwapSnapshot {
+        std::string swap_id;
+        std::string role;                // "alice" | "bob"
+        std::string state;               // see pricoin_adaptor_swap::Status
+        std::string counterparty_pubkey_hex;
+        std::string foreign_chain;       // "btc" | "ltc"
+        int64_t     foreign_amount_sat{0};
+        std::string pric_joint_stealth_address;
+        int64_t     pric_amount_sat{0};
+        std::string memo;
+        std::string abort_reason;
+        int64_t     created_time{0};
+        int64_t     updated_time{0};
+        std::string next_action;         // role-aware hint
+    };
+
+    struct PricoinAdaptorSwapCreateParams {
+        std::string role;                // "alice" | "bob"
+        std::string counterparty_pubkey_hex;  // 33-byte compressed
+        std::string foreign_chain;       // "btc" | "ltc"
+        int64_t     foreign_amount_sat{0};
+        std::string pric_joint_stealth_address;
+        int64_t     pric_amount_sat{0};
+        std::string memo;
+    };
+
+    virtual std::vector<PricoinAdaptorSwapSnapshot> adaptorSwapList() = 0;
+    virtual std::optional<PricoinAdaptorSwapSnapshot>
+        adaptorSwapGet(const std::string& swap_id) = 0;
+    virtual util::Result<PricoinAdaptorSwapSnapshot>
+        adaptorSwapCreate(const PricoinAdaptorSwapCreateParams& p) = 0;
+    virtual util::Result<PricoinAdaptorSwapSnapshot>
+        adaptorSwapAbort(const std::string& swap_id, const std::string& reason) = 0;
+
     //! Pricoin: 32-byte BIP340 x-only form of the wallet's swap-identity
     //! pubkey, hex. Used as the `pubkey` field of Nostr events that
     //! announce orders this wallet maintains. Empty on locked wallet.

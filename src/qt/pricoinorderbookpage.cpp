@@ -190,12 +190,14 @@ void PricoinOrderbookPage::buildLayout()
     m_btn_fill         = new QPushButton(tr("Fill"),          this);
     m_btn_unmatch      = new QPushButton(tr("Unmatch"),       this);
     m_btn_publish      = new QPushButton(tr("Publish to relays"), this);
+    m_btn_start_swap   = new QPushButton(tr("Start swap…"),       this);
     bot_row->addWidget(m_btn_cancel);
     bot_row->addWidget(m_btn_copy_uri);
     bot_row->addWidget(m_btn_find_matches);
     bot_row->addWidget(m_btn_fill);
     bot_row->addWidget(m_btn_unmatch);
     bot_row->addWidget(m_btn_publish);
+    bot_row->addWidget(m_btn_start_swap);
     bot_row->addStretch();
     outer->addLayout(bot_row);
 
@@ -228,6 +230,7 @@ void PricoinOrderbookPage::buildLayout()
     connect(m_btn_fill,         &QPushButton::clicked, this, &PricoinOrderbookPage::onFillClicked);
     connect(m_btn_unmatch,      &QPushButton::clicked, this, &PricoinOrderbookPage::onUnmatchClicked);
     connect(m_btn_publish,         &QPushButton::clicked, this, &PricoinOrderbookPage::onPublishClicked);
+    connect(m_btn_start_swap,      &QPushButton::clicked, this, &PricoinOrderbookPage::onStartSwapClicked);
     connect(m_btn_connect_relays,  &QPushButton::clicked, this, &PricoinOrderbookPage::onConnectRelaysClicked);
     connect(m_btn_relay_settings,  &QPushButton::clicked, this, &PricoinOrderbookPage::onRelaySettingsClicked);
 
@@ -334,6 +337,11 @@ void PricoinOrderbookPage::onSelectionChanged()
     m_btn_unmatch->setEnabled(has && is_matched);
     m_btn_publish->setEnabled(has && is_local && is_active &&
                               m_nostr && m_connected_relay_count > 0);
+    // Start swap is offered when this row is matched. Either side
+    // (the local order or the imported peer) is a valid trigger;
+    // the dialog asks for the missing fields (joint stealth address,
+    // refund timelocks).
+    m_btn_start_swap->setEnabled(has && is_matched);
 }
 
 void PricoinOrderbookPage::onPublishClicked()
@@ -414,6 +422,134 @@ void PricoinOrderbookPage::onAutoRefreshTick()
     // re-pull. This is a bounded operation (single wallet RPC).
     if (!m_model) return;
     refreshTable();
+}
+
+void PricoinOrderbookPage::onStartSwapClicked()
+{
+    if (!m_model) return;
+    const std::string oid = selectedOrderId();
+    if (oid.empty()) return;
+
+    // Determine my-vs-peer order based on origin. The local order
+    // (origin=local) is "mine"; the imported peer (origin=imported)
+    // is the counterparty.
+    const interfaces::Wallet::PricoinOfferSnapshot* mine = nullptr;
+    const interfaces::Wallet::PricoinOfferSnapshot* peer = nullptr;
+    for (const auto& o : m_orders) {
+        if (o.order_id == oid) {
+            if (o.origin == "local") mine = &o;
+            else                     peer = &o;
+        }
+    }
+    if (mine == nullptr || peer == nullptr) {
+        // The user picked a row but its match counterpart isn't
+        // loaded yet. Try to look up the linked peer via matched_with.
+        const interfaces::Wallet::PricoinOfferSnapshot* selected = nullptr;
+        for (const auto& o : m_orders) {
+            if (o.order_id == oid) selected = &o;
+        }
+        if (!selected || selected->matched_with_order_id.empty()) {
+            setStatus(tr("Need both Local and Imported sides of the match in this wallet."), true);
+            return;
+        }
+        const std::string peer_id = selected->matched_with_order_id;
+        for (const auto& o : m_orders) {
+            if (o.order_id == peer_id) {
+                if (selected->origin == "local") { mine = selected; peer = &o; }
+                else                              { peer = selected; mine = &o; }
+                break;
+            }
+        }
+        if (!mine || !peer) {
+            setStatus(tr("Counterparty's order not in this wallet — import their URI first."), true);
+            return;
+        }
+    }
+
+    // Map orderbook side → adaptor-swap role.
+    //   sell_pric (giving up PRIC, receiving foreign) → Alice
+    //   buy_pric  (giving up foreign, receiving PRIC) → Bob
+    const std::string my_role = (mine->side == "sell_pric") ? "alice" : "bob";
+
+    // Compute the actual amounts at the maker's (peer's, when
+    // peer is the maker on the matched side) rate. For the local
+    // side's perspective: pric_in_flight is the actual_pric that
+    // was reserved; foreign at maker's rate — recompute from the
+    // peer's max amounts.
+    const int64_t pric_amount = mine->pric_in_flight_sat;
+    if (pric_amount <= 0) {
+        setStatus(tr("Selected order has no in-flight pric amount."), true);
+        return;
+    }
+    // Maker's rate = (foreign_max / pric_max) of whichever side is
+    // the SellPric (asker = maker per spec — taker pays maker's rate).
+    const interfaces::Wallet::PricoinOfferSnapshot* ask =
+        (mine->side == "sell_pric") ? mine : peer;
+    if (ask->max_pric_amount_sat <= 0) {
+        setStatus(tr("Bad ask amounts."), true);
+        return;
+    }
+    const int64_t foreign_amount = static_cast<int64_t>(
+        (static_cast<__int128>(pric_amount) *
+         static_cast<__int128>(ask->foreign_amount_at_max_sat)) /
+        static_cast<__int128>(ask->max_pric_amount_sat));
+
+    // Prompt for the joint stealth address (the user computed it via
+    // pricoin_buildjointstealthaddress out-of-band) plus refund timelocks.
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Start atomic swap"));
+    auto* form = new QFormLayout(&dlg);
+
+    auto* role_label = new QLabel(QString::fromStdString(my_role), &dlg);
+    auto* chain_label = new QLabel(QString::fromStdString(mine->foreign_chain), &dlg);
+    auto* pric_label = new QLabel(QString::number(pric_amount), &dlg);
+    auto* foreign_label = new QLabel(QString::number(foreign_amount), &dlg);
+    form->addRow(tr("My role:"),               role_label);
+    form->addRow(tr("Foreign chain:"),         chain_label);
+    form->addRow(tr("PRIC amount (sat):"),     pric_label);
+    form->addRow(tr("Foreign amount (sat):"),  foreign_label);
+
+    auto* joint_edit = new QLineEdit(&dlg);
+    joint_edit->setPlaceholderText(tr("output of pricoin_buildjointstealthaddress"));
+    form->addRow(tr("Joint stealth address:"), joint_edit);
+
+    auto* pric_lock = new QSpinBox(&dlg);
+    pric_lock->setRange(1, 2'147'483'647);
+    pric_lock->setValue(480);
+    form->addRow(tr("PRIC refund-height delta (blocks):"), pric_lock);
+
+    auto* delta_min = new QSpinBox(&dlg);
+    delta_min->setRange(1, 2'147'483'647);
+    delta_min->setValue(144);
+    form->addRow(tr("Foreign delta-min (blocks):"), delta_min);
+
+    auto* memo_edit = new QLineEdit(&dlg);
+    form->addRow(tr("Memo:"), memo_edit);
+
+    auto* bb = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(bb);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    interfaces::Wallet::PricoinAdaptorSwapCreateParams ap;
+    ap.role = my_role;
+    ap.counterparty_pubkey_hex = peer->maker_pubkey_hex;
+    ap.foreign_chain = mine->foreign_chain;
+    ap.foreign_amount_sat = foreign_amount;
+    ap.pric_joint_stealth_address = joint_edit->text().trimmed().toStdString();
+    ap.pric_amount_sat = pric_amount;
+    ap.memo = memo_edit->text().toStdString();
+
+    auto r = m_model->wallet().adaptorSwapCreate(ap);
+    if (!r) {
+        setStatus(tr("Start swap failed: %1")
+            .arg(QString::fromStdString(util::ErrorString(r).original)), true);
+        return;
+    }
+    setStatus(tr("Swap created. Switch to the Swaps tab to track its state."));
 }
 
 void PricoinOrderbookPage::onNostrOfferReceived(const QString& uri)

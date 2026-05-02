@@ -14,6 +14,7 @@ class ClientModel;
 class OverviewPage;
 class PlatformStyle;
 class PricoinOrderbookPage;
+class PricoinSwapsPage;
 class ReceiveCoinsDialog;
 class SendCoinsDialog;
 class SendCoinsRecipient;
@@ -64,6 +65,7 @@ private:
     ReceiveCoinsDialog *receiveCoinsPage;
     SendCoinsDialog *sendCoinsPage;
     PricoinOrderbookPage *pricoinOrderbookPage{nullptr};
+    PricoinSwapsPage *pricoinSwapsPage{nullptr};
     AddressBookPage *usedSendingAddressesPage;
     AddressBookPage *usedReceivingAddressesPage;
 
@@ -83,6 +85,8 @@ public Q_SLOTS:
     void gotoSendCoinsPage(QString addr = "");
     /** Switch to Pricoin orderbook page */
     void gotoPricoinOrderbookPage();
+    /** Switch to Pricoin swaps page */
+    void gotoPricoinSwapsPage();
 
     /** Show Sign/Verify Message dialog and switch to sign message tab */
     void gotoSignMessageTab(QString addr = "");

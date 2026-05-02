@@ -1,0 +1,75 @@
+// Copyright (c) 2026-present The Pricoin developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#ifndef BITCOIN_QT_PRICOIN_SWAPS_PAGE_H
+#define BITCOIN_QT_PRICOIN_SWAPS_PAGE_H
+
+#include <QWidget>
+
+#include <vector>
+
+#include <interfaces/wallet.h>
+
+class WalletModel;
+class PlatformStyle;
+
+QT_BEGIN_NAMESPACE
+class QTableView;
+class QStandardItemModel;
+class QPushButton;
+class QLabel;
+class QTextEdit;
+class QTimer;
+QT_END_NAMESPACE
+
+// Phase 5/6 cross-track UI: read-only view of `pricoin_adaptor_swap`
+// records, with the role-aware "next action" hint surfaced per row.
+//
+// State transitions through the multi-step swap protocol (set adaptor
+// materials, set timelocks, pre-sign, claim, fill, refund) are still
+// driven via RPC for now — this page exists to give the GUI user
+// visibility into the running swaps the orderbook produced (or that
+// were created via the existing 12 lifecycle RPCs). A follow-up
+// commit will add wizard-style action buttons that wrap each
+// transition.
+//
+// Refresh is automatic every 5 s plus on `setModel()`.
+
+class PricoinSwapsPage : public QWidget
+{
+    Q_OBJECT
+
+public:
+    explicit PricoinSwapsPage(const PlatformStyle* platformStyle, QWidget* parent = nullptr);
+    ~PricoinSwapsPage() override;
+
+    void setModel(WalletModel* model);
+
+private Q_SLOTS:
+    void onRefreshClicked();
+    void onAbortClicked();
+    void onSelectionChanged();
+    void onAutoRefreshTick();
+
+private:
+    WalletModel* m_model{nullptr};
+    const PlatformStyle* m_platform_style;
+
+    QTableView* m_table{nullptr};
+    QStandardItemModel* m_table_model{nullptr};
+    QPushButton* m_btn_refresh{nullptr};
+    QPushButton* m_btn_abort{nullptr};
+    QLabel*      m_status_label{nullptr};
+    QTextEdit*   m_next_action_view{nullptr};
+    QTimer*      m_auto_refresh_timer{nullptr};
+
+    std::vector<interfaces::Wallet::PricoinAdaptorSwapSnapshot> m_swaps;
+
+    void buildLayout();
+    void refreshTable();
+    void setStatus(const QString& msg, bool error = false);
+    std::string selectedSwapId() const;
+};
+
+#endif // BITCOIN_QT_PRICOIN_SWAPS_PAGE_H

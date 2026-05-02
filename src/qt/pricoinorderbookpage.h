@@ -66,6 +66,7 @@ private Q_SLOTS:
     void onPublishClicked();
     void onConnectRelaysClicked();
     void onRelaySettingsClicked();
+    void onStartSwapClicked();
     void onNostrOfferReceived(const QString& uri);
     void onNostrLog(const QString& msg);
     void onNostrRelayStatus(const QString& url, bool connected);
@@ -86,6 +87,7 @@ private:
     QPushButton* m_btn_fill{nullptr};
     QPushButton* m_btn_unmatch{nullptr};
     QPushButton* m_btn_publish{nullptr};
+    QPushButton* m_btn_start_swap{nullptr};
     QPushButton* m_btn_connect_relays{nullptr};
     QPushButton* m_btn_relay_settings{nullptr};
     QLabel*      m_status_label{nullptr};
