@@ -239,6 +239,13 @@ public:
         int32_t     pric_refund_height{0};
         int32_t     foreign_refund_height{0};
         int32_t     delta_min_blocks{0};
+        // Per-leg destination addresses, agreed at swap creation.
+        // The cooperative-sign dialogs pre-fill recipient/dest from
+        // these by Mode (claim → bob/alice; refund → alice/bob).
+        std::string btc_alice_recipient_xonly_hex;
+        std::string btc_bob_recipient_xonly_hex;
+        std::string pric_alice_recipient_stealth;
+        std::string pric_bob_recipient_stealth;
     };
 
     struct PricoinAdaptorSwapCreateParams {
@@ -249,6 +256,15 @@ public:
         std::string pric_joint_stealth_address;
         int64_t     pric_amount_sat{0};
         std::string memo;
+        // Per-leg destination addresses, agreed at swap creation.
+        // Both parties' wallets store all four so each side can
+        // pre-fill the right recipient at sign time without another
+        // round-trip. BTC fields are 32-byte x-only pubkey hex; PRIC
+        // fields are stealth-address strings.
+        std::string btc_alice_recipient_xonly_hex;
+        std::string btc_bob_recipient_xonly_hex;
+        std::string pric_alice_recipient_stealth;
+        std::string pric_bob_recipient_stealth;
     };
 
     virtual std::vector<PricoinAdaptorSwapSnapshot> adaptorSwapList() = 0;

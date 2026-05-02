@@ -119,6 +119,16 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
                 && snap->pric_refund_height > 0) {
                 m_in_bt_nlocktime->setText(QString::number(snap->pric_refund_height));
             }
+            // Destination: PRIC claim (adaptor) → Alice's stealth,
+            // PRIC refund (plain) → Bob's stealth.
+            if (m_in_bt_dest) {
+                const std::string& dest =
+                    (m_mode == Mode::PricAdaptor) ? snap->pric_alice_recipient_stealth
+                                                   : snap->pric_bob_recipient_stealth;
+                if (!dest.empty()) {
+                    m_in_bt_dest->setText(QString::fromStdString(dest));
+                }
+            }
         }
     }
 }

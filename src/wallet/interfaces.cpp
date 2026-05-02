@@ -436,6 +436,10 @@ public:
         o.pric_refund_height       = s.pric_refund_height;
         o.foreign_refund_height    = s.foreign_refund_height;
         o.delta_min_blocks         = s.delta_min_blocks;
+        o.btc_alice_recipient_xonly_hex  = s.btc_alice_recipient_xonly_hex;
+        o.btc_bob_recipient_xonly_hex    = s.btc_bob_recipient_xonly_hex;
+        o.pric_alice_recipient_stealth   = s.pric_alice_recipient_stealth;
+        o.pric_bob_recipient_stealth     = s.pric_bob_recipient_stealth;
         return o;
     }
 
@@ -477,7 +481,11 @@ public:
         ::wallet::pricoin_adaptor_swap::AdaptorSwap s;
         auto r = ::wallet::pricoin_adaptor_swap::Create(
             *m_wallet, role, cp, p.foreign_chain, p.foreign_amount_sat,
-            p.pric_joint_stealth_address, p.pric_amount_sat, p.memo, s);
+            p.pric_joint_stealth_address, p.pric_amount_sat, p.memo,
+            p.btc_alice_recipient_xonly_hex,
+            p.btc_bob_recipient_xonly_hex,
+            p.pric_alice_recipient_stealth,
+            p.pric_bob_recipient_stealth, s);
         using CR = ::wallet::pricoin_adaptor_swap::CreateResult;
         switch (r) {
         case CR::Ok: return ToSwapSnapshot(s);

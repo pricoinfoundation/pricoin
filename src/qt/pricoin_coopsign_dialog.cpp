@@ -135,6 +135,18 @@ CoopSignDialog::CoopSignDialog(WalletModel* wallet_model,
                 && snap->foreign_refund_height > 0) {
                 m_in_nlocktime->setText(QString::number(snap->foreign_refund_height));
             }
+            // Recipient: BTC claim (adaptor) → Bob's xonly, BTC
+            // refund (plain) → Alice's xonly. Both wallets store
+            // both addresses so each side can pre-fill independent
+            // of role.
+            if (m_in_recipient_xonly) {
+                const std::string& rcpt =
+                    (m_mode == Mode::BtcAdaptor) ? snap->btc_bob_recipient_xonly_hex
+                                                  : snap->btc_alice_recipient_xonly_hex;
+                if (!rcpt.empty()) {
+                    m_in_recipient_xonly->setText(QString::fromStdString(rcpt));
+                }
+            }
         }
     }
 }

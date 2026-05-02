@@ -141,6 +141,10 @@ CreateResult Create(
     const std::string& pric_joint_stealth_address,
     int64_t pric_amount_sat,
     const std::string& memo,
+    const std::string& btc_alice_recipient_xonly_hex,
+    const std::string& btc_bob_recipient_xonly_hex,
+    const std::string& pric_alice_recipient_stealth,
+    const std::string& pric_bob_recipient_stealth,
     AdaptorSwap& out)
 {
     if (!counterparty_pub.IsValid() || !counterparty_pub.IsCompressed()) {
@@ -164,6 +168,13 @@ CreateResult Create(
     s.pric_joint_stealth_address = pric_joint_stealth_address;
     s.pric_amount_sat = pric_amount_sat;
     s.memo = memo;
+    // Destination addresses — the dialogs prefill recipient/dest
+    // fields off these. Passed verbatim here; format validation is
+    // a UX concern up the stack (the create dialog already filters).
+    s.btc_alice_recipient_xonly_hex = btc_alice_recipient_xonly_hex;
+    s.btc_bob_recipient_xonly_hex   = btc_bob_recipient_xonly_hex;
+    s.pric_alice_recipient_stealth  = pric_alice_recipient_stealth;
+    s.pric_bob_recipient_stealth    = pric_bob_recipient_stealth;
     s.created_time = NowSec();
     s.updated_time = s.created_time;
 

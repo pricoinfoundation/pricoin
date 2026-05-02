@@ -583,6 +583,27 @@ void PricoinOrderbookPage::onStartSwapClicked()
     joint_edit->setPlaceholderText(tr("output of pricoin_buildjointstealthaddress"));
     form->addRow(tr("Joint stealth address:"), joint_edit);
 
+    // Per-leg destination addresses. Stored on the swap record so
+    // the cooperative-sign dialogs can pre-fill recipient/dest based
+    // on Mode + role without another out-of-band exchange. Both
+    // parties enter all four (the swap protocol requires both sides
+    // to agree on these up front).
+    auto* btc_alice_rcpt = new QLineEdit(&dlg);
+    btc_alice_rcpt->setPlaceholderText(tr("32-byte x-only — Alice's BTC P2TR refund recipient"));
+    form->addRow(tr("BTC refund (Alice's xonly):"), btc_alice_rcpt);
+
+    auto* btc_bob_rcpt = new QLineEdit(&dlg);
+    btc_bob_rcpt->setPlaceholderText(tr("32-byte x-only — Bob's BTC P2TR claim recipient"));
+    form->addRow(tr("BTC claim (Bob's xonly):"), btc_bob_rcpt);
+
+    auto* pric_alice_rcpt = new QLineEdit(&dlg);
+    pric_alice_rcpt->setPlaceholderText(tr("Alice's PRIC stealth claim recipient"));
+    form->addRow(tr("PRIC claim (Alice's stealth):"), pric_alice_rcpt);
+
+    auto* pric_bob_rcpt = new QLineEdit(&dlg);
+    pric_bob_rcpt->setPlaceholderText(tr("Bob's PRIC stealth refund recipient"));
+    form->addRow(tr("PRIC refund (Bob's stealth):"), pric_bob_rcpt);
+
     auto* pric_lock = new QSpinBox(&dlg);
     pric_lock->setRange(1, 2'147'483'647);
     pric_lock->setValue(480);
@@ -612,6 +633,10 @@ void PricoinOrderbookPage::onStartSwapClicked()
     ap.pric_joint_stealth_address = joint_edit->text().trimmed().toStdString();
     ap.pric_amount_sat = pric_amount;
     ap.memo = memo_edit->text().toStdString();
+    ap.btc_alice_recipient_xonly_hex = btc_alice_rcpt->text().trimmed().toStdString();
+    ap.btc_bob_recipient_xonly_hex   = btc_bob_rcpt->text().trimmed().toStdString();
+    ap.pric_alice_recipient_stealth  = pric_alice_rcpt->text().trimmed().toStdString();
+    ap.pric_bob_recipient_stealth    = pric_bob_rcpt->text().trimmed().toStdString();
 
     auto r = m_model->wallet().adaptorSwapCreate(ap);
     if (!r) {

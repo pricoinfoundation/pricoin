@@ -205,6 +205,20 @@ struct AdaptorSwap {
     int64_t     updated_time{0};
     std::string abort_reason;
 
+    // Per-leg destination addresses, agreed at swap creation. The
+    // BTC P2TR recipients are 32-byte x-only pubkey hex (the dialogs
+    // synthesize 0x5120<xonly> to get the SPK). The PRIC recipients
+    // are full stealth-address strings.
+    //
+    // Convention: BTC alice = refund recipient (Alice gets BTC back
+    // on abort); BTC bob = claim recipient (Bob receives BTC). PRIC
+    // alice = claim recipient (Alice receives PRIC); PRIC bob =
+    // refund recipient (Bob gets PRIC back on abort).
+    std::string btc_alice_recipient_xonly_hex;
+    std::string btc_bob_recipient_xonly_hex;
+    std::string pric_alice_recipient_stealth;
+    std::string pric_bob_recipient_stealth;
+
     SERIALIZE_METHODS(AdaptorSwap, obj) {
         READWRITE(obj.swap_id);
         uint8_t role_byte = static_cast<uint8_t>(obj.role);
@@ -261,6 +275,15 @@ struct AdaptorSwap {
         READWRITE(obj.created_time);
         READWRITE(obj.updated_time);
         READWRITE(obj.abort_reason);
+
+        // Per-leg destination addresses (appended 2026-05-02). These
+        // fields are required for new records; existing pre-format
+        // records will fail to deserialize. Toy/regtest scope —
+        // purge old swap records via a wallet reset if needed.
+        READWRITE(obj.btc_alice_recipient_xonly_hex);
+        READWRITE(obj.btc_bob_recipient_xonly_hex);
+        READWRITE(obj.pric_alice_recipient_stealth);
+        READWRITE(obj.pric_bob_recipient_stealth);
     }
 };
 
@@ -301,6 +324,10 @@ CreateResult Create(
     const std::string& pric_joint_stealth_address,
     int64_t pric_amount_sat,
     const std::string& memo,
+    const std::string& btc_alice_recipient_xonly_hex,
+    const std::string& btc_bob_recipient_xonly_hex,
+    const std::string& pric_alice_recipient_stealth,
+    const std::string& pric_bob_recipient_stealth,
     AdaptorSwap& out);
 
 // Set adaptor materials. For Bob: provide t_secret + T_G + dleq.

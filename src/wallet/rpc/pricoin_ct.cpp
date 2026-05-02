@@ -4322,6 +4322,12 @@ UniValue AdaptorSwapToJSON(const aas::AdaptorSwap& s)
     }
     if (!s.foreign_claim_txid.empty())  foreign.pushKV("claim_txid",  s.foreign_claim_txid);
     if (!s.foreign_refund_txid.empty()) foreign.pushKV("refund_txid", s.foreign_refund_txid);
+    if (!s.btc_alice_recipient_xonly_hex.empty()) {
+        foreign.pushKV("alice_recipient_xonly", s.btc_alice_recipient_xonly_hex);
+    }
+    if (!s.btc_bob_recipient_xonly_hex.empty()) {
+        foreign.pushKV("bob_recipient_xonly", s.btc_bob_recipient_xonly_hex);
+    }
     out.pushKV("foreign", std::move(foreign));
 
     UniValue pric{UniValue::VOBJ};
@@ -4334,6 +4340,12 @@ UniValue AdaptorSwapToJSON(const aas::AdaptorSwap& s)
     }
     if (!s.pric_claim_txid.IsNull())  pric.pushKV("claim_txid",  s.pric_claim_txid.ToString());
     if (!s.pric_refund_txid.IsNull()) pric.pushKV("refund_txid", s.pric_refund_txid.ToString());
+    if (!s.pric_alice_recipient_stealth.empty()) {
+        pric.pushKV("alice_recipient_stealth", s.pric_alice_recipient_stealth);
+    }
+    if (!s.pric_bob_recipient_stealth.empty()) {
+        pric.pushKV("bob_recipient_stealth", s.pric_bob_recipient_stealth);
+    }
     out.pushKV("pric", std::move(pric));
 
     if (s.adaptor_set) {
@@ -4436,6 +4448,14 @@ RPCMethod pricoin_adaptor_swap_create()
             {"pric_joint_stealth_address", RPCArg::Type::STR, RPCArg::Optional::NO, "Joint stealth address (output of pricoin_buildjointstealthaddress)"},
             {"pric_amount_sat",      RPCArg::Type::NUM,     RPCArg::Optional::NO, "PRIC-leg amount"},
             {"memo",                 RPCArg::Type::STR,     RPCArg::Default{""}, "Free-form note"},
+            {"btc_alice_recipient_xonly_hex", RPCArg::Type::STR_HEX, RPCArg::Default{""},
+                "32-byte x-only pubkey hex — Alice's BTC P2TR refund recipient"},
+            {"btc_bob_recipient_xonly_hex",   RPCArg::Type::STR_HEX, RPCArg::Default{""},
+                "32-byte x-only pubkey hex — Bob's BTC P2TR claim recipient"},
+            {"pric_alice_recipient_stealth",  RPCArg::Type::STR,     RPCArg::Default{""},
+                "Alice's PRIC stealth-address claim recipient"},
+            {"pric_bob_recipient_stealth",    RPCArg::Type::STR,     RPCArg::Default{""},
+                "Bob's PRIC stealth-address refund recipient"},
         },
         RPCResult{ RPCResult::Type::ANY, "", "Swap record" },
         RPCExamples{HelpExampleCli("pricoin_adaptor_swap_create",
@@ -4450,9 +4470,14 @@ RPCMethod pricoin_adaptor_swap_create()
             const std::string addr   = request.params[4].get_str();
             const int64_t p_amt      = request.params[5].getInt<int64_t>();
             const std::string memo   = request.params[6].isNull() ? "" : request.params[6].get_str();
+            const std::string btc_alice = request.params[7].isNull() ? "" : request.params[7].get_str();
+            const std::string btc_bob   = request.params[8].isNull() ? "" : request.params[8].get_str();
+            const std::string pric_alice = request.params[9].isNull() ? "" : request.params[9].get_str();
+            const std::string pric_bob   = request.params[10].isNull() ? "" : request.params[10].get_str();
 
             aas::AdaptorSwap s;
-            aas::CreateResult r = aas::Create(*wallet_sp, role, cp, chain, f_amt, addr, p_amt, memo, s);
+            aas::CreateResult r = aas::Create(*wallet_sp, role, cp, chain, f_amt, addr, p_amt, memo,
+                btc_alice, btc_bob, pric_alice, pric_bob, s);
             if (r != aas::CreateResult::Ok) ThrowFromAdaptorSwapCreate(r);
             return AdaptorSwapToJSON(s);
         }
