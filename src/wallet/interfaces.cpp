@@ -472,6 +472,170 @@ public:
         return util::Error{Untranslated("unknown create error")};
     }
 
+    static util::Result<PricoinAdaptorSwapSnapshot> WrapTransition(
+        ::wallet::pricoin_adaptor_swap::TransitionResult r,
+        WalletImpl* self,
+        const uint256& sid)
+    {
+        using TR = ::wallet::pricoin_adaptor_swap::TransitionResult;
+        switch (r) {
+        case TR::Ok: break;
+        case TR::NotFound:        return util::Error{Untranslated("no swap with that id")};
+        case TR::InvalidState:    return util::Error{Untranslated("current state does not permit this transition")};
+        case TR::InvalidInput:    return util::Error{Untranslated("invalid input")};
+        case TR::InvalidTimelocks:return util::Error{Untranslated("refund timelocks failed §6.2 step 7 validation (foreign > pric + delta_min_blocks)")};
+        case TR::Locked:          return util::Error{Untranslated("wallet locked")};
+        case TR::WriteFailed:     return util::Error{Untranslated("wallet write failed")};
+        }
+        ::wallet::pricoin_adaptor_swap::AdaptorSwap s;
+        ::wallet::pricoin_adaptor_swap::Get(*self->m_wallet, sid, s);
+        return ToSwapSnapshot(s);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetAdaptorMaterials(
+        const std::string& swap_id,
+        const std::string& T_G_hex,
+        const std::string& dleq_proof_blob_hex,
+        const std::string& t_secret_hex) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        const auto T_G_bytes = TryParseHex<unsigned char>(T_G_hex);
+        if (!T_G_bytes || T_G_bytes->size() != 33) {
+            return util::Error{Untranslated("T_G must be 33-byte compressed pubkey hex")};
+        }
+        std::array<unsigned char, 33> T_G{};
+        std::copy(T_G_bytes->begin(), T_G_bytes->end(), T_G.begin());
+        const auto dleq_bytes = TryParseHex<unsigned char>(dleq_proof_blob_hex);
+        if (!dleq_bytes || dleq_bytes->empty()) {
+            return util::Error{Untranslated("dleq_proof_blob must be non-empty hex")};
+        }
+        std::optional<std::array<unsigned char, 32>> t_secret;
+        if (!t_secret_hex.empty()) {
+            const auto t_bytes = TryParseHex<unsigned char>(t_secret_hex);
+            if (!t_bytes || t_bytes->size() != 32) {
+                return util::Error{Untranslated("t_secret must be 32-byte hex (or empty for Alice)")};
+            }
+            std::array<unsigned char, 32> t_arr{};
+            std::copy(t_bytes->begin(), t_bytes->end(), t_arr.begin());
+            t_secret = t_arr;
+        }
+        auto r = ::wallet::pricoin_adaptor_swap::SetAdaptorMaterials(
+            *m_wallet, *sid, T_G, *dleq_bytes, t_secret);
+        return WrapTransition(r, this, *sid);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetRefundTimelocks(
+        const std::string& swap_id,
+        int32_t pric_refund_height,
+        int32_t foreign_refund_height,
+        int32_t delta_min_blocks) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        auto r = ::wallet::pricoin_adaptor_swap::SetRefundTimelocks(
+            *m_wallet, *sid, pric_refund_height, foreign_refund_height, delta_min_blocks);
+        return WrapTransition(r, this, *sid);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetBtcFunded(
+        const std::string& swap_id,
+        const std::string& foreign_funding_txid,
+        int32_t foreign_funding_vout,
+        int32_t foreign_funding_height) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        auto r = ::wallet::pricoin_adaptor_swap::SetBtcFunded(
+            *m_wallet, *sid, foreign_funding_txid,
+            foreign_funding_vout, foreign_funding_height);
+        return WrapTransition(r, this, *sid);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPricFunded(
+        const std::string& swap_id,
+        const std::string& pric_funding_txid,
+        int32_t pric_funding_vout,
+        int32_t pric_funding_height) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        auto txid = uint256::FromHex(pric_funding_txid);
+        if (!txid) return util::Error{Untranslated("pric_funding_txid must be 32-byte hex")};
+        auto r = ::wallet::pricoin_adaptor_swap::SetPricFunded(
+            *m_wallet, *sid, *txid,
+            pric_funding_vout, pric_funding_height);
+        return WrapTransition(r, this, *sid);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPreSigned(
+        const std::string& swap_id,
+        const PricoinAdaptorSwapPreSigsHex& presigs) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        auto parse = [](const std::string& hex) {
+            auto b = TryParseHex<unsigned char>(hex);
+            return b.value_or(std::vector<unsigned char>{});
+        };
+        ::wallet::pricoin_adaptor_swap::AdaptorSwapPreSigs ps;
+        ps.btc_claim_presig         = parse(presigs.btc_claim_presig_hex);
+        ps.btc_claim_session        = parse(presigs.btc_claim_session_hex);
+        ps.btc_claim_nonce_parity   = presigs.btc_claim_nonce_parity;
+        ps.pric_claim_presig_blob   = parse(presigs.pric_claim_presig_blob_hex);
+        ps.btc_refund_sig           = parse(presigs.btc_refund_sig_hex);
+        ps.pric_refund_sig_blob     = parse(presigs.pric_refund_sig_blob_hex);
+        if (ps.btc_claim_presig.size() != 64
+            || ps.btc_claim_session.size() != 133
+            || ps.btc_refund_sig.size() != 64
+            || ps.pric_claim_presig_blob.empty()
+            || ps.pric_refund_sig_blob.empty()) {
+            return util::Error{Untranslated("pre-sig blobs must be valid hex of the expected lengths (64/133/64 fixed; PRIC blobs non-empty)")};
+        }
+        auto r = ::wallet::pricoin_adaptor_swap::SetPreSigned(*m_wallet, *sid, ps);
+        return WrapTransition(r, this, *sid);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPricClaimed(
+        const std::string& swap_id,
+        const std::string& pric_claim_txid) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        auto txid = uint256::FromHex(pric_claim_txid);
+        if (!txid) return util::Error{Untranslated("pric_claim_txid must be 32-byte hex")};
+        auto r = ::wallet::pricoin_adaptor_swap::SetPricClaimed(*m_wallet, *sid, *txid);
+        return WrapTransition(r, this, *sid);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetComplete(
+        const std::string& swap_id,
+        const std::string& foreign_claim_txid) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        auto r = ::wallet::pricoin_adaptor_swap::SetComplete(*m_wallet, *sid, foreign_claim_txid);
+        return WrapTransition(r, this, *sid);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetRefunded(
+        const std::string& swap_id,
+        const std::string& pric_refund_txid_or_empty,
+        const std::string& foreign_refund_txid_or_empty) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        uint256 pric_txid{};
+        if (!pric_refund_txid_or_empty.empty()) {
+            auto p = uint256::FromHex(pric_refund_txid_or_empty);
+            if (!p) return util::Error{Untranslated("pric_refund_txid must be 32-byte hex if non-empty")};
+            pric_txid = *p;
+        }
+        auto r = ::wallet::pricoin_adaptor_swap::SetRefunded(
+            *m_wallet, *sid, pric_txid, foreign_refund_txid_or_empty);
+        return WrapTransition(r, this, *sid);
+    }
+
     util::Result<PricoinAdaptorSwapSnapshot>
     adaptorSwapAbort(const std::string& swap_id, const std::string& reason) override {
         auto sid = uint256::FromHex(swap_id);

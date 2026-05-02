@@ -9,13 +9,19 @@
 
 #include <QBrush>
 #include <QColor>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QFont>
+#include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QPlainTextEdit>
+#include <QSpinBox>
 #include <QStandardItemModel>
 #include <QTableView>
 #include <QTextEdit>
@@ -99,12 +105,18 @@ void PricoinSwapsPage::buildLayout()
     outer->addLayout(hint_box);
 
     auto* bot = new QHBoxLayout();
-    m_btn_abort = new QPushButton(tr("Abort swap"), this);
+    m_btn_advance = new QPushButton(tr("Advance state…"), this);
+    m_btn_refund  = new QPushButton(tr("Refund…"),         this);
+    m_btn_abort   = new QPushButton(tr("Abort swap"),      this);
+    bot->addWidget(m_btn_advance);
+    bot->addWidget(m_btn_refund);
     bot->addWidget(m_btn_abort);
     bot->addStretch();
     outer->addLayout(bot);
 
     connect(m_btn_refresh, &QPushButton::clicked, this, &PricoinSwapsPage::onRefreshClicked);
+    connect(m_btn_advance, &QPushButton::clicked, this, &PricoinSwapsPage::onAdvanceClicked);
+    connect(m_btn_refund,  &QPushButton::clicked, this, &PricoinSwapsPage::onRefundClicked);
     connect(m_btn_abort,   &QPushButton::clicked, this, &PricoinSwapsPage::onAbortClicked);
 
     if (auto* sm = m_table->selectionModel()) {
@@ -194,19 +206,30 @@ void PricoinSwapsPage::onSelectionChanged()
 {
     const std::string sid = selectedSwapId();
     bool can_abort = false;
+    bool can_advance = false;
+    bool can_refund = false;
     QString hint;
     if (!sid.empty()) {
         for (const auto& s : m_swaps) {
             if (s.swap_id == sid) {
                 hint = QString::fromStdString(s.next_action);
-                can_abort = (s.state != "complete" && s.state != "refunded"
-                             && s.state != "aborted");
+                const std::string& st = s.state;
+                can_abort = (st != "complete" && st != "refunded" && st != "aborted");
+                // Advance is offered for any non-terminal pre-Complete state.
+                can_advance = (st == "setup" || st == "adaptor_ready"
+                               || st == "btc_funded" || st == "both_funded"
+                               || st == "pre_signed" || st == "pric_claimed");
+                // Refund is allowed once funding has confirmed.
+                can_refund = (st == "both_funded" || st == "pre_signed"
+                              || st == "pric_claimed");
                 break;
             }
         }
     }
     if (m_next_action_view) m_next_action_view->setPlainText(hint);
-    m_btn_abort->setEnabled(!sid.empty() && can_abort);
+    m_btn_advance->setEnabled(can_advance);
+    m_btn_refund->setEnabled(can_refund);
+    m_btn_abort->setEnabled(can_abort);
 }
 
 void PricoinSwapsPage::onRefreshClicked()
@@ -218,6 +241,246 @@ void PricoinSwapsPage::onRefreshClicked()
 void PricoinSwapsPage::onAutoRefreshTick()
 {
     if (m_model) refreshTable();
+}
+
+// ─── Advance-state dialogs (one per source state) ───────────────────
+//
+// Each helper builds a modal QDialog with state-appropriate fields,
+// runs exec(), and on Accepted calls the wallet method and refreshes.
+// Helpers return true on success so the caller can refresh the UI.
+
+namespace {
+
+// Adds a label+QLineEdit row, returns the edit so the caller can
+// read the value back.
+QLineEdit* AddTextRow(QFormLayout* form, const QString& label,
+                      QWidget* parent, const QString& placeholder = {})
+{
+    auto* edit = new QLineEdit(parent);
+    if (!placeholder.isEmpty()) edit->setPlaceholderText(placeholder);
+    form->addRow(label, edit);
+    return edit;
+}
+
+// Adds a label+QPlainTextEdit row for variable-length hex blobs.
+QPlainTextEdit* AddBlobRow(QFormLayout* form, const QString& label,
+                            QWidget* parent, int max_h = 60)
+{
+    auto* edit = new QPlainTextEdit(parent);
+    edit->setMaximumHeight(max_h);
+    form->addRow(label, edit);
+    return edit;
+}
+
+QSpinBox* AddIntRow(QFormLayout* form, const QString& label,
+                    QWidget* parent, int min, int max, int default_val)
+{
+    auto* spin = new QSpinBox(parent);
+    spin->setRange(min, max);
+    spin->setValue(default_val);
+    form->addRow(label, spin);
+    return spin;
+}
+
+// Builds an OK/Cancel button box and connects to the dialog.
+void AddOkCancel(QFormLayout* form, QDialog* dlg)
+{
+    auto* bb = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, dlg);
+    QObject::connect(bb, &QDialogButtonBox::accepted, dlg, &QDialog::accept);
+    QObject::connect(bb, &QDialogButtonBox::rejected, dlg, &QDialog::reject);
+    form->addRow(bb);
+}
+
+} // namespace
+
+void PricoinSwapsPage::onAdvanceClicked()
+{
+    if (!m_model) return;
+    const std::string sid = selectedSwapId();
+    if (sid.empty()) return;
+
+    // Capture a copy of the selected swap.
+    interfaces::Wallet::PricoinAdaptorSwapSnapshot snap{};
+    bool found = false;
+    for (const auto& s : m_swaps) {
+        if (s.swap_id == sid) { snap = s; found = true; break; }
+    }
+    if (!found) return;
+
+    QDialog dlg(this);
+    auto* form = new QFormLayout(&dlg);
+
+    // Each branch: build state-specific form, exec, then call wallet.
+    // ─── Setup → AdaptorReady (combined) ───
+    if (snap.state == "setup") {
+        dlg.setWindowTitle(tr("Set adaptor materials + refund timelocks"));
+        form->addRow(new QLabel(tr("Both adaptor materials and refund timelocks "
+                                    "must be set to advance to AdaptorReady."), &dlg));
+        auto* T_G = AddTextRow(form, tr("T_G (33-byte compressed hex):"), &dlg);
+        auto* dleq = AddBlobRow(form, tr("DLEQ proof blob (hex):"), &dlg, 80);
+        auto* t_secret_label = new QLabel(snap.role == "bob"
+            ? tr("(Bob — required)") : tr("(Alice — leave empty)"), &dlg);
+        auto* t_secret = new QLineEdit(&dlg);
+        t_secret->setPlaceholderText(tr("32-byte hex if Bob, empty if Alice"));
+        form->addRow(tr("t_secret:"), t_secret);
+        form->addRow(QString(), t_secret_label);
+
+        // Refund timelocks (suggested defaults: arbitrary high values).
+        auto* p_h = AddIntRow(form, tr("PRIC refund height:"),
+                               &dlg, 1, 2'000'000'000, 100'000);
+        auto* f_h = AddIntRow(form, tr("Foreign refund height:"),
+                               &dlg, 1, 2'000'000'000, 100'200);
+        auto* d_m = AddIntRow(form, tr("Delta min (foreign blocks):"),
+                               &dlg, 1, 2'000'000'000, 144);
+        AddOkCancel(form, &dlg);
+
+        if (dlg.exec() != QDialog::Accepted) return;
+        auto r1 = m_model->wallet().adaptorSwapSetAdaptorMaterials(
+            sid, T_G->text().trimmed().toStdString(),
+            dleq->toPlainText().trimmed().toStdString(),
+            t_secret->text().trimmed().toStdString());
+        if (!r1) {
+            setStatus(tr("Set adaptor failed: %1")
+                .arg(QString::fromStdString(util::ErrorString(r1).original)), true);
+            return;
+        }
+        auto r2 = m_model->wallet().adaptorSwapSetRefundTimelocks(
+            sid, p_h->value(), f_h->value(), d_m->value());
+        if (!r2) {
+            setStatus(tr("Set timelocks failed: %1")
+                .arg(QString::fromStdString(util::ErrorString(r2).original)), true);
+            return;
+        }
+        refreshTable();
+        setStatus(tr("Advanced to AdaptorReady."));
+        return;
+    }
+
+    // ─── AdaptorReady → BtcFunded ───
+    if (snap.state == "adaptor_ready") {
+        dlg.setWindowTitle(tr("Set BTC funded"));
+        auto* txid = AddTextRow(form, tr("Foreign funding txid:"), &dlg);
+        auto* vout = AddIntRow(form, tr("Foreign funding vout:"), &dlg, 0, 65535, 0);
+        auto* h    = AddIntRow(form, tr("Foreign funding height:"), &dlg, 1, 2'000'000'000, 1);
+        AddOkCancel(form, &dlg);
+        if (dlg.exec() != QDialog::Accepted) return;
+        auto r = m_model->wallet().adaptorSwapSetBtcFunded(
+            sid, txid->text().trimmed().toStdString(), vout->value(), h->value());
+        if (!r) { setStatus(tr("Failed: %1")
+            .arg(QString::fromStdString(util::ErrorString(r).original)), true); return; }
+        refreshTable();
+        setStatus(tr("Advanced to BtcFunded."));
+        return;
+    }
+
+    // ─── BtcFunded → BothFunded ───
+    if (snap.state == "btc_funded") {
+        dlg.setWindowTitle(tr("Set PRIC funded"));
+        auto* txid = AddTextRow(form, tr("PRIC funding txid (32-byte hex):"), &dlg);
+        auto* vout = AddIntRow(form, tr("PRIC funding vout:"), &dlg, 0, 65535, 0);
+        auto* h    = AddIntRow(form, tr("PRIC funding height:"), &dlg, 1, 2'000'000'000, 1);
+        AddOkCancel(form, &dlg);
+        if (dlg.exec() != QDialog::Accepted) return;
+        auto r = m_model->wallet().adaptorSwapSetPricFunded(
+            sid, txid->text().trimmed().toStdString(), vout->value(), h->value());
+        if (!r) { setStatus(tr("Failed: %1")
+            .arg(QString::fromStdString(util::ErrorString(r).original)), true); return; }
+        refreshTable();
+        setStatus(tr("Advanced to BothFunded."));
+        return;
+    }
+
+    // ─── BothFunded → PreSigned ───
+    if (snap.state == "both_funded") {
+        dlg.setWindowTitle(tr("Set pre-signatures"));
+        form->addRow(new QLabel(tr("Paste the 4 cooperative pre-signatures "
+                                    "(spec §6.2 step 5+6+7) as hex blobs."), &dlg));
+        auto* btc_p   = AddBlobRow(form, tr("BTC claim pre-sig (64 bytes hex):"), &dlg, 50);
+        auto* btc_s   = AddBlobRow(form, tr("BTC claim session (133 bytes hex):"), &dlg, 60);
+        auto* btc_par = AddIntRow (form, tr("BTC claim nonce parity (0/1):"), &dlg, 0, 1, 0);
+        auto* pric_p  = AddBlobRow(form, tr("PRIC claim pre-sig blob (hex):"), &dlg, 80);
+        auto* btc_r   = AddBlobRow(form, tr("BTC refund sig (64 bytes hex):"), &dlg, 50);
+        auto* pric_r  = AddBlobRow(form, tr("PRIC refund sig blob (hex):"), &dlg, 80);
+        AddOkCancel(form, &dlg);
+        if (dlg.exec() != QDialog::Accepted) return;
+        interfaces::Wallet::PricoinAdaptorSwapPreSigsHex ps;
+        ps.btc_claim_presig_hex       = btc_p->toPlainText().trimmed().toStdString();
+        ps.btc_claim_session_hex      = btc_s->toPlainText().trimmed().toStdString();
+        ps.btc_claim_nonce_parity     = btc_par->value();
+        ps.pric_claim_presig_blob_hex = pric_p->toPlainText().trimmed().toStdString();
+        ps.btc_refund_sig_hex         = btc_r->toPlainText().trimmed().toStdString();
+        ps.pric_refund_sig_blob_hex   = pric_r->toPlainText().trimmed().toStdString();
+        auto r = m_model->wallet().adaptorSwapSetPreSigned(sid, ps);
+        if (!r) { setStatus(tr("Failed: %1")
+            .arg(QString::fromStdString(util::ErrorString(r).original)), true); return; }
+        refreshTable();
+        setStatus(tr("Advanced to PreSigned."));
+        return;
+    }
+
+    // ─── PreSigned → PricClaimed ───
+    if (snap.state == "pre_signed") {
+        dlg.setWindowTitle(tr("Set PRIC claimed"));
+        form->addRow(new QLabel(tr("Bob's PRIC claim tx is on-chain — t is now "
+                                    "extractable. Record the claim txid."), &dlg));
+        auto* txid = AddTextRow(form, tr("PRIC claim txid:"), &dlg);
+        AddOkCancel(form, &dlg);
+        if (dlg.exec() != QDialog::Accepted) return;
+        auto r = m_model->wallet().adaptorSwapSetPricClaimed(
+            sid, txid->text().trimmed().toStdString());
+        if (!r) { setStatus(tr("Failed: %1")
+            .arg(QString::fromStdString(util::ErrorString(r).original)), true); return; }
+        refreshTable();
+        setStatus(tr("Advanced to PricClaimed."));
+        return;
+    }
+
+    // ─── PricClaimed → Complete ───
+    if (snap.state == "pric_claimed") {
+        dlg.setWindowTitle(tr("Set complete"));
+        form->addRow(new QLabel(tr("Alice's foreign claim tx confirmed; swap done."), &dlg));
+        auto* txid = AddTextRow(form, tr("Foreign claim txid:"), &dlg);
+        AddOkCancel(form, &dlg);
+        if (dlg.exec() != QDialog::Accepted) return;
+        auto r = m_model->wallet().adaptorSwapSetComplete(
+            sid, txid->text().trimmed().toStdString());
+        if (!r) { setStatus(tr("Failed: %1")
+            .arg(QString::fromStdString(util::ErrorString(r).original)), true); return; }
+        refreshTable();
+        setStatus(tr("Swap complete."));
+        return;
+    }
+
+    setStatus(tr("No advance available from state %1.")
+        .arg(QString::fromStdString(snap.state)), true);
+}
+
+void PricoinSwapsPage::onRefundClicked()
+{
+    if (!m_model) return;
+    const std::string sid = selectedSwapId();
+    if (sid.empty()) return;
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Set refunded"));
+    auto* form = new QFormLayout(&dlg);
+    form->addRow(new QLabel(tr("Pass the txid of whichever leg refunded; "
+                                "leave the other empty."), &dlg));
+    auto* pric  = AddTextRow(form, tr("PRIC refund txid (32-byte hex, optional):"), &dlg);
+    auto* foreign = AddTextRow(form, tr("Foreign refund txid (optional):"), &dlg);
+    AddOkCancel(form, &dlg);
+    if (dlg.exec() != QDialog::Accepted) return;
+    auto r = m_model->wallet().adaptorSwapSetRefunded(
+        sid, pric->text().trimmed().toStdString(),
+        foreign->text().trimmed().toStdString());
+    if (!r) {
+        setStatus(tr("Refund failed: %1")
+            .arg(QString::fromStdString(util::ErrorString(r).original)), true);
+        return;
+    }
+    refreshTable();
+    setStatus(tr("Swap moved to Refunded."));
 }
 
 void PricoinSwapsPage::onAbortClicked()

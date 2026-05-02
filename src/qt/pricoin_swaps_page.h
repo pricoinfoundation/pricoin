@@ -49,6 +49,8 @@ public:
 private Q_SLOTS:
     void onRefreshClicked();
     void onAbortClicked();
+    void onAdvanceClicked();
+    void onRefundClicked();
     void onSelectionChanged();
     void onAutoRefreshTick();
 
@@ -59,6 +61,8 @@ private:
     QTableView* m_table{nullptr};
     QStandardItemModel* m_table_model{nullptr};
     QPushButton* m_btn_refresh{nullptr};
+    QPushButton* m_btn_advance{nullptr};
+    QPushButton* m_btn_refund{nullptr};
     QPushButton* m_btn_abort{nullptr};
     QLabel*      m_status_label{nullptr};
     QTextEdit*   m_next_action_view{nullptr};

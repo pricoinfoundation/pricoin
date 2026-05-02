@@ -238,6 +238,67 @@ public:
     virtual util::Result<PricoinAdaptorSwapSnapshot>
         adaptorSwapAbort(const std::string& swap_id, const std::string& reason) = 0;
 
+    // Setup → AdaptorReady transitions (both required before advancing).
+    // For Bob role, supply `t_secret_hex` (32-byte hex); for Alice it must
+    // be empty.
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetAdaptorMaterials(
+        const std::string& swap_id,
+        const std::string& T_G_hex,
+        const std::string& dleq_proof_blob_hex,
+        const std::string& t_secret_hex) = 0;
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetRefundTimelocks(
+        const std::string& swap_id,
+        int32_t pric_refund_height,
+        int32_t foreign_refund_height,
+        int32_t delta_min_blocks) = 0;
+
+    // AdaptorReady → BtcFunded.
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetBtcFunded(
+        const std::string& swap_id,
+        const std::string& foreign_funding_txid,
+        int32_t foreign_funding_vout,
+        int32_t foreign_funding_height) = 0;
+
+    // BtcFunded → BothFunded.
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPricFunded(
+        const std::string& swap_id,
+        const std::string& pric_funding_txid,
+        int32_t pric_funding_vout,
+        int32_t pric_funding_height) = 0;
+
+    // BothFunded → PreSigned. All 6 blobs must be valid hex of the
+    // expected lengths (see pricoin_adaptor_swap::AdaptorSwapPreSigs).
+    struct PricoinAdaptorSwapPreSigsHex {
+        std::string btc_claim_presig_hex;          // 64 bytes
+        std::string btc_claim_session_hex;         // 133 bytes
+        int32_t     btc_claim_nonce_parity{0};
+        std::string pric_claim_presig_blob_hex;
+        std::string btc_refund_sig_hex;            // 64 bytes
+        std::string pric_refund_sig_blob_hex;
+    };
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPreSigned(
+        const std::string& swap_id,
+        const PricoinAdaptorSwapPreSigsHex& presigs) = 0;
+
+    // PreSigned → PricClaimed (Bob has broadcast the PRIC claim;
+    // Alice extracts t from on-chain at this point).
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPricClaimed(
+        const std::string& swap_id,
+        const std::string& pric_claim_txid) = 0;
+
+    // PricClaimed → Complete (Alice's foreign claim confirmed).
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetComplete(
+        const std::string& swap_id,
+        const std::string& foreign_claim_txid) = 0;
+
+    // Off-path: refund. Allowed from BothFunded/PreSigned/PricClaimed.
+    // Caller passes the txid of whichever leg refunded (the other can
+    // be empty).
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetRefunded(
+        const std::string& swap_id,
+        const std::string& pric_refund_txid_or_empty,
+        const std::string& foreign_refund_txid_or_empty) = 0;
+
     //! Pricoin: 32-byte BIP340 x-only form of the wallet's swap-identity
     //! pubkey, hex. Used as the `pubkey` field of Nostr events that
     //! announce orders this wallet maintains. Empty on locked wallet.
