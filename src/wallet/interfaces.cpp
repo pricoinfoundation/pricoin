@@ -423,6 +423,7 @@ public:
             [](unsigned char b) { return b != 0; });
         if (has_adaptor) {
             o.adaptor_T_G_hex = HexStr(s.T_G);
+            o.adaptor_T_H_hex = HexStr(s.T_H);
             o.adaptor_dleq_blob_hex = HexStr(s.dleq_proof_blob);
         }
         o.foreign_funding_txid     = s.foreign_funding_txid;
@@ -524,6 +525,7 @@ public:
     util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetAdaptorMaterials(
         const std::string& swap_id,
         const std::string& T_G_hex,
+        const std::string& T_H_hex,
         const std::string& dleq_proof_blob_hex,
         const std::string& t_secret_hex) override
     {
@@ -535,6 +537,12 @@ public:
         }
         std::array<unsigned char, 33> T_G{};
         std::copy(T_G_bytes->begin(), T_G_bytes->end(), T_G.begin());
+        const auto T_H_bytes = TryParseHex<unsigned char>(T_H_hex);
+        if (!T_H_bytes || T_H_bytes->size() != 33) {
+            return util::Error{Untranslated("T_H must be 33-byte compressed pubkey hex")};
+        }
+        std::array<unsigned char, 33> T_H{};
+        std::copy(T_H_bytes->begin(), T_H_bytes->end(), T_H.begin());
         const auto dleq_bytes = TryParseHex<unsigned char>(dleq_proof_blob_hex);
         if (!dleq_bytes || dleq_bytes->empty()) {
             return util::Error{Untranslated("dleq_proof_blob must be non-empty hex")};
@@ -550,7 +558,7 @@ public:
             t_secret = t_arr;
         }
         auto r = ::wallet::pricoin_adaptor_swap::SetAdaptorMaterials(
-            *m_wallet, *sid, T_G, *dleq_bytes, t_secret);
+            *m_wallet, *sid, T_G, T_H, *dleq_bytes, t_secret);
         return WrapTransition(r, this, *sid);
     }
 

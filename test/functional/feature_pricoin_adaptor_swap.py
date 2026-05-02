@@ -113,14 +113,16 @@ class PricoinAdaptorSwapTest(BitcoinTestFramework):
         # ─── Section 3: SetAdaptorMaterials gates ───
         self.log.info("Section 3: adaptor materials gating")
         T_G       = SECP256K1_G_HEX  # any valid 33-byte compressed pubkey
+        T_H       = SECP256K1_G_HEX  # opaque 33-byte point for state-machine purposes
         dleq_blob = random_hex(64)   # opaque blob for state-machine purposes
         t_secret  = random_hex(32)
 
-        # Alice receives T_G + DLEQ from Bob; she does NOT supply t_secret.
-        s = alice.pricoin_adaptor_swap_set_adaptor(sid, T_G, dleq_blob, "")
+        # Alice receives T_G + T_H + DLEQ from Bob; she does NOT supply t_secret.
+        s = alice.pricoin_adaptor_swap_set_adaptor(sid, T_G, T_H, dleq_blob, "")
         # With timelocks already set, this transition advances to AdaptorReady.
         assert_equal(s["state"], "adaptor_ready")
         assert_equal(s["adaptor"]["T_G"], T_G)
+        assert_equal(s["adaptor"]["T_H"], T_H)
         assert_equal(s["adaptor"]["dleq_proof_blob"], dleq_blob)
         assert_equal(s["adaptor"]["has_t"], False)
 
@@ -135,12 +137,12 @@ class PricoinAdaptorSwapTest(BitcoinTestFramework):
         assert_raises_rpc_error(
             -8, "invalid input for this transition",
             alice.pricoin_adaptor_swap_set_adaptor,
-            sid2, T_G, dleq_blob, t_secret)
+            sid2, T_G, T_H, dleq_blob, t_secret)
         alice.pricoin_adaptor_swap_abort(sid2, "trial cleanup")
 
         # Bob's wallet — also set timelocks + adaptor materials with t_secret.
         bob.pricoin_adaptor_swap_set_timelocks(bid, 100_000, 100_200, 144)
-        sb = bob.pricoin_adaptor_swap_set_adaptor(bid, T_G, dleq_blob, t_secret)
+        sb = bob.pricoin_adaptor_swap_set_adaptor(bid, T_G, T_H, dleq_blob, t_secret)
         assert_equal(sb["state"], "adaptor_ready")
         assert_equal(sb["adaptor"]["has_t"], True)
         # t_secret is NOT echoed back in JSON (security posture).
@@ -153,7 +155,7 @@ class PricoinAdaptorSwapTest(BitcoinTestFramework):
         assert_raises_rpc_error(
             -8, "invalid input for this transition",
             bob.pricoin_adaptor_swap_set_adaptor,
-            sb_extra["swap_id"], T_G, dleq_blob, "")
+            sb_extra["swap_id"], T_G, T_H, dleq_blob, "")
         bob.pricoin_adaptor_swap_abort(sb_extra["swap_id"], "trial cleanup")
 
         # ─── Section 4: forward path through funding + pre-sign ───
@@ -223,7 +225,7 @@ class PricoinAdaptorSwapTest(BitcoinTestFramework):
             "alice", bob_pub, "btc", foreign_amt, joint_addr, pric_amt, "refund test")
         cid = sc["swap_id"]
         alice.pricoin_adaptor_swap_set_timelocks(cid, 100_000, 100_200, 144)
-        alice.pricoin_adaptor_swap_set_adaptor(cid, T_G, dleq_blob, "")
+        alice.pricoin_adaptor_swap_set_adaptor(cid, T_G, T_H, dleq_blob, "")
         alice.pricoin_adaptor_swap_set_btc_funded(cid, "11" * 32, 0, 800_000)
         alice.pricoin_adaptor_swap_set_pric_funded(cid, "22" * 32, 0, 12_345)
         # Refund from BothFunded (counterparty stalled before pre-sig phase
@@ -244,7 +246,7 @@ class PricoinAdaptorSwapTest(BitcoinTestFramework):
             "bob", alice_pub, "btc", foreign_amt, joint_addr, pric_amt, "abort test")
         abid = sb_abort["swap_id"]
         bob.pricoin_adaptor_swap_set_timelocks(abid, 100_000, 100_200, 144)
-        bob.pricoin_adaptor_swap_set_adaptor(abid, T_G, dleq_blob, t_secret)
+        bob.pricoin_adaptor_swap_set_adaptor(abid, T_G, T_H, dleq_blob, t_secret)
         s = bob.pricoin_adaptor_swap_get(abid)
         assert_equal(s["adaptor"]["has_t"], True)
         s = bob.pricoin_adaptor_swap_abort(abid, "counterparty stalled")
@@ -277,7 +279,7 @@ class PricoinAdaptorSwapTest(BitcoinTestFramework):
             xid, "ab" * 32, 0, 800_000)
         # Cannot SetPreSigned before BothFunded.
         alice.pricoin_adaptor_swap_set_timelocks(xid, 100_000, 100_200, 144)
-        alice.pricoin_adaptor_swap_set_adaptor(xid, T_G, dleq_blob, "")
+        alice.pricoin_adaptor_swap_set_adaptor(xid, T_G, T_H, dleq_blob, "")
         assert_raises_rpc_error(
             -32600, "current state does not permit this transition",
             alice.pricoin_adaptor_swap_set_pre_signed,

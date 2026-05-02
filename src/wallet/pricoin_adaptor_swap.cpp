@@ -226,6 +226,7 @@ TransitionResult SetAdaptorMaterials(
     CWallet& wallet,
     const uint256& swap_id,
     const std::array<unsigned char, 33>& T_G,
+    const std::array<unsigned char, 33>& T_H,
     const std::vector<unsigned char>& dleq_proof_blob,
     const std::optional<std::array<unsigned char, 32>>& t_secret_for_bob)
 {
@@ -233,6 +234,7 @@ TransitionResult SetAdaptorMaterials(
     return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
         if (s.state != State::Setup) return TransitionResult::InvalidState;
         s.T_G = T_G;
+        s.T_H = T_H;
         s.dleq_proof_blob = dleq_proof_blob;
         s.adaptor_set = true;
         if (s.role == Role::Bob) {

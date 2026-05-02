@@ -4351,6 +4351,7 @@ UniValue AdaptorSwapToJSON(const aas::AdaptorSwap& s)
     if (s.adaptor_set) {
         UniValue ad{UniValue::VOBJ};
         ad.pushKV("T_G", HexStr(s.T_G));
+        ad.pushKV("T_H", HexStr(s.T_H));
         ad.pushKV("dleq_proof_blob", HexStr(s.dleq_proof_blob));
         // We deliberately do NOT echo t_secret in JSON output — Bob's
         // wallet has it on-disk; exposing it via JSON would risk it
@@ -4494,14 +4495,15 @@ RPCMethod pricoin_adaptor_swap_set_adaptor()
         "RPC — the persistence layer just stores the bytes.\n",
         {
             {"swap_id",          RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
-            {"T_G",              RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte compressed adaptor point"},
+            {"T_G",              RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte compressed adaptor point t·G"},
+            {"T_H",              RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte compressed adaptor point t·H_p(P_pi)"},
             {"dleq_proof_blob",  RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Serialized DLEQ proof bytes"},
             {"t_secret_for_bob", RPCArg::Type::STR_HEX, RPCArg::Default{""},
                 "Bob ONLY: the 32-byte secret t. Empty for Alice."},
         },
         RPCResult{ RPCResult::Type::ANY, "", "Updated swap record" },
         RPCExamples{HelpExampleCli("pricoin_adaptor_swap_set_adaptor",
-            "<swap_id> <T_G_hex> <dleq_blob_hex> [<t_hex>]")},
+            "<swap_id> <T_G_hex> <T_H_hex> <dleq_blob_hex> [<t_hex>]")},
         [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
             auto wallet_sp = GetWalletForJSONRPCRequest(request);
             if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
@@ -4512,12 +4514,18 @@ RPCMethod pricoin_adaptor_swap_set_adaptor()
             }
             std::array<unsigned char, 33> T_G{};
             std::copy(T_G_bytes->begin(), T_G_bytes->end(), T_G.begin());
-            auto dleq = TryParseHex<unsigned char>(request.params[2].get_str());
+            auto T_H_bytes = TryParseHex<unsigned char>(request.params[2].get_str());
+            if (!T_H_bytes || T_H_bytes->size() != 33) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "T_H must be 33-byte compressed pubkey hex");
+            }
+            std::array<unsigned char, 33> T_H{};
+            std::copy(T_H_bytes->begin(), T_H_bytes->end(), T_H.begin());
+            auto dleq = TryParseHex<unsigned char>(request.params[3].get_str());
             if (!dleq || dleq->empty()) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "dleq_proof_blob must be non-empty hex");
             }
             std::optional<std::array<unsigned char, 32>> t_secret;
-            const std::string t_hex = request.params[3].isNull() ? "" : request.params[3].get_str();
+            const std::string t_hex = request.params[4].isNull() ? "" : request.params[4].get_str();
             if (!t_hex.empty()) {
                 auto t_bytes = TryParseHex<unsigned char>(t_hex);
                 if (!t_bytes || t_bytes->size() != 32) {
@@ -4527,7 +4535,7 @@ RPCMethod pricoin_adaptor_swap_set_adaptor()
                 std::copy(t_bytes->begin(), t_bytes->end(), t_arr.begin());
                 t_secret = t_arr;
             }
-            auto r = aas::SetAdaptorMaterials(*wallet_sp, sid, T_G, *dleq, t_secret);
+            auto r = aas::SetAdaptorMaterials(*wallet_sp, sid, T_G, T_H, *dleq, t_secret);
             if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
             aas::AdaptorSwap out;
             (void)aas::Get(*wallet_sp, sid, out);

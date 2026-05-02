@@ -320,6 +320,7 @@ void PricoinSwapsPage::onAdvanceClicked()
         form->addRow(new QLabel(tr("Both adaptor materials and refund timelocks "
                                     "must be set to advance to AdaptorReady."), &dlg));
         auto* T_G = AddTextRow(form, tr("T_G (33-byte compressed hex):"), &dlg);
+        auto* T_H = AddTextRow(form, tr("T_H (33-byte compressed hex):"), &dlg);
         auto* dleq = AddBlobRow(form, tr("DLEQ proof blob (hex):"), &dlg, 80);
         auto* t_secret_label = new QLabel(snap.role == "bob"
             ? tr("(Bob — required)") : tr("(Alice — leave empty)"), &dlg);
@@ -340,6 +341,7 @@ void PricoinSwapsPage::onAdvanceClicked()
         if (dlg.exec() != QDialog::Accepted) return;
         auto r1 = m_model->wallet().adaptorSwapSetAdaptorMaterials(
             sid, T_G->text().trimmed().toStdString(),
+            T_H->text().trimmed().toStdString(),
             dleq->toPlainText().trimmed().toStdString(),
             t_secret->text().trimmed().toStdString());
         if (!r1) {

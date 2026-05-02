@@ -220,8 +220,9 @@ public:
         std::string next_action;         // role-aware hint
         // Adaptor materials, populated once SetAdaptorMaterials runs.
         // Empty before AdaptorReady. The cooperative-sign dialogs
-        // pre-fill T_G / dleq_t from these on construction.
+        // pre-fill T_G / T_H / dleq_t from these on construction.
         std::string adaptor_T_G_hex;
+        std::string adaptor_T_H_hex;
         std::string adaptor_dleq_blob_hex;
         // Funding outpoints + heights — the cooperative-sign dialogs
         // need them to auto-compute the BIP341 sighash (BTC) and the
@@ -281,6 +282,7 @@ public:
     virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetAdaptorMaterials(
         const std::string& swap_id,
         const std::string& T_G_hex,
+        const std::string& T_H_hex,
         const std::string& dleq_proof_blob_hex,
         const std::string& t_secret_hex) = 0;
     virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetRefundTimelocks(

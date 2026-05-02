@@ -178,8 +178,13 @@ struct AdaptorSwap {
     uint256     pric_claim_txid{};         // populated on PricClaimed
     uint256     pric_refund_txid{};        // populated on Refunded (Alice)
 
-    // Cross-chain binding (both parties hold T_G; only Bob holds t).
+    // Cross-chain binding (both parties hold T_G + T_H; only Bob holds t).
+    // T_H = t · H_p(P_pi) where P_pi is the joint pubkey at the ring's
+    // signer index. Bob can derive locally; Alice receives T_H over
+    // the same channel as T_G + dleq_proof, after verifying the
+    // DLEQ proof binds them.
     std::array<unsigned char, 33> T_G{};
+    std::array<unsigned char, 33> T_H{};
     std::vector<unsigned char>    dleq_proof_blob;
     bool                          adaptor_set{false};
 
@@ -252,6 +257,7 @@ struct AdaptorSwap {
         READWRITE(obj.pric_refund_txid);
 
         READWRITE(obj.T_G);
+        READWRITE(obj.T_H);
         READWRITE(obj.dleq_proof_blob);
         uint8_t adaptor_set_byte = obj.adaptor_set ? 1 : 0;
         READWRITE(adaptor_set_byte);
@@ -345,6 +351,7 @@ TransitionResult SetAdaptorMaterials(
     CWallet& wallet,
     const uint256& swap_id,
     const std::array<unsigned char, 33>& T_G,
+    const std::array<unsigned char, 33>& T_H,
     const std::vector<unsigned char>& dleq_proof_blob,
     const std::optional<std::array<unsigned char, 32>>& t_secret_for_bob);
 

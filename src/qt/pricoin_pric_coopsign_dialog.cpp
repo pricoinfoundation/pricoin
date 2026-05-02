@@ -93,6 +93,9 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
                 if (m_in_T_G && !snap->adaptor_T_G_hex.empty()) {
                     m_in_T_G->setText(QString::fromStdString(snap->adaptor_T_G_hex));
                 }
+                if (m_in_T_H && !snap->adaptor_T_H_hex.empty()) {
+                    m_in_T_H->setText(QString::fromStdString(snap->adaptor_T_H_hex));
+                }
                 if (m_in_dleq_t && !snap->adaptor_dleq_blob_hex.empty()) {
                     m_in_dleq_t->setPlainText(QString::fromStdString(snap->adaptor_dleq_blob_hex));
                 }
