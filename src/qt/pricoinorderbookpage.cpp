@@ -4,6 +4,7 @@
 
 #include <qt/pricoinorderbookpage.h>
 
+#include <qt/pricoin_nostr_client.h>
 #include <qt/walletmodel.h>
 #include <util/translation.h>
 
@@ -173,13 +174,24 @@ void PricoinOrderbookPage::buildLayout()
     m_btn_find_matches = new QPushButton(tr("Find matches"),  this);
     m_btn_fill         = new QPushButton(tr("Fill"),          this);
     m_btn_unmatch      = new QPushButton(tr("Unmatch"),       this);
+    m_btn_publish      = new QPushButton(tr("Publish to relays"), this);
     bot_row->addWidget(m_btn_cancel);
     bot_row->addWidget(m_btn_copy_uri);
     bot_row->addWidget(m_btn_find_matches);
     bot_row->addWidget(m_btn_fill);
     bot_row->addWidget(m_btn_unmatch);
+    bot_row->addWidget(m_btn_publish);
     bot_row->addStretch();
     outer->addLayout(bot_row);
+
+    // Relay status row.
+    auto* relay_row = new QHBoxLayout();
+    m_btn_connect_relays = new QPushButton(tr("Connect relays"), this);
+    m_relay_status_label = new QLabel(tr("Relays: not connected"), this);
+    m_relay_status_label->setWordWrap(true);
+    relay_row->addWidget(m_btn_connect_relays);
+    relay_row->addWidget(m_relay_status_label, /*stretch=*/1);
+    outer->addLayout(relay_row);
 
     connect(m_btn_create,       &QPushButton::clicked, this, &PricoinOrderbookPage::onCreateClicked);
     connect(m_btn_import,       &QPushButton::clicked, this, &PricoinOrderbookPage::onImportClicked);
@@ -189,6 +201,8 @@ void PricoinOrderbookPage::buildLayout()
     connect(m_btn_find_matches, &QPushButton::clicked, this, &PricoinOrderbookPage::onFindMatchesClicked);
     connect(m_btn_fill,         &QPushButton::clicked, this, &PricoinOrderbookPage::onFillClicked);
     connect(m_btn_unmatch,      &QPushButton::clicked, this, &PricoinOrderbookPage::onUnmatchClicked);
+    connect(m_btn_publish,         &QPushButton::clicked, this, &PricoinOrderbookPage::onPublishClicked);
+    connect(m_btn_connect_relays,  &QPushButton::clicked, this, &PricoinOrderbookPage::onConnectRelaysClicked);
 
     if (auto* sm = m_table->selectionModel()) {
         connect(sm, &QItemSelectionModel::selectionChanged,
@@ -283,6 +297,93 @@ void PricoinOrderbookPage::onSelectionChanged()
     m_btn_find_matches->setEnabled(has && is_active);
     m_btn_fill->setEnabled(has && is_matched);
     m_btn_unmatch->setEnabled(has && is_matched);
+    m_btn_publish->setEnabled(has && is_local && is_active &&
+                              m_nostr && m_connected_relay_count > 0);
+}
+
+void PricoinOrderbookPage::onPublishClicked()
+{
+    if (!m_model || !m_nostr) return;
+    const std::string oid = selectedOrderId();
+    if (oid.empty()) return;
+    const auto rec = m_model->wallet().offerGet(oid);
+    if (!rec) return;
+    if (rec->origin != "local") {
+        setStatus(tr("Only Local orders can be published."), true);
+        return;
+    }
+    const std::string uri = m_model->wallet().offerExportUri(oid);
+    if (uri.empty()) {
+        setStatus(tr("Export URI failed."), true);
+        return;
+    }
+    const QString side = (rec->side == "buy_pric") ? "buy" : "sell";
+    const bool ok = m_nostr->publishOfferUri(
+        QString::fromStdString(uri),
+        QString::fromStdString(rec->order_id),
+        rec->expiry_unix_sec,
+        QString::fromStdString(rec->foreign_chain),
+        side);
+    if (!ok) {
+        setStatus(tr("Publish failed (no relay connected, or signing error)."), true);
+    } else {
+        setStatus(tr("Offer published to relays."));
+    }
+}
+
+void PricoinOrderbookPage::onConnectRelaysClicked()
+{
+    if (!m_model) return;
+    if (!m_nostr) {
+        // Default relay list. Replace via QSettings or a config dialog
+        // in a follow-up commit.
+        QStringList relays;
+        relays << "wss://relay.damus.io"
+               << "wss://nos.lol"
+               << "wss://relay.snort.social";
+        m_nostr = new PricoinNostrClient(m_model, relays, this);
+        connect(m_nostr, &PricoinNostrClient::offerReceived,
+                this, &PricoinOrderbookPage::onNostrOfferReceived);
+        connect(m_nostr, &PricoinNostrClient::log,
+                this, &PricoinOrderbookPage::onNostrLog);
+        connect(m_nostr, &PricoinNostrClient::relayStatusChanged,
+                this, &PricoinOrderbookPage::onNostrRelayStatus);
+    }
+    m_nostr->connectAll();
+    setStatus(tr("Connecting to %1 relays…").arg(m_nostr->relayUrls().size()));
+}
+
+void PricoinOrderbookPage::onNostrOfferReceived(const QString& uri)
+{
+    if (!m_model) return;
+    auto r = m_model->wallet().offerImport(uri.toStdString());
+    if (!r) {
+        // Most often: duplicate (already imported) or expired.
+        // Quietly absorb — duplicates from multiple relays are normal.
+        return;
+    }
+    refreshTable();
+    setStatus(tr("Imported new offer from network."));
+}
+
+void PricoinOrderbookPage::onNostrLog(const QString& msg)
+{
+    // For v0, surface relay log lines via the status label. Could be
+    // routed to a dedicated debug pane in a follow-up.
+    if (m_status_label) m_status_label->setText(msg);
+}
+
+void PricoinOrderbookPage::onNostrRelayStatus(const QString& url, bool connected)
+{
+    Q_UNUSED(url);
+    if (connected) ++m_connected_relay_count;
+    else if (m_connected_relay_count > 0) --m_connected_relay_count;
+    if (m_relay_status_label) {
+        const int total = m_nostr ? m_nostr->relayUrls().size() : 0;
+        m_relay_status_label->setText(
+            tr("Relays: %1/%2 connected").arg(m_connected_relay_count).arg(total));
+    }
+    onSelectionChanged();
 }
 
 void PricoinOrderbookPage::onRefreshClicked()

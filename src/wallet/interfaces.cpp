@@ -5,6 +5,7 @@
 #include <interfaces/wallet.h>
 
 #include <common/args.h>
+#include <crypto/hmac_sha256.h>
 #include <consensus/amount.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
@@ -375,6 +376,51 @@ public:
         ::wallet::pricoin_offer::Order o;
         ::wallet::pricoin_offer::Get(*m_wallet, *oid, o);
         return ToSnapshot(o);
+    }
+
+private:
+    // Re-derive the swap-identity priv. Mirrors the path inside
+    // pricoin_swap_session::DeriveSwapIdentityPriv (which is private).
+    bool deriveSwapIdentityPriv(CKey& out) {
+        const auto& id = ::wallet::pricoin_stealth::GetOrCreate(*m_wallet);
+        if (!id.spend.IsValid()) return false;
+        constexpr const char* kTag = "pricoin/swap/identity-v1";
+        for (uint8_t counter = 0; counter < 16; ++counter) {
+            CHMAC_SHA256 hmac(UCharCast(id.spend.data()), 32);
+            hmac.Write(reinterpret_cast<const unsigned char*>(kTag), std::strlen(kTag));
+            hmac.Write(&counter, 1);
+            unsigned char raw[32];
+            hmac.Finalize(raw);
+            out.Set(raw, raw + 32, /*compressed=*/true);
+            if (out.IsValid()) return true;
+        }
+        return false;
+    }
+
+public:
+    std::string getSwapIdentityXOnlyHex() override {
+        CKey priv;
+        if (!deriveSwapIdentityPriv(priv)) return "";
+        const CPubKey pub = priv.GetPubKey();
+        XOnlyPubKey xonly(pub);
+        return HexStr(xonly);
+    }
+
+    util::Result<std::string> signNostrEvent(const uint256& event_id_hash) override {
+        CKey priv;
+        if (!deriveSwapIdentityPriv(priv)) {
+            return util::Error{Untranslated("swap-identity priv unavailable (wallet locked?)")};
+        }
+        std::vector<unsigned char> sig(64);
+        uint256 aux;
+        GetStrongRandBytes(aux);
+        if (!priv.SignSchnorr(event_id_hash,
+                              std::span<unsigned char>{sig.data(), sig.size()},
+                              /*merkle_root=*/nullptr,
+                              aux)) {
+            return util::Error{Untranslated("BIP340 sign failed")};
+        }
+        return HexStr(sig);
     }
 
     std::vector<PricoinMatchCandidate> offerFindMatches(const std::string& my_order_id) override {

@@ -202,6 +202,16 @@ public:
     //! sorted best-first.
     virtual std::vector<PricoinMatchCandidate> offerFindMatches(const std::string& my_order_id) = 0;
 
+    //! Pricoin: 32-byte BIP340 x-only form of the wallet's swap-identity
+    //! pubkey, hex. Used as the `pubkey` field of Nostr events that
+    //! announce orders this wallet maintains. Empty on locked wallet.
+    virtual std::string getSwapIdentityXOnlyHex() = 0;
+
+    //! Pricoin: produce a 64-byte BIP340 Schnorr signature over `hash`
+    //! using the wallet's swap-identity priv. Returns hex on success
+    //! or an error string. Used to sign Nostr `id` digests.
+    virtual util::Result<std::string> signNostrEvent(const uint256& event_id_hash) = 0;
+
     // Get a new address.
     virtual util::Result<CTxDestination> getNewDestination(OutputType type, const std::string& label) = 0;
 

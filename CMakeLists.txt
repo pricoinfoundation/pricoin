@@ -167,7 +167,7 @@ cmake_dependent_option(BUILD_GUI_TESTS "Build test_bitcoin-qt executable." ON "B
 if(BUILD_GUI)
   set(qt_components Core Gui Widgets LinguistTools)
   if(ENABLE_WALLET)
-    list(APPEND qt_components Network)
+    list(APPEND qt_components Network WebSockets)
   endif()
   if(WITH_DBUS)
     list(APPEND qt_components DBus)

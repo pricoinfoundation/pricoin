@@ -11,6 +11,7 @@
 
 #include <interfaces/wallet.h>
 
+class PricoinNostrClient;
 class WalletModel;
 class PlatformStyle;
 
@@ -61,6 +62,11 @@ private Q_SLOTS:
     void onFillClicked();
     void onUnmatchClicked();
     void onSelectionChanged();
+    void onPublishClicked();
+    void onConnectRelaysClicked();
+    void onNostrOfferReceived(const QString& uri);
+    void onNostrLog(const QString& msg);
+    void onNostrRelayStatus(const QString& url, bool connected);
 
 private:
     WalletModel* m_model{nullptr};
@@ -76,7 +82,13 @@ private:
     QPushButton* m_btn_find_matches{nullptr};
     QPushButton* m_btn_fill{nullptr};
     QPushButton* m_btn_unmatch{nullptr};
+    QPushButton* m_btn_publish{nullptr};
+    QPushButton* m_btn_connect_relays{nullptr};
     QLabel*      m_status_label{nullptr};
+    QLabel*      m_relay_status_label{nullptr};
+
+    PricoinNostrClient* m_nostr{nullptr};
+    int                 m_connected_relay_count{0};
 
     // Cached snapshots indexed parallel to table rows so we can map
     // a selected row back to the underlying order_id without

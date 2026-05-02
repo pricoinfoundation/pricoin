@@ -190,6 +190,8 @@ if(ENABLE_WALLET)
       receiverequestdialog.h
       recentrequeststablemodel.cpp
       recentrequeststablemodel.h
+      pricoin_nostr_client.cpp
+      pricoin_nostr_client.h
       pricoinorderbookpage.cpp
       pricoinorderbookpage.h
       sendcoinsdialog.cpp
@@ -227,6 +229,7 @@ if(ENABLE_WALLET)
     PRIVATE
       bitcoin_wallet
       Qt6::Network
+      Qt6::WebSockets
   )
 endif()
 

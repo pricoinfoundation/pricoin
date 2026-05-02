@@ -1,0 +1,356 @@
+// Copyright (c) 2026-present The Pricoin developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#include <qt/pricoin_nostr_client.h>
+
+#include <qt/walletmodel.h>
+
+#include <crypto/sha256.h>
+#include <interfaces/wallet.h>
+#include <random.h>
+#include <pubkey.h>
+#include <uint256.h>
+#include <util/strencodings.h>
+#include <util/translation.h>
+
+#include <QByteArray>
+#include <QDateTime>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonValue>
+#include <QString>
+#include <QUrl>
+#include <QWebSocket>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+
+namespace {
+
+// NIP-01 canonical serializer for the [0, pk, ts, kind, tags, content]
+// array. JSON with no whitespace; control chars 0x00–0x1f escaped per
+// RFC 8259; quote (\"), backslash (\\), and the named escapes \b \f
+// \n \r \t. Other Unicode is kept as raw UTF-8 bytes.
+QByteArray EscapeJsonString(const QString& s)
+{
+    QByteArray utf8 = s.toUtf8();
+    QByteArray out;
+    out.reserve(utf8.size() + 2);
+    out.append('"');
+    for (unsigned char c : utf8) {
+        switch (c) {
+        case '\\':  out.append("\\\\", 2); break;
+        case '"':   out.append("\\\"", 2); break;
+        case '\b':  out.append("\\b",  2); break;
+        case '\f':  out.append("\\f",  2); break;
+        case '\n':  out.append("\\n",  2); break;
+        case '\r':  out.append("\\r",  2); break;
+        case '\t':  out.append("\\t",  2); break;
+        default:
+            if (c < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(c));
+                out.append(buf);
+            } else {
+                out.append(static_cast<char>(c));
+            }
+        }
+    }
+    out.append('"');
+    return out;
+}
+
+QByteArray SerializeTag(const QStringList& tag)
+{
+    QByteArray out;
+    out.append('[');
+    for (int i = 0; i < tag.size(); ++i) {
+        if (i > 0) out.append(',');
+        out.append(EscapeJsonString(tag[i]));
+    }
+    out.append(']');
+    return out;
+}
+
+// Serialize the [0, pk, ts, kind, tags, content] array per NIP-01.
+QByteArray CanonicalSerialize(int kind,
+                               const QString& pubkey_hex,
+                               qint64 created_at,
+                               const QList<QStringList>& tags,
+                               const QString& content)
+{
+    QByteArray out;
+    out.append("[0,");
+    out.append(EscapeJsonString(pubkey_hex));
+    out.append(',');
+    out.append(QByteArray::number(created_at));
+    out.append(',');
+    out.append(QByteArray::number(kind));
+    out.append(",[");
+    for (int i = 0; i < tags.size(); ++i) {
+        if (i > 0) out.append(',');
+        out.append(SerializeTag(tags[i]));
+    }
+    out.append("],");
+    out.append(EscapeJsonString(content));
+    out.append(']');
+    return out;
+}
+
+uint256 Sha256(const QByteArray& data)
+{
+    uint256 out;
+    CSHA256 h;
+    h.Write(reinterpret_cast<const unsigned char*>(data.constData()),
+            data.size());
+    h.Finalize(out.data());
+    return out;
+}
+
+} // namespace
+
+PricoinNostrClient::PricoinNostrClient(WalletModel* model,
+                                         const QStringList& relay_urls,
+                                         QObject* parent)
+    : QObject(parent),
+      m_model(model),
+      m_relay_urls(relay_urls)
+{
+    // Subscribe under a stable id so reconnects re-use it.
+    uint256 sub_seed;
+    GetStrongRandBytes(sub_seed);
+    m_subid = QStringLiteral("pricoffer-") +
+              QString::fromStdString(HexStr(std::span<const unsigned char>{
+                  sub_seed.data(), 8}));
+}
+
+PricoinNostrClient::~PricoinNostrClient()
+{
+    disconnectAll();
+}
+
+void PricoinNostrClient::connectAll()
+{
+    for (const QString& url : m_relay_urls) {
+        if (m_socket_by_url.contains(url)) continue;
+        auto* sock = new QWebSocket(QString(),
+                                     QWebSocketProtocol::VersionLatest, this);
+        m_relay_url_by_socket.insert(sock, url);
+        m_socket_by_url.insert(url, sock);
+
+        connect(sock, &QWebSocket::connected,    this, &PricoinNostrClient::onConnected);
+        connect(sock, &QWebSocket::disconnected, this, &PricoinNostrClient::onDisconnected);
+        connect(sock, &QWebSocket::textMessageReceived,
+                this, &PricoinNostrClient::onTextMessage);
+        connect(sock,
+                QOverload<QAbstractSocket::SocketError>::of(&QWebSocket::error),
+                this, [this, sock](QAbstractSocket::SocketError) {
+                    Q_EMIT log(tr("Relay error: %1: %2")
+                        .arg(m_relay_url_by_socket.value(sock, "?"))
+                        .arg(sock->errorString()));
+                });
+
+        Q_EMIT log(tr("Connecting to %1…").arg(url));
+        sock->open(QUrl(url));
+    }
+}
+
+void PricoinNostrClient::disconnectAll()
+{
+    for (auto* sock : m_relay_url_by_socket.keys()) {
+        sock->close();
+        sock->deleteLater();
+    }
+    m_relay_url_by_socket.clear();
+    m_socket_by_url.clear();
+}
+
+bool PricoinNostrClient::anyConnected() const
+{
+    for (auto it = m_socket_by_url.constBegin();
+         it != m_socket_by_url.constEnd(); ++it) {
+        if (it.value()->state() == QAbstractSocket::ConnectedState) return true;
+    }
+    return false;
+}
+
+void PricoinNostrClient::onConnected()
+{
+    auto* sock = qobject_cast<QWebSocket*>(sender());
+    if (!sock) return;
+    const QString url = m_relay_url_by_socket.value(sock);
+    Q_EMIT relayStatusChanged(url, /*connected=*/true);
+    Q_EMIT log(tr("Connected: %1").arg(url));
+    sendSubscription(sock);
+}
+
+void PricoinNostrClient::onDisconnected()
+{
+    auto* sock = qobject_cast<QWebSocket*>(sender());
+    if (!sock) return;
+    const QString url = m_relay_url_by_socket.value(sock);
+    Q_EMIT relayStatusChanged(url, /*connected=*/false);
+    Q_EMIT log(tr("Disconnected: %1").arg(url));
+}
+
+void PricoinNostrClient::sendSubscription(QWebSocket* sock)
+{
+    // ["REQ", "<subid>", {"kinds":[30030], "limit":256}]
+    QJsonObject filter;
+    filter.insert("kinds", QJsonArray{kOfferKind});
+    filter.insert("limit", 256);
+
+    QJsonArray req;
+    req.append(QStringLiteral("REQ"));
+    req.append(m_subid);
+    req.append(filter);
+
+    const QString frame = QString::fromUtf8(
+        QJsonDocument(req).toJson(QJsonDocument::Compact));
+    sock->sendTextMessage(frame);
+}
+
+bool PricoinNostrClient::publishOfferUri(const QString& uri,
+                                          const QString& order_id_hex,
+                                          qint64 expiry_unix_sec,
+                                          const QString& chain,
+                                          const QString& side)
+{
+    if (!m_model) return false;
+    const std::string xonly = m_model->wallet().getSwapIdentityXOnlyHex();
+    if (xonly.empty()) {
+        Q_EMIT log(tr("Cannot publish: swap-identity unavailable (wallet locked?)"));
+        return false;
+    }
+    const QString pubkey_hex = QString::fromStdString(xonly);
+    const qint64 created_at = QDateTime::currentSecsSinceEpoch();
+
+    QList<QStringList> tags;
+    tags.append({QStringLiteral("d"), order_id_hex});
+    tags.append({QStringLiteral("expiration"), QString::number(expiry_unix_sec)});
+    tags.append({QStringLiteral("c"), chain});
+    tags.append({QStringLiteral("s"), side});
+
+    const QByteArray canon =
+        CanonicalSerialize(kOfferKind, pubkey_hex, created_at, tags, uri);
+    const uint256 id = Sha256(canon);
+    const QString id_hex = QString::fromStdString(id.GetHex());
+
+    auto sig_or = m_model->wallet().signNostrEvent(id);
+    if (!sig_or) {
+        Q_EMIT log(tr("Cannot sign Nostr event: %1")
+            .arg(QString::fromStdString(util::ErrorString(sig_or).original)));
+        return false;
+    }
+
+    QJsonObject ev;
+    ev.insert("id",         id_hex);
+    ev.insert("pubkey",     pubkey_hex);
+    ev.insert("created_at", static_cast<double>(created_at));
+    ev.insert("kind",       kOfferKind);
+    QJsonArray tags_json;
+    for (const auto& t : tags) {
+        QJsonArray a;
+        for (const auto& v : t) a.append(v);
+        tags_json.append(a);
+    }
+    ev.insert("tags",       tags_json);
+    ev.insert("content",    uri);
+    ev.insert("sig",        QString::fromStdString(*sig_or));
+
+    QJsonArray msg;
+    msg.append(QStringLiteral("EVENT"));
+    msg.append(ev);
+    const QString frame = QString::fromUtf8(
+        QJsonDocument(msg).toJson(QJsonDocument::Compact));
+
+    int sent = 0;
+    for (auto it = m_socket_by_url.constBegin();
+         it != m_socket_by_url.constEnd(); ++it) {
+        QWebSocket* sock = it.value();
+        if (sock->state() != QAbstractSocket::ConnectedState) continue;
+        sock->sendTextMessage(frame);
+        ++sent;
+    }
+    Q_EMIT log(tr("Published offer %1 to %2 relay(s).")
+        .arg(order_id_hex.left(12) + "…").arg(sent));
+    return sent > 0;
+}
+
+bool PricoinNostrClient::verifyEvent(const QString& pubkey_hex,
+                                      const QString& id_hex,
+                                      const QString& sig_hex,
+                                      const QString& canonical_serialized)
+{
+    // Recompute id and verify it matches.
+    const QByteArray canon = canonical_serialized.toUtf8();
+    const uint256 id = Sha256(canon);
+    if (QString::fromStdString(id.GetHex()) != id_hex) return false;
+
+    // Verify BIP340 sig.
+    const auto pub_bytes = TryParseHex<unsigned char>(pubkey_hex.toStdString());
+    if (!pub_bytes || pub_bytes->size() != 32) return false;
+    const auto sig_bytes = TryParseHex<unsigned char>(sig_hex.toStdString());
+    if (!sig_bytes || sig_bytes->size() != 64) return false;
+
+    XOnlyPubKey xonly(std::span<const unsigned char>(pub_bytes->data(), 32));
+    return xonly.VerifySchnorr(id,
+        std::span<const unsigned char>(sig_bytes->data(), sig_bytes->size()));
+}
+
+void PricoinNostrClient::onTextMessage(const QString& message)
+{
+    QJsonParseError pe;
+    auto doc = QJsonDocument::fromJson(message.toUtf8(), &pe);
+    if (pe.error != QJsonParseError::NoError || !doc.isArray()) return;
+    const QJsonArray arr = doc.array();
+    if (arr.isEmpty() || !arr[0].isString()) return;
+    const QString tag = arr[0].toString();
+
+    if (tag == QStringLiteral("EVENT")) {
+        // ["EVENT", <subid>, <event>]
+        if (arr.size() < 3 || !arr[2].isObject()) return;
+        const QJsonObject ev = arr[2].toObject();
+        const int kind = ev.value("kind").toInt();
+        if (kind != kOfferKind) return;
+
+        const QString id_hex     = ev.value("id").toString();
+        const QString pubkey_hex = ev.value("pubkey").toString();
+        const QString sig_hex    = ev.value("sig").toString();
+        const QString content    = ev.value("content").toString();
+        const qint64 created_at  =
+            static_cast<qint64>(ev.value("created_at").toDouble());
+
+        if (m_seen_event_ids.contains(id_hex)) return;
+
+        // Reconstruct canonical serialization.
+        QList<QStringList> tags;
+        const QJsonArray jtags = ev.value("tags").toArray();
+        for (const QJsonValue& jt : jtags) {
+            if (!jt.isArray()) continue;
+            QStringList t;
+            for (const QJsonValue& jv : jt.toArray()) {
+                t.append(jv.toString());
+            }
+            tags.append(t);
+        }
+        const QByteArray canon = CanonicalSerialize(
+            kOfferKind, pubkey_hex, created_at, tags, content);
+
+        if (!verifyEvent(pubkey_hex, id_hex, sig_hex, QString::fromUtf8(canon))) {
+            Q_EMIT log(tr("Rejected event %1: signature/id mismatch")
+                .arg(id_hex.left(12) + "…"));
+            return;
+        }
+
+        m_seen_event_ids.insert(id_hex);
+        Q_EMIT offerReceived(content);
+    } else if (tag == QStringLiteral("EOSE") || tag == QStringLiteral("OK") ||
+               tag == QStringLiteral("NOTICE") || tag == QStringLiteral("CLOSED") ||
+               tag == QStringLiteral("AUTH")) {
+        // Silently ignore non-EVENT control frames for v0.
+    }
+}
