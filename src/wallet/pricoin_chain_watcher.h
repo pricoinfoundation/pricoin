@@ -55,6 +55,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -125,6 +126,23 @@ public:
     // = relay says no such tx.
     virtual std::optional<ForeignTxStatus> TxStatus(const std::string& txid_hex) = 0;
 };
+
+// Pluggable factory for resolving a foreign-chain client by chain
+// name. The daemon (init.cpp) installs an implementation that
+// delegates to `pricoin::swap::GetBackend(chain_name)` wrapped in
+// `ChainBackendForeignClient` — but the wallet library can't link
+// the swap module directly (the bitcoin-wallet utility doesn't pull
+// it in), so we route through this hook.
+//
+// Tests may also override the factory to inject mocks, though most
+// tests use the explicit ForeignClientMap on the ChainWatcher
+// constructor (which short-circuits the factory).
+using ForeignClientFactory =
+    std::function<std::shared_ptr<IForeignChainClient>(const std::string&)>;
+
+void SetForeignClientFactory(ForeignClientFactory factory);
+std::shared_ptr<IForeignChainClient> MakeForeignClientFromRegistry(
+    const std::string& chain_name);
 
 // Test/dev mock. Configurable via Set* setters; thread-safe.
 class MockForeignChainClient final : public IForeignChainClient {
@@ -221,6 +239,32 @@ private:
     std::atomic<bool> m_stopping{false};
     std::atomic<int64_t> m_transitions_applied{0};
 };
+
+// ─── Per-wallet polling manager ─────────────────────────────────
+//
+// Singleton-per-wallet ChainWatcher manager. Tier-3 RPCs (start /
+// stop / status / tick_once) operate against this manager. The
+// chain backends are auto-discovered from the
+// `pricoin::swap::ChainBackend` registry on Start; if no backends
+// are registered the watcher still runs but transitions only fire
+// for PRIC-leg kinds (which read the embedded chainstate directly).
+
+// Start the polling watcher for `wallet`. Idempotent — calling
+// Start twice has no effect. Auto-discovers backends from the
+// registry; the watcher periodically re-binds them per tick so
+// hot-reloading the backend registry is honoured.
+void StartManaged(::wallet::CWallet& wallet,
+                   std::chrono::seconds interval = std::chrono::seconds{30});
+// Stop the polling watcher for `wallet`. No-op if not running.
+void StopManaged(::wallet::CWallet& wallet);
+// True iff a polling thread is currently running for `wallet`.
+bool IsManagedRunning(::wallet::CWallet& wallet);
+// Drive a single tick synchronously for `wallet` — for tests.
+// Works regardless of whether StartManaged has been called.
+void TickOnceManaged(::wallet::CWallet& wallet);
+// Stop all managed watchers. Called from process Shutdown to
+// terminate threads cleanly before joining.
+void StopAllManaged();
 
 } // namespace wallet::pricoin_chain_watcher
 

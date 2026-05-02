@@ -6337,6 +6337,117 @@ RPCMethod pricoin_swapwatch_list()
     };
 }
 
+RPCMethod pricoin_swapwatch_start()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_start",
+        "Start the per-wallet swap-watcher polling thread. Each tick,\n"
+        "the watcher walks all pending entries (see pricoin_swapwatch_list),\n"
+        "queries the matching foreign-chain backend (configured via\n"
+        "-btcwatchurl= / -ltcwatchurl=) for confirmation depth, and\n"
+        "applies the matching SetX transition on the AdaptorSwap state\n"
+        "machine when the threshold is reached.\n"
+        "\n"
+        "Idempotent — calling twice has no effect. The thread is stopped\n"
+        "by pricoin_swapwatch_stop or implicitly on wallet unload /\n"
+        "daemon shutdown.\n",
+        {
+            {"interval_sec", RPCArg::Type::NUM, RPCArg::Default{30},
+                "Poll interval in seconds. Default 30."},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::BOOL, "running", "True iff the watcher is now running"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_start", "30")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const int interval = request.params[0].isNull()
+                ? 30 : request.params[0].getInt<int>();
+            if (interval < 1 || interval > 3600) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "interval_sec must be in [1, 3600]");
+            }
+            pcw::StartManaged(*wallet_sp, std::chrono::seconds{interval});
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("running", pcw::IsManagedRunning(*wallet_sp));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_swapwatch_stop()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_stop",
+        "Stop the per-wallet swap-watcher polling thread. Idempotent.\n",
+        {},
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::BOOL, "running", "Always false after this returns"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_stop", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            pcw::StopManaged(*wallet_sp);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("running", false);
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_swapwatch_status()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_status",
+        "Diagnostic snapshot of the per-wallet swap-watcher.\n",
+        {},
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::BOOL, "running", "Polling thread alive?"},
+                {RPCResult::Type::NUM,  "pending_entries", "Count of pending watch entries"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_status", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            std::vector<pcw::WatchEntry> all;
+            (void)pcw::List(*wallet_sp, all);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("running", pcw::IsManagedRunning(*wallet_sp));
+            out.pushKV("pending_entries", static_cast<int>(all.size()));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_swapwatch_tick_once()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_tick_once",
+        "Drive a single watcher tick synchronously. Walks all pending\n"
+        "entries once, queries backends, applies transitions whose\n"
+        "thresholds are met. Used by tests to advance the state\n"
+        "machine deterministically without a background thread.\n",
+        {},
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::NUM, "pending_after", "Count of entries remaining after the tick"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_tick_once", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            pcw::TickOnceManaged(*wallet_sp);
+            std::vector<pcw::WatchEntry> all;
+            (void)pcw::List(*wallet_sp, all);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("pending_after", static_cast<int>(all.size()));
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_swapwatch_notify()
 {
     return RPCMethod{
@@ -6492,6 +6603,10 @@ RPCMethod pricoin_offer_export_uri_export()              { return pricoin_offer_
 RPCMethod pricoin_swapwatch_add_export()                { return pricoin_swapwatch_add(); }
 RPCMethod pricoin_swapwatch_remove_export()             { return pricoin_swapwatch_remove(); }
 RPCMethod pricoin_swapwatch_list_export()               { return pricoin_swapwatch_list(); }
+RPCMethod pricoin_swapwatch_start_export()              { return pricoin_swapwatch_start(); }
+RPCMethod pricoin_swapwatch_stop_export()               { return pricoin_swapwatch_stop(); }
+RPCMethod pricoin_swapwatch_status_export()             { return pricoin_swapwatch_status(); }
+RPCMethod pricoin_swapwatch_tick_once_export()          { return pricoin_swapwatch_tick_once(); }
 RPCMethod pricoin_swapwatch_notify_export()             { return pricoin_swapwatch_notify(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }

@@ -226,8 +226,42 @@ bool LoadFromDB(::wallet::CWallet& wallet)
 
 void Shutdown()
 {
+    // Stop polling threads first so they don't touch the cache
+    // mid-clear.
+    StopAllManaged();
     LOCK(g_mutex);
     g_caches.clear();
+}
+
+// ─── Foreign-client factory hook ─────────────────────────────────
+//
+// The daemon installs an implementation in init.cpp that wraps
+// `pricoin::swap::GetBackend(chain_name)` in a ChainBackendForeignClient.
+// The bitcoin-wallet utility doesn't link the swap module so the
+// factory stays unset and MakeForeignClientFromRegistry returns
+// nullptr — fine for the wallet utility (it never polls foreign chains).
+
+namespace {
+Mutex g_factory_mutex;
+ForeignClientFactory g_factory GUARDED_BY(g_factory_mutex);
+} // namespace
+
+void SetForeignClientFactory(ForeignClientFactory factory)
+{
+    LOCK(g_factory_mutex);
+    g_factory = std::move(factory);
+}
+
+std::shared_ptr<IForeignChainClient> MakeForeignClientFromRegistry(
+    const std::string& chain_name)
+{
+    ForeignClientFactory f;
+    {
+        LOCK(g_factory_mutex);
+        f = g_factory;
+    }
+    if (!f) return nullptr;
+    return f(chain_name);
 }
 
 // ─── MockForeignChainClient ─────────────────────────────────────
@@ -403,13 +437,23 @@ bool ChainWatcher::HandleEntry(const WatchEntry& e)
             // Swap gone (aborted/refunded externally) — drop entry.
             return true;
         }
+        // Resolve client: prefer the explicitly-injected map (for
+        // tests that wire in mocks), fall back to the registry-
+        // backed adapter (the production path that uses the
+        // configured Esplora backends).
+        std::shared_ptr<IForeignChainClient> client;
         auto it = m_clients.find(s.foreign_chain);
-        if (it == m_clients.end()) {
+        if (it != m_clients.end()) {
+            client = it->second;
+        } else {
+            client = MakeForeignClientFromRegistry(s.foreign_chain);
+        }
+        if (!client) {
             // No client for this chain — leave entry pending so a
             // future Start() with a configured client can pick it up.
             return false;
         }
-        st = it->second->TxStatus(e.txid_hex);
+        st = client->TxStatus(e.txid_hex);
     } else {
         st = PricTxStatus(e.txid_hex);
     }
@@ -460,6 +504,83 @@ bool ChainWatcher::HandleEntry(const WatchEntry& e)
                   static_cast<int>(r));
     }
     return true;  // entry consumed either way
+}
+
+// ─── Per-wallet polling manager ─────────────────────────────────
+
+namespace {
+
+// Process-level registry of running ChainWatcher instances, one per
+// wallet. Mutex-protected; entries inserted on StartManaged, erased
+// on StopManaged / StopAllManaged / Shutdown. Each ChainWatcher
+// owns its polling thread; we hold a unique_ptr.
+Mutex g_managed_mutex;
+std::map<::wallet::CWallet*, std::unique_ptr<ChainWatcher>> g_managed
+    GUARDED_BY(g_managed_mutex);
+
+} // namespace
+
+void StartManaged(::wallet::CWallet& wallet, std::chrono::seconds interval)
+{
+    LOCK(g_managed_mutex);
+    auto& slot = g_managed[&wallet];
+    if (slot) return;  // already running
+    // Empty client map → registry fallback drives the lookups
+    // (production path); tests can register backends directly via
+    // pricoin::swap::RegisterBackend before calling StartManaged.
+    slot = std::make_unique<ChainWatcher>(wallet, ForeignClientMap{}, interval);
+    slot->Start();
+}
+
+void StopManaged(::wallet::CWallet& wallet)
+{
+    std::unique_ptr<ChainWatcher> watcher;
+    {
+        LOCK(g_managed_mutex);
+        auto it = g_managed.find(&wallet);
+        if (it == g_managed.end()) return;
+        watcher = std::move(it->second);
+        g_managed.erase(it);
+    }
+    // Destructor joins the thread; do this outside the mutex so a
+    // tick currently running doesn't deadlock on g_managed_mutex.
+    watcher.reset();
+}
+
+bool IsManagedRunning(::wallet::CWallet& wallet)
+{
+    LOCK(g_managed_mutex);
+    auto it = g_managed.find(&wallet);
+    return it != g_managed.end() && it->second != nullptr;
+}
+
+void TickOnceManaged(::wallet::CWallet& wallet)
+{
+    // If a managed watcher exists, drive its TickOnce. Otherwise
+    // construct a transient watcher and tick it once. Tests that
+    // exercise the autonomous path without StartManaged use this
+    // entry point for deterministic, thread-free ticking.
+    {
+        LOCK(g_managed_mutex);
+        auto it = g_managed.find(&wallet);
+        if (it != g_managed.end() && it->second) {
+            it->second->TickOnce();
+            return;
+        }
+    }
+    ChainWatcher transient(wallet, ForeignClientMap{}, std::chrono::seconds{0});
+    transient.TickOnce();
+}
+
+void StopAllManaged()
+{
+    std::map<::wallet::CWallet*, std::unique_ptr<ChainWatcher>> taken;
+    {
+        LOCK(g_managed_mutex);
+        std::swap(taken, g_managed);
+    }
+    // Joining threads — outside the mutex.
+    taken.clear();
 }
 
 } // namespace wallet::pricoin_chain_watcher

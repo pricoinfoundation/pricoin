@@ -1552,6 +1552,57 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             }
         }
     }
+#ifdef ENABLE_WALLET
+    // Wire the wallet-tier swap-watcher's foreign-client factory to
+    // the pricoin::swap chain-backend registry. The wallet library
+    // can't link the swap module directly (the bitcoin-wallet
+    // utility doesn't pull it in), so we install the adapter here.
+    wallet::pricoin_chain_watcher::SetForeignClientFactory(
+        [](const std::string& chain_name)
+            -> std::shared_ptr<wallet::pricoin_chain_watcher::IForeignChainClient> {
+            using namespace wallet::pricoin_chain_watcher;
+            auto backend = ::pricoin::swap::GetBackend(chain_name);
+            if (!backend) return nullptr;
+            // Local adapter — translates ChainBackend → IForeignChainClient.
+            // Tip-minus-block_height + 1 gives the confirmation count
+            // the watcher's threshold is checked against.
+            class Adapter : public IForeignChainClient {
+            public:
+                explicit Adapter(std::shared_ptr<::pricoin::swap::ChainBackend> b)
+                    : m_backend(std::move(b)) {}
+                std::optional<int> TipHeight() override {
+                    try { return m_backend->GetTipHeight(); }
+                    catch (const ::pricoin::swap::ChainBackendError&) { return std::nullopt; }
+                }
+                std::optional<ForeignTxStatus> TxStatus(const std::string& txid_hex) override {
+                    try {
+                        const auto st = m_backend->GetTxStatus(txid_hex);
+                        ForeignTxStatus out;
+                        out.found = true;
+                        out.block_height = st.block_height;
+                        if (st.confirmed && st.block_height >= 0) {
+                            const int tip = m_backend->GetTipHeight();
+                            out.confirmations = std::max(0, tip - st.block_height + 1);
+                        }
+                        return out;
+                    } catch (const ::pricoin::swap::ChainBackendError& e) {
+                        const std::string m = e.what();
+                        if (m.find("404") != std::string::npos
+                            || m.find("not found") != std::string::npos
+                            || m.find("Not Found") != std::string::npos) {
+                            ForeignTxStatus out;
+                            out.found = false;
+                            return out;
+                        }
+                        return std::nullopt;
+                    }
+                }
+            private:
+                std::shared_ptr<::pricoin::swap::ChainBackend> m_backend;
+            };
+            return std::make_shared<Adapter>(std::move(backend));
+        });
+#endif
 
     LogInfo("Using at most %i automatic connections (%i file descriptors available)", nMaxConnections, available_fds);
 
