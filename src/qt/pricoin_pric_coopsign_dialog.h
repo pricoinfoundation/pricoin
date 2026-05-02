@@ -1,0 +1,170 @@
+// Copyright (c) 2026-present The Pricoin developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#ifndef BITCOIN_QT_PRICOIN_PRIC_COOPSIGN_DIALOG_H
+#define BITCOIN_QT_PRICOIN_PRIC_COOPSIGN_DIALOG_H
+
+#include <QDialog>
+#include <QString>
+#include <cstdint>
+#include <string>
+
+class WalletModel;
+
+QT_BEGIN_NAMESPACE
+class QComboBox;
+class QLabel;
+class QLineEdit;
+class QPlainTextEdit;
+class QPushButton;
+QT_END_NAMESPACE
+
+// PricCoopSignDialog — guided UI for the PRIC-side cooperative-CLSAG
+// signing dance. Two modes:
+//
+//   PricPlain    — multi-layer cooperative CLSAG (used for the
+//                  PRIC refund cooperative sig — a normal v4 spend
+//                  signed cooperatively without an adaptor).
+//                  RPC chain: pricoin_jointspend_round1_safe →
+//                  pricoin_jointspend_combine →
+//                  pricoin_jointspend_share →
+//                  pricoin_jointspend_assemble.
+//
+//   PricAdaptor  — single-layer cooperative adaptor-CLSAG (per
+//                  doc/adaptor-clsag.md §4, used for the PRIC claim
+//                  adaptor pre-sig — adapts under T_G).
+//                  RPC chain: pricoin_jointspend_adaptor_round1 →
+//                  pricoin_jointspend_adaptor_combine →
+//                  pricoin_jointspend_share (reused) →
+//                  pricoin_jointspend_adaptor_assemble.
+//
+// Both flows are 2-round-trip: round 1 exchanges shares
+// (L/R/KI[/D] + commitment + DLEQ proofs in adaptor mode); round 2
+// exchanges close shares.
+//
+// The dialog is hand-paste mode — the user supplies x_share, z_share
+// (plain), session bookkeeping (session_id, ring_hash,
+// joint_output_id, role), and the buildtx output (ring_ml or ring,
+// pi, msg) themselves. Auto-pulling these from a swap session
+// record is a follow-on concern.
+
+class PricCoopSignDialog : public QDialog
+{
+    Q_OBJECT
+
+public:
+    enum class Mode {
+        PricPlain,    // refund — multi-layer, no adaptor
+        PricAdaptor,  // claim — single-layer + adaptor
+    };
+
+    PricCoopSignDialog(WalletModel* wallet_model,
+                       Mode mode,
+                       const QString& title,
+                       QWidget* parent = nullptr);
+
+    // Final result. PricPlain → 32-byte signature_hex (final CLSAG sig
+    // blob, broadcastable). PricAdaptor → 32-byte presig (serialized
+    // AdaptorPreSignature blob — feeds adaptorSwapSetPreSigned).
+    QString finalBlobHex() const { return m_final_blob_hex; }
+
+private Q_SLOTS:
+    void onStep1Compute();
+    void onStep2Compute();
+    void onStep3Compute();
+    void onStep4Compute();
+
+private:
+    WalletModel* m_wm{nullptr};
+    Mode m_mode;
+
+    // Saved between steps.
+    QString m_alpha;          // 32-byte hex; SECRET, never displayed
+    QString m_my_L_share;
+    QString m_my_R_share;
+    QString m_my_KI_share;
+    QString m_my_D_share;     // multi-layer plain only
+    QString m_my_commitment;
+    QString m_my_dleq_alpha;  // adaptor only
+    QString m_my_dleq_x;      // adaptor only
+    QString m_X_pub_X;        // adaptor only — x_X·G
+    QString m_KI;
+    QString m_D;
+    QString m_L_pi, m_R_pi;
+    QString m_L_prime, m_R_prime;       // adaptor only
+    QString m_c_pi, m_c0;
+    QString m_mu_P, m_mu_C;             // multi-layer plain only
+    QString m_s_others_json;            // JSON array of hex strings
+    QString m_my_s_share;
+    QString m_final_blob_hex;
+
+    // Inputs that persist for cross-step recall.
+    QString m_x_share, m_z_share;
+    QString m_msg_hex;
+    QString m_pi;
+    QString m_session_id;
+    QString m_ring_hash, m_joint_output_id;
+    QString m_role;
+    QString m_T_G, m_T_H, m_dleq_t;
+    QString m_session_label, m_session_payload;
+    QString m_X_pub_shares_json;        // JSON array
+    QString m_ring_ml_json;             // multi-layer
+    QString m_ring_json;                // single-layer (adaptor)
+
+    // ─── Setup form fields ───
+    QLineEdit*      m_in_x_share{nullptr};
+    QLineEdit*      m_in_z_share{nullptr};
+    QLineEdit*      m_in_joint_pubkey{nullptr};
+    QLineEdit*      m_in_msg{nullptr};
+    QLineEdit*      m_in_pi{nullptr};
+    QLineEdit*      m_in_session_id{nullptr};
+    QLineEdit*      m_in_ring_hash{nullptr};
+    QLineEdit*      m_in_joint_output_id{nullptr};
+    QComboBox*      m_in_role{nullptr};
+    // adaptor-only:
+    QLineEdit*      m_in_X_pub_X{nullptr};
+    QLineEdit*      m_in_T_G{nullptr};
+    QLineEdit*      m_in_T_H{nullptr};
+    QPlainTextEdit* m_in_dleq_t{nullptr};
+    QLineEdit*      m_in_session_label{nullptr};
+    QLineEdit*      m_in_session_payload{nullptr};
+    // ring/ring_ml + s_others input pasted as JSON:
+    QPlainTextEdit* m_in_ring_or_ring_ml{nullptr};
+
+    // ─── Step 1: My round 1 (local; persists nonce record) ───
+    QPushButton*    m_btn_step1{nullptr};
+    QPlainTextEdit* m_out_step1{nullptr};
+
+    // ─── Step 2: Combine (paste peer's round-1 share) ───
+    QPlainTextEdit* m_in_peer_share_json{nullptr};
+    QLineEdit*      m_in_X_pub_peer{nullptr};   // adaptor only
+    QPlainTextEdit* m_in_s_others_seed_json{nullptr}; // plain only — taker-supplied decoy s_others
+    QPushButton*    m_btn_step2{nullptr};
+    QPlainTextEdit* m_out_step2{nullptr};
+
+    // ─── Step 3: My round 3 (local) ───
+    QPushButton*    m_btn_step3{nullptr};
+    QPlainTextEdit* m_out_step3{nullptr};
+
+    // ─── Step 4: Assemble (paste peer's s_share) ───
+    QLineEdit*      m_in_peer_s_share{nullptr};
+    QPushButton*    m_btn_step4{nullptr};
+    QPlainTextEdit* m_out_step4{nullptr};
+
+    QLabel*         m_status_label{nullptr};
+
+    void buildLayout(const QString& title);
+    void setStatus(const QString& msg, bool error = false);
+
+    struct RpcResult {
+        bool ok;
+        std::string json;
+        std::string error_msg;
+    };
+    RpcResult callRpc(const std::string& method, const std::string& params_json);
+
+    static QString RandomHex32();
+};
+
+#endif // BITCOIN_QT_PRICOIN_PRIC_COOPSIGN_DIALOG_H
