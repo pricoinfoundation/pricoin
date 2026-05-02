@@ -25,6 +25,7 @@
 #include <wallet/fees.h>
 #include <wallet/load.h>
 #include <wallet/pricoin_ct_send.h>
+#include <wallet/pricoin_offer.h>
 #include <wallet/pricoin_stealth.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/wallet.h>
@@ -178,6 +179,222 @@ public:
         } catch (...) {
             return 0;
         }
+    }
+
+    // ────── Phase-6 orderbook ──────
+private:
+    static const char* OfferOriginStr(::wallet::pricoin_offer::Origin o) {
+        return o == ::wallet::pricoin_offer::Origin::Local ? "local" : "imported";
+    }
+    static const char* OfferSideStr(::wallet::pricoin_offer::Side s) {
+        return s == ::wallet::pricoin_offer::Side::BuyPric ? "buy_pric" : "sell_pric";
+    }
+    static const char* OfferChainStr(::wallet::pricoin_offer::ForeignChain c) {
+        return c == ::wallet::pricoin_offer::ForeignChain::Btc ? "btc" : "ltc";
+    }
+    static const char* OfferStatusStr(::wallet::pricoin_offer::Status s) {
+        using S = ::wallet::pricoin_offer::Status;
+        switch (s) {
+            case S::Active:    return "active";
+            case S::Matched:   return "matched";
+            case S::Filled:    return "filled";
+            case S::Cancelled: return "cancelled";
+            case S::Expired:   return "expired";
+        }
+        return "unknown";
+    }
+
+    static PricoinOfferSnapshot ToSnapshot(const ::wallet::pricoin_offer::Order& o) {
+        PricoinOfferSnapshot s;
+        s.order_id = o.payload.order_id.ToString();
+        s.origin = OfferOriginStr(o.origin);
+        s.side = OfferSideStr(o.payload.side);
+        s.foreign_chain = OfferChainStr(o.payload.foreign_chain);
+        s.max_pric_amount_sat = o.payload.max_pric_amount_sat;
+        s.foreign_amount_at_max_sat = o.payload.foreign_amount_at_max_sat;
+        s.expiry_unix_sec = o.payload.expiry_unix_sec;
+        s.maker_pubkey_hex = HexStr(o.payload.maker_pubkey);
+        s.status = OfferStatusStr(o.status);
+        s.pric_remaining_sat = o.pric_remaining_sat;
+        s.pric_in_flight_sat = o.pric_in_flight_sat;
+        if (!o.matched_with_order_id.IsNull()) {
+            s.matched_with_order_id = o.matched_with_order_id.ToString();
+        }
+        s.notes = o.notes;
+        s.created_time = o.created_time;
+        s.updated_time = o.updated_time;
+        return s;
+    }
+
+    static std::optional<uint256> ParseOid(const std::string& s) {
+        return uint256::FromHex(s);
+    }
+
+    static ::wallet::pricoin_offer::Side ParseSide(const std::string& s) {
+        if (s == "buy_pric")  return ::wallet::pricoin_offer::Side::BuyPric;
+        return ::wallet::pricoin_offer::Side::SellPric;
+    }
+    static ::wallet::pricoin_offer::ForeignChain ParseChain(const std::string& s) {
+        if (s == "ltc") return ::wallet::pricoin_offer::ForeignChain::Ltc;
+        return ::wallet::pricoin_offer::ForeignChain::Btc;
+    }
+
+public:
+    PricoinOfferCreateResult offerCreate(const PricoinOfferCreateParams& p) override {
+        PricoinOfferCreateResult r;
+        ::wallet::pricoin_offer::CreateParams cp;
+        if (p.side != "buy_pric" && p.side != "sell_pric") {
+            r.error = "side must be \"buy_pric\" or \"sell_pric\"";
+            return r;
+        }
+        if (p.foreign_chain != "btc" && p.foreign_chain != "ltc") {
+            r.error = "foreign_chain must be \"btc\" or \"ltc\"";
+            return r;
+        }
+        cp.side = ParseSide(p.side);
+        cp.foreign_chain = ParseChain(p.foreign_chain);
+        cp.max_pric_amount_sat = p.max_pric_amount_sat;
+        cp.foreign_amount_at_max_sat = p.foreign_amount_at_max_sat;
+        cp.expiry_unix_sec = p.expiry_unix_sec;
+        cp.notes = p.notes;
+        ::wallet::pricoin_offer::Order o;
+        auto cr = ::wallet::pricoin_offer::Create(*m_wallet, cp, o);
+        using CR = ::wallet::pricoin_offer::CreateResult;
+        switch (cr) {
+        case CR::Ok:
+            r.ok = true;
+            r.record = ToSnapshot(o);
+            r.uri = ::wallet::pricoin_offer::EncodeUri(o.payload);
+            return r;
+        case CR::InvalidInput:     r.error = "amounts and expiry must be > 0"; return r;
+        case CR::Locked:           r.error = "wallet locked"; return r;
+        case CR::DerivationFailed: r.error = "swap-identity priv unavailable"; return r;
+        case CR::WriteFailed:      r.error = "wallet write failed"; return r;
+        }
+        return r;
+    }
+
+    util::Result<PricoinOfferSnapshot> offerImport(const std::string& uri) override {
+        ::wallet::pricoin_offer::Order o;
+        auto ir = ::wallet::pricoin_offer::Import(*m_wallet, uri, o);
+        using IR = ::wallet::pricoin_offer::ImportResult;
+        switch (ir) {
+        case IR::Ok:                return ToSnapshot(o);
+        case IR::InvalidUri:        return util::Error{Untranslated("URI did not parse as a pricoffer:v1 envelope")};
+        case IR::InvalidSignature:  return util::Error{Untranslated("offer signature does not verify")};
+        case IR::Duplicate:         return util::Error{Untranslated("an order with this id is already in the wallet")};
+        case IR::AlreadyExpired:    return util::Error{Untranslated("offer expiry has already passed")};
+        case IR::Locked:            return util::Error{Untranslated("wallet locked")};
+        case IR::WriteFailed:       return util::Error{Untranslated("wallet write failed")};
+        }
+        return util::Error{Untranslated("unknown import error")};
+    }
+
+    std::vector<PricoinOfferSnapshot> offerList() override {
+        std::vector<PricoinOfferSnapshot> out;
+        std::vector<::wallet::pricoin_offer::Order> all;
+        auto r = ::wallet::pricoin_offer::List(*m_wallet, all);
+        if (r != ::wallet::pricoin_offer::LookupResult::Ok) return out;
+        out.reserve(all.size());
+        for (const auto& o : all) out.push_back(ToSnapshot(o));
+        return out;
+    }
+
+    std::optional<PricoinOfferSnapshot> offerGet(const std::string& order_id) override {
+        auto oid = ParseOid(order_id);
+        if (!oid) return std::nullopt;
+        ::wallet::pricoin_offer::Order o;
+        auto r = ::wallet::pricoin_offer::Get(*m_wallet, *oid, o);
+        if (r != ::wallet::pricoin_offer::LookupResult::Ok) return std::nullopt;
+        return ToSnapshot(o);
+    }
+
+    std::string offerExportUri(const std::string& order_id) override {
+        auto oid = ParseOid(order_id);
+        if (!oid) return "";
+        std::string uri;
+        ::wallet::pricoin_offer::ExportUri(*m_wallet, *oid, uri);
+        return uri;
+    }
+
+    util::Result<PricoinOfferSnapshot> offerCancel(const std::string& order_id) override {
+        auto oid = ParseOid(order_id);
+        if (!oid) return util::Error{Untranslated("order_id must be 32-byte hex")};
+        auto r = ::wallet::pricoin_offer::Cancel(*m_wallet, *oid);
+        if (r != ::wallet::pricoin_offer::MutateResult::Ok) {
+            return util::Error{Untranslated("cancel rejected")};
+        }
+        ::wallet::pricoin_offer::Order o;
+        ::wallet::pricoin_offer::Get(*m_wallet, *oid, o);
+        return ToSnapshot(o);
+    }
+
+    util::Result<std::pair<PricoinOfferSnapshot, PricoinOfferSnapshot>>
+    offerMatch(const std::string& my_order_id,
+               const std::string& their_order_id,
+               int64_t actual_pric_amount_sat) override {
+        auto m = ParseOid(my_order_id);
+        auto t = ParseOid(their_order_id);
+        if (!m || !t) return util::Error{Untranslated("order ids must be 32-byte hex")};
+        auto r = ::wallet::pricoin_offer::Match(*m_wallet, *m, *t, actual_pric_amount_sat);
+        using MR = ::wallet::pricoin_offer::MutateResult;
+        switch (r) {
+        case MR::Ok: break;
+        case MR::NotFound:        return util::Error{Untranslated("no order with that id")};
+        case MR::InvalidState:    return util::Error{Untranslated("current state does not permit match")};
+        case MR::InvalidInput:    return util::Error{Untranslated("invalid input")};
+        case MR::PriceCrossFailed:return util::Error{Untranslated("orders do not price-cross")};
+        case MR::Locked:          return util::Error{Untranslated("wallet locked")};
+        case MR::WriteFailed:     return util::Error{Untranslated("wallet write failed")};
+        }
+        ::wallet::pricoin_offer::Order mo, to;
+        ::wallet::pricoin_offer::Get(*m_wallet, *m, mo);
+        ::wallet::pricoin_offer::Get(*m_wallet, *t, to);
+        return std::make_pair(ToSnapshot(mo), ToSnapshot(to));
+    }
+
+    util::Result<PricoinOfferSnapshot> offerFill(const std::string& order_id) override {
+        auto oid = ParseOid(order_id);
+        if (!oid) return util::Error{Untranslated("bad order_id")};
+        auto r = ::wallet::pricoin_offer::Fill(*m_wallet, *oid);
+        if (r != ::wallet::pricoin_offer::MutateResult::Ok) {
+            return util::Error{Untranslated("fill rejected (order not Matched, or in_flight invariant violated)")};
+        }
+        ::wallet::pricoin_offer::Order o;
+        ::wallet::pricoin_offer::Get(*m_wallet, *oid, o);
+        return ToSnapshot(o);
+    }
+
+    util::Result<PricoinOfferSnapshot> offerUnmatch(const std::string& order_id) override {
+        auto oid = ParseOid(order_id);
+        if (!oid) return util::Error{Untranslated("bad order_id")};
+        auto r = ::wallet::pricoin_offer::Unmatch(*m_wallet, *oid);
+        if (r != ::wallet::pricoin_offer::MutateResult::Ok) {
+            return util::Error{Untranslated("unmatch rejected (order not Matched)")};
+        }
+        ::wallet::pricoin_offer::Order o;
+        ::wallet::pricoin_offer::Get(*m_wallet, *oid, o);
+        return ToSnapshot(o);
+    }
+
+    std::vector<PricoinMatchCandidate> offerFindMatches(const std::string& my_order_id) override {
+        std::vector<PricoinMatchCandidate> out;
+        auto oid = ParseOid(my_order_id);
+        if (!oid) return out;
+        std::vector<::wallet::pricoin_offer::MatchCandidate> cands;
+        auto r = ::wallet::pricoin_offer::FindMatches(*m_wallet, *oid, cands);
+        if (r != ::wallet::pricoin_offer::LookupResult::Ok) return out;
+        out.reserve(cands.size());
+        for (const auto& c : cands) {
+            PricoinMatchCandidate m;
+            m.their_order_id = c.their_order_id.ToString();
+            m.their_max_pric_sat = c.their_max_pric_sat;
+            m.their_foreign_at_max_sat = c.their_foreign_at_max_sat;
+            m.max_actual_pric_sat = c.max_actual_pric_sat;
+            m.price_advantage_milli = c.price_advantage_milli;
+            out.push_back(m);
+        }
+        return out;
     }
     util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label) override
     {

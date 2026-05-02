@@ -115,6 +115,93 @@ public:
     //! `pricoin_listownct.total_recovered`.
     virtual CAmount confidentialBalance() = 0;
 
+    // ────── Phase-6 orderbook (Tier 1) wallet interface ──────
+    //
+    // Read-friendly snapshot of an Order record for the GUI table.
+    // String fields use the same enum spellings as the JSON-RPC layer
+    // ("local"/"imported", "buy_pric"/"sell_pric", "btc"/"ltc",
+    // "active"/"matched"/"filled"/"cancelled"/"expired"). Decimal
+    // amounts stay in sats (int64).
+    struct PricoinOfferSnapshot {
+        std::string order_id;
+        std::string origin;
+        std::string side;
+        std::string foreign_chain;
+        int64_t     max_pric_amount_sat{0};
+        int64_t     foreign_amount_at_max_sat{0};
+        int64_t     expiry_unix_sec{0};
+        std::string maker_pubkey_hex;
+        std::string status;
+        int64_t     pric_remaining_sat{0};
+        int64_t     pric_in_flight_sat{0};
+        std::string matched_with_order_id;  // empty if none
+        std::string notes;
+        int64_t     created_time{0};
+        int64_t     updated_time{0};
+    };
+
+    struct PricoinOfferCreateParams {
+        std::string side;          // "buy_pric" | "sell_pric"
+        std::string foreign_chain; // "btc" | "ltc"
+        int64_t     max_pric_amount_sat{0};
+        int64_t     foreign_amount_at_max_sat{0};
+        int64_t     expiry_unix_sec{0};
+        std::string notes;
+    };
+
+    struct PricoinOfferCreateResult {
+        bool        ok{false};
+        std::string error;        // populated when !ok
+        PricoinOfferSnapshot record{};
+        std::string uri;          // canonical pricoffer:v1/<base64>
+    };
+
+    struct PricoinMatchCandidate {
+        std::string their_order_id;
+        int64_t     their_max_pric_sat{0};
+        int64_t     their_foreign_at_max_sat{0};
+        int64_t     max_actual_pric_sat{0};
+        int64_t     price_advantage_milli{0};
+    };
+
+    //! Pricoin: create a local order. Generates fresh order_id, signs
+    //! payload with wallet's swap-identity priv, returns record + URI.
+    virtual PricoinOfferCreateResult offerCreate(const PricoinOfferCreateParams& p) = 0;
+
+    //! Pricoin: import an offer URI from a counterparty. Verifies sig,
+    //! rejects duplicates / expired / malformed.
+    virtual util::Result<PricoinOfferSnapshot> offerImport(const std::string& uri) = 0;
+
+    //! Pricoin: list all orders (Local + Imported).
+    virtual std::vector<PricoinOfferSnapshot> offerList() = 0;
+
+    //! Pricoin: read one order by id.
+    virtual std::optional<PricoinOfferSnapshot> offerGet(const std::string& order_id) = 0;
+
+    //! Pricoin: re-export the URI for a Local order. Returns empty for
+    //! imported orders.
+    virtual std::string offerExportUri(const std::string& order_id) = 0;
+
+    //! Pricoin: operator-cancel an order (Active or Matched → Cancelled).
+    virtual util::Result<PricoinOfferSnapshot> offerCancel(const std::string& order_id) = 0;
+
+    //! Pricoin: lock my order to their order at the chosen actual_pric_amount.
+    //! Both transition to Matched. See `pricoin_offer_match` RPC docs.
+    virtual util::Result<std::pair<PricoinOfferSnapshot, PricoinOfferSnapshot>>
+        offerMatch(const std::string& my_order_id,
+                   const std::string& their_order_id,
+                   int64_t actual_pric_amount_sat) = 0;
+
+    //! Pricoin: mark a Matched order Filled (cascades to peer).
+    virtual util::Result<PricoinOfferSnapshot> offerFill(const std::string& order_id) = 0;
+
+    //! Pricoin: release a Matched order back to Active (cascades to peer).
+    virtual util::Result<PricoinOfferSnapshot> offerUnmatch(const std::string& order_id) = 0;
+
+    //! Pricoin: find imported offers that price-cross with my order,
+    //! sorted best-first.
+    virtual std::vector<PricoinMatchCandidate> offerFindMatches(const std::string& my_order_id) = 0;
+
     // Get a new address.
     virtual util::Result<CTxDestination> getNewDestination(OutputType type, const std::string& label) = 0;
 

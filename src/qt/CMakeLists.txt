@@ -190,6 +190,8 @@ if(ENABLE_WALLET)
       receiverequestdialog.h
       recentrequeststablemodel.cpp
       recentrequeststablemodel.h
+      pricoinorderbookpage.cpp
+      pricoinorderbookpage.h
       sendcoinsdialog.cpp
       sendcoinsdialog.h
       sendcoinsentry.cpp
