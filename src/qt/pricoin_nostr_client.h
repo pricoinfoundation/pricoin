@@ -51,6 +51,10 @@ class PricoinNostrClient : public QObject
 
 public:
     static constexpr int kOfferKind = 30030;
+    // NIP-04 encrypted DMs use kind=4. Subscribed to with a #p
+    // tag filter set to the wallet's xonly pubkey, so the relay
+    // only sends events addressed to us.
+    static constexpr int kDmKind = 4;
 
     PricoinNostrClient(WalletModel* model,
                        const QStringList& relay_urls,
@@ -73,6 +77,14 @@ public:
                          const QString& chain,        // "btc" | "ltc"
                          const QString& side);        // "buy" | "sell"
 
+    // Publish a NIP-04 encrypted direct message to `peer_xonly_hex`.
+    // The wallet derives the AES key via ECDH(my_swap_priv,
+    // peer_xonly→even-y), encrypts `plaintext` with AES-256-CBC +
+    // random IV, and packages it as a kind-4 event with a `["p",
+    // peer]` tag. Returns true if at least one relay was sent to.
+    bool publishDirectMessage(const QString& peer_xonly_hex,
+                               const QString& plaintext);
+
     // True if at least one relay is currently connected.
     bool anyConnected() const;
 
@@ -83,6 +95,11 @@ Q_SIGNALS:
     // has not yet imported. The orderbook page calls offerImport on
     // it and refreshes its view.
     void offerReceived(const QString& uri);
+    // Fired for each VALIDATED inbound NIP-04 DM. `from_xonly_hex`
+    // is the sender's xonly pubkey (32-byte hex). `plaintext` is
+    // the decrypted content.
+    void directMessageReceived(const QString& from_xonly_hex,
+                                 const QString& plaintext);
     // Status delta — true=connected, false=disconnected.
     void relayStatusChanged(const QString& relay_url, bool connected);
     // Diagnostic stream (relay errors, parse failures, etc.).

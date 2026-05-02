@@ -5,12 +5,15 @@
 #include <qt/pricoin_coopsign_dialog.h>
 
 #include <interfaces/node.h>
+#include <qt/pricoin_nostr_client.h>
+#include <qt/pricoin_relay_settings_dialog.h>
 #include <qt/walletmodel.h>
 #include <random.h>
 #include <univalue.h>
 #include <util/strencodings.h>
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
 #include <QDialogButtonBox>
@@ -82,10 +85,16 @@ CoopSignDialog::CoopSignDialog(WalletModel* wallet_model,
                                 QWidget* parent)
     : QDialog(parent),
       m_wm(wallet_model),
-      m_mode(mode)
+      m_mode(mode),
+      m_swap_id(QString::fromStdString(swap_id))
 {
     setModal(true);
-    resize(820, 740);
+    resize(820, 800);
+    // Relay list: same QSettings key as the orderbook page so
+    // user's saved relays are reused. We don't auto-connect — the
+    // user clicks "Connect Nostr DM" if they want auto-delivery.
+    m_relay_urls = PricoinRelaySettingsDialog::loadFromSettings();
+
     buildLayout(title);
 
     // If a swap_id was given, pre-fill what we can from the wallet's
@@ -94,6 +103,13 @@ CoopSignDialog::CoopSignDialog(WalletModel* wallet_model,
     if (!swap_id.empty() && m_wm) {
         auto snap = m_wm->wallet().adaptorSwapGet(swap_id);
         if (snap) {
+            // Peer xonly = last 32 bytes of the 33-byte compressed
+            // counterparty pubkey (drop the parity prefix).
+            if (!snap->counterparty_pubkey_hex.empty()
+                && snap->counterparty_pubkey_hex.size() >= 66) {
+                m_peer_xonly = QString::fromStdString(
+                    snap->counterparty_pubkey_hex.substr(2));
+            }
             // Peer pubkey: the swap's counterparty_pubkey, 33-byte
             // compressed already.
             if (m_in_peer_pub && !snap->counterparty_pubkey_hex.empty()) {
@@ -260,6 +276,24 @@ void CoopSignDialog::buildLayout(const QString& title)
 
     auto* outer = new QVBoxLayout(this);
 
+    // ─── Nostr DM section (optional auto-delivery) ────────────
+    {
+        auto* box = new QGroupBox(tr("Nostr DM (optional — auto-deliver pubnonce/partial to peer)"), this);
+        box->setStyleSheet(QStringLiteral("QGroupBox { font-weight: bold; }"));
+        auto* h = new QHBoxLayout(box);
+        m_btn_nostr_connect = new QPushButton(tr("Connect Nostr DM"), box);
+        h->addWidget(m_btn_nostr_connect);
+        m_chk_auto_paste = new QCheckBox(tr("Auto-paste from peer DMs"), box);
+        m_chk_auto_paste->setChecked(true);
+        h->addWidget(m_chk_auto_paste);
+        m_lbl_nostr_status = new QLabel(box);
+        m_lbl_nostr_status->setWordWrap(true);
+        h->addWidget(m_lbl_nostr_status, /*stretch=*/1);
+        outer->addWidget(box);
+        connect(m_btn_nostr_connect, &QPushButton::clicked, this, &CoopSignDialog::onNostrConnectClicked);
+        updateNostrStatus();
+    }
+
     // Header — explain the protocol shape so a user that hasn't run
     // through this before doesn't get lost.
     auto* hdr = new QLabel(this);
@@ -391,8 +425,13 @@ void CoopSignDialog::buildLayout(const QString& title)
         form->addRow(tr("Output (send `pubnonce` to peer):"), m_out_step2);
         form->addRow(QString(), MakeCopyPasteRow(m_out_step2, box));
 
+        m_btn_send_dm_round2 = new QPushButton(tr("Send pubnonce via Nostr DM"), box);
+        m_btn_send_dm_round2->setEnabled(false);
+        form->addRow(QString(), m_btn_send_dm_round2);
+
         steps_v->addWidget(box);
-        connect(m_btn_step2, &QPushButton::clicked, this, &CoopSignDialog::onStep2Compute);
+        connect(m_btn_step2,           &QPushButton::clicked, this, &CoopSignDialog::onStep2Compute);
+        connect(m_btn_send_dm_round2,  &QPushButton::clicked, this, &CoopSignDialog::onSendDmRound2);
     }
 
     // ─── Step 3: Combine + my partial ──────────────────────────
@@ -423,8 +462,13 @@ void CoopSignDialog::buildLayout(const QString& title)
         form->addRow(tr("Output (send `partial_sig` to peer):"), m_out_step3);
         form->addRow(QString(), MakeCopyPasteRow(m_out_step3, box));
 
+        m_btn_send_dm_round3 = new QPushButton(tr("Send partial_sig via Nostr DM"), box);
+        m_btn_send_dm_round3->setEnabled(false);
+        form->addRow(QString(), m_btn_send_dm_round3);
+
         steps_v->addWidget(box);
-        connect(m_btn_step3, &QPushButton::clicked, this, &CoopSignDialog::onStep3Compute);
+        connect(m_btn_step3,           &QPushButton::clicked, this, &CoopSignDialog::onStep3Compute);
+        connect(m_btn_send_dm_round3,  &QPushButton::clicked, this, &CoopSignDialog::onSendDmRound3);
     }
 
     // ─── Step 4: Aggregate partials ────────────────────────────
@@ -543,6 +587,7 @@ void CoopSignDialog::onStep2Compute()
     m_role            = role;
     m_out_step2->setPlainText(QString::fromStdString(r.json));
     setStatus(tr("Step 2 OK. pubnonce ready to send to peer."));
+    updateNostrStatus();
 }
 
 void CoopSignDialog::onStep3Compute()
@@ -624,6 +669,7 @@ void CoopSignDialog::onStep3Compute()
     combined.pushKV("partial_sig",  m_my_partial.toStdString());
     m_out_step3->setPlainText(QString::fromStdString(combined.write(2)));
     setStatus(tr("Step 3 OK. Send `partial_sig` to peer; keep session locally for step 4."));
+    updateNostrStatus();
 }
 
 void CoopSignDialog::onStep4Compute()
@@ -664,3 +710,137 @@ void CoopSignDialog::onStep4Compute()
 
 void CoopSignDialog::onCopyButton() {}
 void CoopSignDialog::onPasteButton() {}
+
+// ─── Nostr DM transport ──────────────────────────────────────────
+
+void CoopSignDialog::updateNostrStatus()
+{
+    if (!m_lbl_nostr_status) return;
+    if (!m_nostr) {
+        m_lbl_nostr_status->setText(tr("DM relay: disconnected. Peer xonly: %1")
+            .arg(m_peer_xonly.isEmpty()
+                ? tr("(unknown — set by ctor swap_id)")
+                : m_peer_xonly.left(16) + "…"));
+        if (m_btn_send_dm_round2) m_btn_send_dm_round2->setEnabled(false);
+        if (m_btn_send_dm_round3) m_btn_send_dm_round3->setEnabled(false);
+        if (m_btn_nostr_connect) m_btn_nostr_connect->setText(tr("Connect Nostr DM"));
+        return;
+    }
+    m_lbl_nostr_status->setText(
+        tr("DM relay: %1/%2 connected. Peer xonly: %3")
+            .arg(m_relay_connected_count)
+            .arg(m_relay_urls.size())
+            .arg(m_peer_xonly.isEmpty() ? tr("(unknown)") : m_peer_xonly.left(16) + "…"));
+    const bool can_send = (m_relay_connected_count > 0 && !m_peer_xonly.isEmpty());
+    if (m_btn_send_dm_round2) m_btn_send_dm_round2->setEnabled(
+        can_send && !m_my_pubnonce.isEmpty());
+    if (m_btn_send_dm_round3) m_btn_send_dm_round3->setEnabled(
+        can_send && !m_my_partial.isEmpty());
+    if (m_btn_nostr_connect) m_btn_nostr_connect->setText(tr("Disconnect Nostr DM"));
+}
+
+void CoopSignDialog::onNostrConnectClicked()
+{
+    if (m_nostr) {
+        m_nostr->disconnectAll();
+        delete m_nostr;
+        m_nostr = nullptr;
+        m_relay_connected_count = 0;
+        updateNostrStatus();
+        return;
+    }
+    if (m_relay_urls.isEmpty()) {
+        setStatus(tr("No Nostr relays configured. Use Orderbook → Relay settings… first."), true);
+        return;
+    }
+    if (m_peer_xonly.isEmpty()) {
+        setStatus(tr("Peer xonly unknown — DM destination cannot be determined."), true);
+        return;
+    }
+    m_nostr = new PricoinNostrClient(m_wm, m_relay_urls, this);
+    connect(m_nostr, &PricoinNostrClient::log,
+            this, &CoopSignDialog::onNostrLog);
+    connect(m_nostr, &PricoinNostrClient::relayStatusChanged,
+            this, &CoopSignDialog::onNostrRelayStatus);
+    connect(m_nostr, &PricoinNostrClient::directMessageReceived,
+            this, &CoopSignDialog::onDmReceived);
+    m_nostr->connectAll();
+    updateNostrStatus();
+}
+
+void CoopSignDialog::onNostrRelayStatus(const QString& url, bool connected)
+{
+    Q_UNUSED(url);
+    if (connected) ++m_relay_connected_count;
+    else --m_relay_connected_count;
+    if (m_relay_connected_count < 0) m_relay_connected_count = 0;
+    updateNostrStatus();
+}
+
+void CoopSignDialog::onNostrLog(const QString& msg)
+{
+    setStatus(msg);
+}
+
+void CoopSignDialog::onSendDmRound2()
+{
+    if (!m_nostr || m_my_pubnonce.isEmpty() || m_peer_xonly.isEmpty()) return;
+    UniValue env{UniValue::VOBJ};
+    env.pushKV("v",        1);
+    env.pushKV("leg",      m_mode == Mode::BtcAdaptor ? "btc_claim_adaptor"
+                                                       : "btc_refund");
+    env.pushKV("swap_id",  m_swap_id.toStdString());
+    env.pushKV("round",    2);
+    env.pushKV("pubnonce", m_my_pubnonce.toStdString());
+    const QString plaintext = QString::fromStdString(env.write(0));
+    if (m_nostr->publishDirectMessage(m_peer_xonly, plaintext)) {
+        setStatus(tr("Round-1 pubnonce DM sent."));
+    }
+}
+
+void CoopSignDialog::onSendDmRound3()
+{
+    if (!m_nostr || m_my_partial.isEmpty() || m_peer_xonly.isEmpty()) return;
+    UniValue env{UniValue::VOBJ};
+    env.pushKV("v",        1);
+    env.pushKV("leg",      m_mode == Mode::BtcAdaptor ? "btc_claim_adaptor"
+                                                       : "btc_refund");
+    env.pushKV("swap_id",  m_swap_id.toStdString());
+    env.pushKV("round",    3);
+    env.pushKV("partial",  m_my_partial.toStdString());
+    const QString plaintext = QString::fromStdString(env.write(0));
+    if (m_nostr->publishDirectMessage(m_peer_xonly, plaintext)) {
+        setStatus(tr("Round-2 partial DM sent."));
+    }
+}
+
+void CoopSignDialog::onDmReceived(const QString& from_xonly_hex,
+                                    const QString& plaintext)
+{
+    // Filter: only DMs from this swap's counterparty.
+    if (!m_peer_xonly.isEmpty() && from_xonly_hex != m_peer_xonly) return;
+    UniValue env;
+    if (!env.read(plaintext.toStdString()) || !env.isObject()) {
+        return;
+    }
+    if (env.exists("swap_id")
+        && env["swap_id"].get_str() != m_swap_id.toStdString()
+        && !m_swap_id.isEmpty()) {
+        return;  // different swap, ignore
+    }
+    if (!m_chk_auto_paste || !m_chk_auto_paste->isChecked()) {
+        setStatus(tr("Peer DM received (auto-paste disabled — use Paste buttons)."));
+        return;
+    }
+    if (!env.exists("round")) return;
+    const int round = env["round"].getInt<int>();
+    if (round == 2 && env.exists("pubnonce") && m_in_peer_pubnonce) {
+        m_in_peer_pubnonce->setPlainText(
+            QString::fromStdString(env["pubnonce"].get_str()));
+        setStatus(tr("Peer pubnonce auto-pasted from DM. Run step 3."));
+    } else if (round == 3 && env.exists("partial") && m_in_peer_partial) {
+        m_in_peer_partial->setPlainText(
+            QString::fromStdString(env["partial"].get_str()));
+        setStatus(tr("Peer partial auto-pasted from DM. Run step 4."));
+    }
+}

@@ -196,6 +196,8 @@ if(ENABLE_WALLET)
       pricoin_match_dialog.h
       pricoin_pric_coopsign_dialog.cpp
       pricoin_pric_coopsign_dialog.h
+      pricoin_nip04.cpp
+      pricoin_nip04.h
       pricoin_nostr_client.cpp
       pricoin_nostr_client.h
       pricoin_relay_settings_dialog.cpp

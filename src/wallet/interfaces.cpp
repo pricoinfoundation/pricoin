@@ -738,6 +738,37 @@ public:
         return HexStr(sig);
     }
 
+    util::Result<std::array<unsigned char, 32>>
+    nip04SharedKey(const std::string& peer_xonly_hex) override {
+        CKey priv;
+        if (!deriveSwapIdentityPriv(priv)) {
+            return util::Error{Untranslated("swap-identity priv unavailable (wallet locked?)")};
+        }
+        // NIP-04 interop convention: lift peer xonly to compressed
+        // by prepending 0x02 (even-y). Priv parity normalization is
+        // NOT needed — the ECDH X-coordinate is parity-invariant
+        // (negation flips y, preserves x), so both parties arrive
+        // at the same X regardless of their natural pubkey parity.
+        const auto peer_bytes = TryParseHex<unsigned char>(peer_xonly_hex);
+        if (!peer_bytes || peer_bytes->size() != 32) {
+            return util::Error{Untranslated("peer_xonly must be 32-byte hex")};
+        }
+        std::vector<unsigned char> peer_compressed(33);
+        peer_compressed[0] = 0x02;
+        std::copy(peer_bytes->begin(), peer_bytes->end(), peer_compressed.begin() + 1);
+        CPubKey peer_pub(std::span<const unsigned char>(peer_compressed.data(), 33));
+        if (!peer_pub.IsValid()) {
+            return util::Error{Untranslated("peer_xonly is not on the curve (even-y lift)")};
+        }
+        // ECDH via stealth helper. Returns 33-byte compressed point;
+        // bytes 1..32 are the X-coordinate that NIP-04 uses as the AES key.
+        auto pt = ::pricoin::stealth::ECDHPoint(priv, peer_pub);
+        if (!pt) return util::Error{Untranslated("ECDH failed")};
+        std::array<unsigned char, 32> key{};
+        std::copy(pt->begin() + 1, pt->end(), key.begin());
+        return key;
+    }
+
     std::vector<PricoinMatchCandidate> offerFindMatches(const std::string& my_order_id) override {
         std::vector<PricoinMatchCandidate> out;
         auto oid = ParseOid(my_order_id);

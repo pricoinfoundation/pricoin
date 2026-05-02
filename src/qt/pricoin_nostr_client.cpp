@@ -4,6 +4,7 @@
 
 #include <qt/pricoin_nostr_client.h>
 
+#include <qt/pricoin_nip04.h>
 #include <qt/walletmodel.h>
 
 #include <crypto/sha256.h>
@@ -198,15 +199,33 @@ void PricoinNostrClient::onDisconnected()
 
 void PricoinNostrClient::sendSubscription(QWebSocket* sock)
 {
-    // ["REQ", "<subid>", {"kinds":[30030], "limit":256}]
-    QJsonObject filter;
-    filter.insert("kinds", QJsonArray{kOfferKind});
-    filter.insert("limit", 256);
+    // Two filters: kind=30030 for orderbook (no per-recipient
+    // narrowing — anyone may broadcast offers we want to see), and
+    // kind=4 NIP-04 DMs narrowed to events tagged for our xonly.
+    // Sent as a single REQ with multiple filter clauses (NIP-01: a
+    // REQ accepts an array of filters, OR-combined).
+    QJsonObject filter_offers;
+    filter_offers.insert("kinds", QJsonArray{kOfferKind});
+    filter_offers.insert("limit", 256);
 
     QJsonArray req;
     req.append(QStringLiteral("REQ"));
     req.append(m_subid);
-    req.append(filter);
+    req.append(filter_offers);
+
+    // DM filter — only attempt if the wallet's xonly is available.
+    if (m_model) {
+        const std::string xonly = m_model->wallet().getSwapIdentityXOnlyHex();
+        if (!xonly.empty()) {
+            QJsonObject filter_dms;
+            filter_dms.insert("kinds", QJsonArray{kDmKind});
+            QJsonArray p_tag;
+            p_tag.append(QString::fromStdString(xonly));
+            filter_dms.insert("#p", p_tag);
+            filter_dms.insert("limit", 256);
+            req.append(filter_dms);
+        }
+    }
 
     const QString frame = QString::fromUtf8(
         QJsonDocument(req).toJson(QJsonDocument::Compact));
@@ -280,6 +299,80 @@ bool PricoinNostrClient::publishOfferUri(const QString& uri,
     return sent > 0;
 }
 
+bool PricoinNostrClient::publishDirectMessage(const QString& peer_xonly_hex,
+                                                const QString& plaintext)
+{
+    if (!m_model) return false;
+    const std::string xonly = m_model->wallet().getSwapIdentityXOnlyHex();
+    if (xonly.empty()) {
+        Q_EMIT log(tr("Cannot publish DM: swap-identity unavailable (wallet locked?)"));
+        return false;
+    }
+    auto key_or = m_model->wallet().nip04SharedKey(peer_xonly_hex.toStdString());
+    if (!key_or) {
+        Q_EMIT log(tr("Cannot derive NIP-04 key for peer %1: %2")
+            .arg(peer_xonly_hex.left(12) + "…")
+            .arg(QString::fromStdString(util::ErrorString(key_or).original)));
+        return false;
+    }
+    auto content_or = pricoin::nip04::Encrypt(*key_or, plaintext);
+    if (!content_or) {
+        Q_EMIT log(tr("NIP-04 encrypt failed"));
+        return false;
+    }
+
+    const QString my_pubkey_hex = QString::fromStdString(xonly);
+    const qint64 created_at = QDateTime::currentSecsSinceEpoch();
+
+    QList<QStringList> tags;
+    tags.append({QStringLiteral("p"), peer_xonly_hex});
+
+    const QByteArray canon =
+        CanonicalSerialize(kDmKind, my_pubkey_hex, created_at, tags, *content_or);
+    const uint256 id = Sha256(canon);
+    const QString id_hex = QString::fromStdString(id.GetHex());
+
+    auto sig_or = m_model->wallet().signNostrEvent(id);
+    if (!sig_or) {
+        Q_EMIT log(tr("Cannot sign DM: %1")
+            .arg(QString::fromStdString(util::ErrorString(sig_or).original)));
+        return false;
+    }
+
+    QJsonObject ev;
+    ev.insert("id",         id_hex);
+    ev.insert("pubkey",     my_pubkey_hex);
+    ev.insert("created_at", static_cast<double>(created_at));
+    ev.insert("kind",       kDmKind);
+    QJsonArray tags_json;
+    for (const auto& t : tags) {
+        QJsonArray a;
+        for (const auto& v : t) a.append(v);
+        tags_json.append(a);
+    }
+    ev.insert("tags",       tags_json);
+    ev.insert("content",    *content_or);
+    ev.insert("sig",        QString::fromStdString(*sig_or));
+
+    QJsonArray msg;
+    msg.append(QStringLiteral("EVENT"));
+    msg.append(ev);
+    const QString frame = QString::fromUtf8(
+        QJsonDocument(msg).toJson(QJsonDocument::Compact));
+
+    int sent = 0;
+    for (auto it = m_socket_by_url.constBegin();
+         it != m_socket_by_url.constEnd(); ++it) {
+        QWebSocket* sock = it.value();
+        if (sock->state() != QAbstractSocket::ConnectedState) continue;
+        sock->sendTextMessage(frame);
+        ++sent;
+    }
+    Q_EMIT log(tr("Published DM to %1 → %2 relay(s).")
+        .arg(peer_xonly_hex.left(12) + "…").arg(sent));
+    return sent > 0;
+}
+
 bool PricoinNostrClient::verifyEvent(const QString& pubkey_hex,
                                       const QString& id_hex,
                                       const QString& sig_hex,
@@ -315,7 +408,7 @@ void PricoinNostrClient::onTextMessage(const QString& message)
         if (arr.size() < 3 || !arr[2].isObject()) return;
         const QJsonObject ev = arr[2].toObject();
         const int kind = ev.value("kind").toInt();
-        if (kind != kOfferKind) return;
+        if (kind != kOfferKind && kind != kDmKind) return;
 
         const QString id_hex     = ev.value("id").toString();
         const QString pubkey_hex = ev.value("pubkey").toString();
@@ -338,7 +431,7 @@ void PricoinNostrClient::onTextMessage(const QString& message)
             tags.append(t);
         }
         const QByteArray canon = CanonicalSerialize(
-            kOfferKind, pubkey_hex, created_at, tags, content);
+            kind, pubkey_hex, created_at, tags, content);
 
         if (!verifyEvent(pubkey_hex, id_hex, sig_hex, QString::fromUtf8(canon))) {
             Q_EMIT log(tr("Rejected event %1: signature/id mismatch")
@@ -347,7 +440,25 @@ void PricoinNostrClient::onTextMessage(const QString& message)
         }
 
         m_seen_event_ids.insert(id_hex);
-        Q_EMIT offerReceived(content);
+        if (kind == kOfferKind) {
+            Q_EMIT offerReceived(content);
+        } else {
+            // kind=4 NIP-04 DM. Decrypt with the wallet's NIP-04
+            // shared key for the sender. If the relay was loose
+            // about #p filtering and delivered a DM not for us,
+            // decryption will fail (different ECDH key) and we
+            // silently drop.
+            if (!m_model) return;
+            auto key_or = m_model->wallet().nip04SharedKey(pubkey_hex.toStdString());
+            if (!key_or) return;
+            auto pt_or = pricoin::nip04::Decrypt(*key_or, content);
+            if (!pt_or) {
+                Q_EMIT log(tr("DM from %1: decrypt failed (not for us, or malformed)")
+                    .arg(pubkey_hex.left(12) + "…"));
+                return;
+            }
+            Q_EMIT directMessageReceived(pubkey_hex, *pt_or);
+        }
     } else if (tag == QStringLiteral("EOSE") || tag == QStringLiteral("OK") ||
                tag == QStringLiteral("NOTICE") || tag == QStringLiteral("CLOSED") ||
                tag == QStringLiteral("AUTH")) {

@@ -5,12 +5,15 @@
 #include <qt/pricoin_pric_coopsign_dialog.h>
 
 #include <interfaces/node.h>
+#include <qt/pricoin_nostr_client.h>
+#include <qt/pricoin_relay_settings_dialog.h>
 #include <qt/walletmodel.h>
 #include <random.h>
 #include <univalue.h>
 #include <util/strencodings.h>
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
 #include <QDialogButtonBox>
@@ -77,10 +80,12 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
                                         QWidget* parent)
     : QDialog(parent),
       m_wm(wallet_model),
-      m_mode(mode)
+      m_mode(mode),
+      m_swap_id(QString::fromStdString(swap_id))
 {
     setModal(true);
-    resize(880, 900);
+    resize(880, 960);
+    m_relay_urls = PricoinRelaySettingsDialog::loadFromSettings();
     buildLayout(title);
 
     // Pre-fill from the swap record where we can: adaptor materials
@@ -89,6 +94,11 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
     if (!swap_id.empty() && m_wm) {
         auto snap = m_wm->wallet().adaptorSwapGet(swap_id);
         if (snap) {
+            if (!snap->counterparty_pubkey_hex.empty()
+                && snap->counterparty_pubkey_hex.size() >= 66) {
+                m_peer_xonly = QString::fromStdString(
+                    snap->counterparty_pubkey_hex.substr(2));
+            }
             if (m_mode == Mode::PricAdaptor) {
                 if (m_in_T_G && !snap->adaptor_T_G_hex.empty()) {
                     m_in_T_G->setText(QString::fromStdString(snap->adaptor_T_G_hex));
@@ -296,6 +306,155 @@ void PricCoopSignDialog::onRunBuildtx()
     setStatus(tr("Buildtx OK. msg / ring_ml / pi / z_self auto-filled. Send `z_other_for_peer` + ring + pi + msg + joint_pubkey to peer."));
 }
 
+// ─── Nostr DM transport ──────────────────────────────────────────
+
+void PricCoopSignDialog::updateNostrStatus()
+{
+    if (!m_lbl_nostr_status) return;
+    if (!m_nostr) {
+        m_lbl_nostr_status->setText(tr("DM relay: disconnected. Peer xonly: %1")
+            .arg(m_peer_xonly.isEmpty()
+                ? tr("(unknown — set by ctor swap_id)")
+                : m_peer_xonly.left(16) + "…"));
+        if (m_btn_send_dm_round1) m_btn_send_dm_round1->setEnabled(false);
+        if (m_btn_send_dm_round3) m_btn_send_dm_round3->setEnabled(false);
+        if (m_btn_nostr_connect) m_btn_nostr_connect->setText(tr("Connect Nostr DM"));
+        return;
+    }
+    m_lbl_nostr_status->setText(
+        tr("DM relay: %1/%2 connected. Peer xonly: %3")
+            .arg(m_relay_connected_count)
+            .arg(m_relay_urls.size())
+            .arg(m_peer_xonly.isEmpty() ? tr("(unknown)") : m_peer_xonly.left(16) + "…"));
+    const bool can_send = (m_relay_connected_count > 0 && !m_peer_xonly.isEmpty());
+    if (m_btn_send_dm_round1) m_btn_send_dm_round1->setEnabled(
+        can_send && !m_my_commitment.isEmpty());
+    if (m_btn_send_dm_round3) m_btn_send_dm_round3->setEnabled(
+        can_send && !m_my_s_share.isEmpty());
+    if (m_btn_nostr_connect) m_btn_nostr_connect->setText(tr("Disconnect Nostr DM"));
+}
+
+void PricCoopSignDialog::onNostrConnectClicked()
+{
+    if (m_nostr) {
+        m_nostr->disconnectAll();
+        delete m_nostr;
+        m_nostr = nullptr;
+        m_relay_connected_count = 0;
+        updateNostrStatus();
+        return;
+    }
+    if (m_relay_urls.isEmpty()) {
+        setStatus(tr("No Nostr relays configured. Use Orderbook → Relay settings… first."), true);
+        return;
+    }
+    if (m_peer_xonly.isEmpty()) {
+        setStatus(tr("Peer xonly unknown — DM destination cannot be determined."), true);
+        return;
+    }
+    m_nostr = new PricoinNostrClient(m_wm, m_relay_urls, this);
+    connect(m_nostr, &PricoinNostrClient::log,
+            this, &PricCoopSignDialog::onNostrLog);
+    connect(m_nostr, &PricoinNostrClient::relayStatusChanged,
+            this, &PricCoopSignDialog::onNostrRelayStatus);
+    connect(m_nostr, &PricoinNostrClient::directMessageReceived,
+            this, &PricCoopSignDialog::onDmReceived);
+    m_nostr->connectAll();
+    updateNostrStatus();
+}
+
+void PricCoopSignDialog::onNostrRelayStatus(const QString& url, bool connected)
+{
+    Q_UNUSED(url);
+    if (connected) ++m_relay_connected_count;
+    else --m_relay_connected_count;
+    if (m_relay_connected_count < 0) m_relay_connected_count = 0;
+    updateNostrStatus();
+}
+
+void PricCoopSignDialog::onNostrLog(const QString& msg)
+{
+    setStatus(msg);
+}
+
+void PricCoopSignDialog::onSendDmRound1()
+{
+    if (!m_nostr || m_my_commitment.isEmpty() || m_peer_xonly.isEmpty()) return;
+    // The "share" envelope is the same JSON the peer will paste into
+    // m_in_peer_share_json on their side (the keys mirror the
+    // round1 RPC output, minus alpha).
+    UniValue share{UniValue::VOBJ};
+    share.pushKV("L_share",  m_my_L_share.toStdString());
+    share.pushKV("R_share",  m_my_R_share.toStdString());
+    share.pushKV("KI_share", m_my_KI_share.toStdString());
+    if (!m_my_D_share.isEmpty()) {
+        share.pushKV("D_share", m_my_D_share.toStdString());
+    }
+    if (!m_my_dleq_alpha.isEmpty()) {
+        share.pushKV("dleq_alpha", m_my_dleq_alpha.toStdString());
+    }
+    if (!m_my_dleq_x.isEmpty()) {
+        share.pushKV("dleq_x", m_my_dleq_x.toStdString());
+    }
+    share.pushKV("commitment", m_my_commitment.toStdString());
+
+    UniValue env{UniValue::VOBJ};
+    env.pushKV("v",        1);
+    env.pushKV("leg",      m_mode == Mode::PricAdaptor ? "pric_claim_adaptor"
+                                                        : "pric_refund");
+    env.pushKV("swap_id",  m_swap_id.toStdString());
+    env.pushKV("round",    1);
+    env.pushKV("share",    share);
+    const QString plaintext = QString::fromStdString(env.write(0));
+    if (m_nostr->publishDirectMessage(m_peer_xonly, plaintext)) {
+        setStatus(tr("Round-1 share DM sent."));
+    }
+}
+
+void PricCoopSignDialog::onSendDmRound3()
+{
+    if (!m_nostr || m_my_s_share.isEmpty() || m_peer_xonly.isEmpty()) return;
+    UniValue env{UniValue::VOBJ};
+    env.pushKV("v",        1);
+    env.pushKV("leg",      m_mode == Mode::PricAdaptor ? "pric_claim_adaptor"
+                                                        : "pric_refund");
+    env.pushKV("swap_id",  m_swap_id.toStdString());
+    env.pushKV("round",    3);
+    env.pushKV("s_share",  m_my_s_share.toStdString());
+    const QString plaintext = QString::fromStdString(env.write(0));
+    if (m_nostr->publishDirectMessage(m_peer_xonly, plaintext)) {
+        setStatus(tr("Round-3 s_share DM sent."));
+    }
+}
+
+void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
+                                       const QString& plaintext)
+{
+    if (!m_peer_xonly.isEmpty() && from_xonly_hex != m_peer_xonly) return;
+    UniValue env;
+    if (!env.read(plaintext.toStdString()) || !env.isObject()) return;
+    if (env.exists("swap_id")
+        && env["swap_id"].get_str() != m_swap_id.toStdString()
+        && !m_swap_id.isEmpty()) {
+        return;
+    }
+    if (!m_chk_auto_paste || !m_chk_auto_paste->isChecked()) {
+        setStatus(tr("Peer DM received (auto-paste disabled — use Paste buttons)."));
+        return;
+    }
+    if (!env.exists("round")) return;
+    const int round = env["round"].getInt<int>();
+    if (round == 1 && env.exists("share") && m_in_peer_share_json) {
+        m_in_peer_share_json->setPlainText(
+            QString::fromStdString(env["share"].write(2)));
+        setStatus(tr("Peer share auto-pasted from DM. Run step 2."));
+    } else if (round == 3 && env.exists("s_share") && m_in_peer_s_share) {
+        m_in_peer_s_share->setText(
+            QString::fromStdString(env["s_share"].get_str()));
+        setStatus(tr("Peer s_share auto-pasted from DM. Run step 4."));
+    }
+}
+
 QString PricCoopSignDialog::RandomHex32()
 {
     unsigned char buf[32];
@@ -352,6 +511,24 @@ void PricCoopSignDialog::buildLayout(const QString& title)
     const bool adaptor = (m_mode == Mode::PricAdaptor);
 
     auto* outer = new QVBoxLayout(this);
+
+    // ─── Nostr DM section (optional auto-delivery) ────────────
+    {
+        auto* box = new QGroupBox(tr("Nostr DM (optional — auto-deliver share/s_share to peer)"), this);
+        box->setStyleSheet(QStringLiteral("QGroupBox { font-weight: bold; }"));
+        auto* h = new QHBoxLayout(box);
+        m_btn_nostr_connect = new QPushButton(tr("Connect Nostr DM"), box);
+        h->addWidget(m_btn_nostr_connect);
+        m_chk_auto_paste = new QCheckBox(tr("Auto-paste from peer DMs"), box);
+        m_chk_auto_paste->setChecked(true);
+        h->addWidget(m_chk_auto_paste);
+        m_lbl_nostr_status = new QLabel(box);
+        m_lbl_nostr_status->setWordWrap(true);
+        h->addWidget(m_lbl_nostr_status, /*stretch=*/1);
+        outer->addWidget(box);
+        connect(m_btn_nostr_connect, &QPushButton::clicked, this, &PricCoopSignDialog::onNostrConnectClicked);
+        updateNostrStatus();
+    }
 
     auto* hdr = new QLabel(this);
     hdr->setWordWrap(true);
@@ -571,8 +748,12 @@ void PricCoopSignDialog::buildLayout(const QString& title)
         layout->addWidget(new QLabel(tr("Output (send to peer; alpha is omitted/secret):"), box));
         layout->addWidget(m_out_step1);
         layout->addLayout(MakeCopyPasteRow(m_out_step1));
+        m_btn_send_dm_round1 = new QPushButton(tr("Send share via Nostr DM"), box);
+        m_btn_send_dm_round1->setEnabled(false);
+        layout->addWidget(m_btn_send_dm_round1);
         steps_v->addWidget(box);
-        connect(m_btn_step1, &QPushButton::clicked, this, &PricCoopSignDialog::onStep1Compute);
+        connect(m_btn_step1,          &QPushButton::clicked, this, &PricCoopSignDialog::onStep1Compute);
+        connect(m_btn_send_dm_round1, &QPushButton::clicked, this, &PricCoopSignDialog::onSendDmRound1);
     }
 
     // ─── Step 2: Combine ───────────────────────────────────────
@@ -632,8 +813,12 @@ void PricCoopSignDialog::buildLayout(const QString& title)
         layout->addWidget(new QLabel(tr("Output (send `s_share` to peer):"), box));
         layout->addWidget(m_out_step3);
         layout->addLayout(MakeCopyPasteRow(m_out_step3));
+        m_btn_send_dm_round3 = new QPushButton(tr("Send s_share via Nostr DM"), box);
+        m_btn_send_dm_round3->setEnabled(false);
+        layout->addWidget(m_btn_send_dm_round3);
         steps_v->addWidget(box);
-        connect(m_btn_step3, &QPushButton::clicked, this, &PricCoopSignDialog::onStep3Compute);
+        connect(m_btn_step3,          &QPushButton::clicked, this, &PricCoopSignDialog::onStep3Compute);
+        connect(m_btn_send_dm_round3, &QPushButton::clicked, this, &PricCoopSignDialog::onSendDmRound3);
     }
 
     // ─── Step 4: Assemble ──────────────────────────────────────
@@ -780,6 +965,7 @@ void PricCoopSignDialog::onStep1Compute()
         m_out_step1->setPlainText(QString::fromStdString(share_for_peer.write(2)));
     }
     setStatus(tr("Step 1 OK. alpha kept locally; share JSON ready for peer."));
+    updateNostrStatus();
 }
 
 void PricCoopSignDialog::onStep2Compute()
@@ -950,6 +1136,7 @@ void PricCoopSignDialog::onStep3Compute()
     m_my_s_share = QString::fromStdString(v["s_share"].get_str());
     m_out_step3->setPlainText(m_my_s_share);
     setStatus(tr("Step 3 OK. Send `s_share` to peer."));
+    updateNostrStatus();
 }
 
 void PricCoopSignDialog::onStep4Compute()

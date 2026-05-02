@@ -10,9 +10,11 @@
 #include <cstdint>
 #include <string>
 
+class PricoinNostrClient;
 class WalletModel;
 
 QT_BEGIN_NAMESPACE
+class QCheckBox;
 class QComboBox;
 class QLabel;
 class QLineEdit;
@@ -97,6 +99,12 @@ private Q_SLOTS:
     void onStep3Compute();
     void onStep4Compute();
     void onComputeSighash();
+    void onNostrConnectClicked();
+    void onSendDmRound2();
+    void onSendDmRound3();
+    void onDmReceived(const QString& from_xonly_hex, const QString& plaintext);
+    void onNostrLog(const QString& msg);
+    void onNostrRelayStatus(const QString& url, bool connected);
 
     void onCopyButton();
     void onPasteButton();
@@ -159,8 +167,22 @@ private:
 
     QLabel* m_status_label{nullptr};
 
+    // ─── Nostr DM transport ───
+    QString             m_swap_id;
+    QString             m_peer_xonly;
+    QStringList         m_relay_urls;
+    PricoinNostrClient* m_nostr{nullptr};
+    int                 m_relay_connected_count{0};
+
+    QPushButton*    m_btn_nostr_connect{nullptr};
+    QLabel*         m_lbl_nostr_status{nullptr};
+    QCheckBox*      m_chk_auto_paste{nullptr};
+    QPushButton*    m_btn_send_dm_round2{nullptr};
+    QPushButton*    m_btn_send_dm_round3{nullptr};
+
     void buildLayout(const QString& title);
     void setStatus(const QString& msg, bool error = false);
+    void updateNostrStatus();
 
     // RPC dispatch helper. Returns the parsed UniValue result on
     // success; on RPC error, surfaces a message via setStatus and

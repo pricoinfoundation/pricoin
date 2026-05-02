@@ -17,6 +17,7 @@
 #include <util/result.h>
 #include <util/ui_change_type.h>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -347,6 +348,16 @@ public:
     //! using the wallet's swap-identity priv. Returns hex on success
     //! or an error string. Used to sign Nostr `id` digests.
     virtual util::Result<std::string> signNostrEvent(const uint256& event_id_hash) = 0;
+
+    //! Pricoin: NIP-04 shared AES key for a peer xonly pubkey.
+    //!
+    //! Returns the 32-byte X-coordinate of
+    //! ECDH(my_swap_priv_normalized, lift(peer_xonly, even-y)) —
+    //! exactly the key NIP-04 uses for AES-256-CBC. The interop
+    //! convention is to lift xonly with parity 0x02 (even-y) and
+    //! normalize the priv via BIP340's even-y rule.
+    virtual util::Result<std::array<unsigned char, 32>>
+        nip04SharedKey(const std::string& peer_xonly_hex) = 0;
 
     // Get a new address.
     virtual util::Result<CTxDestination> getNewDestination(OutputType type, const std::string& label) = 0;
