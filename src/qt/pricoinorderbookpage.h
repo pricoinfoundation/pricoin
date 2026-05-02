@@ -20,6 +20,7 @@ class QTableView;
 class QStandardItemModel;
 class QPushButton;
 class QLabel;
+class QTimer;
 QT_END_NAMESPACE
 
 // Phase-6 orderbook UI (Tier 1).
@@ -64,9 +65,11 @@ private Q_SLOTS:
     void onSelectionChanged();
     void onPublishClicked();
     void onConnectRelaysClicked();
+    void onRelaySettingsClicked();
     void onNostrOfferReceived(const QString& uri);
     void onNostrLog(const QString& msg);
     void onNostrRelayStatus(const QString& url, bool connected);
+    void onAutoRefreshTick();
 
 private:
     WalletModel* m_model{nullptr};
@@ -84,11 +87,15 @@ private:
     QPushButton* m_btn_unmatch{nullptr};
     QPushButton* m_btn_publish{nullptr};
     QPushButton* m_btn_connect_relays{nullptr};
+    QPushButton* m_btn_relay_settings{nullptr};
     QLabel*      m_status_label{nullptr};
     QLabel*      m_relay_status_label{nullptr};
+    QTimer*      m_auto_refresh_timer{nullptr};
 
     PricoinNostrClient* m_nostr{nullptr};
     int                 m_connected_relay_count{0};
+
+    void rebuildNostrClient();
 
     // Cached snapshots indexed parallel to table rows so we can map
     // a selected row back to the underlying order_id without

@@ -5,6 +5,7 @@
 #include <qt/pricoinorderbookpage.h>
 
 #include <qt/pricoin_nostr_client.h>
+#include <qt/pricoin_relay_settings_dialog.h>
 #include <qt/walletmodel.h>
 #include <util/translation.h>
 
@@ -23,9 +24,12 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSpinBox>
+#include <QBrush>
+#include <QColor>
 #include <QStandardItemModel>
 #include <QTableView>
 #include <QTextEdit>
+#include <QTimer>
 #include <QVBoxLayout>
 
 namespace {
@@ -45,10 +49,21 @@ QString FormatExpiry(int64_t unix_sec) {
 }
 
 QString StatusBadge(const std::string& s) {
-    // Title-case status; the table view doesn't yet color-code.
     QString q = QString::fromStdString(s);
     if (!q.isEmpty()) q[0] = q[0].toUpper();
     return q;
+}
+
+// Picks a foreground color for a status cell. Tuned for both light
+// and dark terminal-ish themes — bright accents that read on
+// either backdrop.
+QColor StatusColor(const std::string& s) {
+    if (s == "active")    return QColor(0x1b, 0x5e, 0x20); // green
+    if (s == "matched")   return QColor(0xe6, 0x91, 0x38); // amber
+    if (s == "filled")    return QColor(0x14, 0x4f, 0xc9); // blue
+    if (s == "cancelled") return QColor(0x70, 0x70, 0x70); // grey
+    if (s == "expired")   return QColor(0x7f, 0x00, 0x00); // dark red
+    return QColor(Qt::black);
 }
 
 // Modal "Create offer" dialog. Returns the create params on accept.
@@ -187,11 +202,22 @@ void PricoinOrderbookPage::buildLayout()
     // Relay status row.
     auto* relay_row = new QHBoxLayout();
     m_btn_connect_relays = new QPushButton(tr("Connect relays"), this);
+    m_btn_relay_settings = new QPushButton(tr("Relay settings…"), this);
     m_relay_status_label = new QLabel(tr("Relays: not connected"), this);
     m_relay_status_label->setWordWrap(true);
     relay_row->addWidget(m_btn_connect_relays);
+    relay_row->addWidget(m_btn_relay_settings);
     relay_row->addWidget(m_relay_status_label, /*stretch=*/1);
     outer->addLayout(relay_row);
+
+    // Auto-refresh: the table re-loads from the wallet every 5s so
+    // expiry sweeps and external state changes (e.g., from CLI) show
+    // up without the user clicking Refresh. Nostr-imported orders
+    // already trigger an immediate refresh via offerReceived; this
+    // timer is the safety net for everything else.
+    m_auto_refresh_timer = new QTimer(this);
+    m_auto_refresh_timer->setInterval(5000);
+    connect(m_auto_refresh_timer, &QTimer::timeout, this, &PricoinOrderbookPage::onAutoRefreshTick);
 
     connect(m_btn_create,       &QPushButton::clicked, this, &PricoinOrderbookPage::onCreateClicked);
     connect(m_btn_import,       &QPushButton::clicked, this, &PricoinOrderbookPage::onImportClicked);
@@ -203,6 +229,7 @@ void PricoinOrderbookPage::buildLayout()
     connect(m_btn_unmatch,      &QPushButton::clicked, this, &PricoinOrderbookPage::onUnmatchClicked);
     connect(m_btn_publish,         &QPushButton::clicked, this, &PricoinOrderbookPage::onPublishClicked);
     connect(m_btn_connect_relays,  &QPushButton::clicked, this, &PricoinOrderbookPage::onConnectRelaysClicked);
+    connect(m_btn_relay_settings,  &QPushButton::clicked, this, &PricoinOrderbookPage::onRelaySettingsClicked);
 
     if (auto* sm = m_table->selectionModel()) {
         connect(sm, &QItemSelectionModel::selectionChanged,
@@ -220,6 +247,9 @@ void PricoinOrderbookPage::setModel(WalletModel* model)
                 this, &PricoinOrderbookPage::onSelectionChanged);
     }
     refreshTable();
+    if (m_model && m_auto_refresh_timer && !m_auto_refresh_timer->isActive()) {
+        m_auto_refresh_timer->start();
+    }
 }
 
 void PricoinOrderbookPage::refreshTable()
@@ -247,7 +277,12 @@ void PricoinOrderbookPage::refreshTable()
         m_table_model->setItem(static_cast<int>(i), col++, new QStandardItem(FormatSat(o.max_pric_amount_sat)));
         m_table_model->setItem(static_cast<int>(i), col++, new QStandardItem(FormatSat(o.foreign_amount_at_max_sat)));
         m_table_model->setItem(static_cast<int>(i), col++, new QStandardItem(rate));
-        m_table_model->setItem(static_cast<int>(i), col++, new QStandardItem(StatusBadge(o.status)));
+        auto* status_item = new QStandardItem(StatusBadge(o.status));
+        status_item->setForeground(QBrush(StatusColor(o.status)));
+        QFont f = status_item->font();
+        f.setBold(true);
+        status_item->setFont(f);
+        m_table_model->setItem(static_cast<int>(i), col++, status_item);
         m_table_model->setItem(static_cast<int>(i), col++, new QStandardItem(FormatSat(o.pric_remaining_sat)));
         m_table_model->setItem(static_cast<int>(i), col++, new QStandardItem(FormatSat(o.pric_in_flight_sat)));
         m_table_model->setItem(static_cast<int>(i), col++, new QStandardItem(FormatExpiry(o.expiry_unix_sec)));
@@ -331,26 +366,54 @@ void PricoinOrderbookPage::onPublishClicked()
     }
 }
 
+void PricoinOrderbookPage::rebuildNostrClient()
+{
+    if (m_nostr) {
+        m_nostr->disconnectAll();
+        m_nostr->deleteLater();
+        m_nostr = nullptr;
+        m_connected_relay_count = 0;
+    }
+    if (!m_model) return;
+    const QStringList relays = PricoinRelaySettingsDialog::loadFromSettings();
+    if (relays.isEmpty()) return;
+    m_nostr = new PricoinNostrClient(m_model, relays, this);
+    connect(m_nostr, &PricoinNostrClient::offerReceived,
+            this, &PricoinOrderbookPage::onNostrOfferReceived);
+    connect(m_nostr, &PricoinNostrClient::log,
+            this, &PricoinOrderbookPage::onNostrLog);
+    connect(m_nostr, &PricoinNostrClient::relayStatusChanged,
+            this, &PricoinOrderbookPage::onNostrRelayStatus);
+}
+
 void PricoinOrderbookPage::onConnectRelaysClicked()
 {
     if (!m_model) return;
+    rebuildNostrClient();
     if (!m_nostr) {
-        // Default relay list. Replace via QSettings or a config dialog
-        // in a follow-up commit.
-        QStringList relays;
-        relays << "wss://relay.damus.io"
-               << "wss://nos.lol"
-               << "wss://relay.snort.social";
-        m_nostr = new PricoinNostrClient(m_model, relays, this);
-        connect(m_nostr, &PricoinNostrClient::offerReceived,
-                this, &PricoinOrderbookPage::onNostrOfferReceived);
-        connect(m_nostr, &PricoinNostrClient::log,
-                this, &PricoinOrderbookPage::onNostrLog);
-        connect(m_nostr, &PricoinNostrClient::relayStatusChanged,
-                this, &PricoinOrderbookPage::onNostrRelayStatus);
+        setStatus(tr("No relays configured. Open Relay settings to add some."), true);
+        return;
     }
     m_nostr->connectAll();
     setStatus(tr("Connecting to %1 relays…").arg(m_nostr->relayUrls().size()));
+}
+
+void PricoinOrderbookPage::onRelaySettingsClicked()
+{
+    PricoinRelaySettingsDialog dlg(this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    PricoinRelaySettingsDialog::saveToSettings(dlg.relays());
+    setStatus(tr("Relay list saved. Reconnecting…"));
+    rebuildNostrClient();
+    if (m_nostr) m_nostr->connectAll();
+}
+
+void PricoinOrderbookPage::onAutoRefreshTick()
+{
+    // Bail out if there's a pending in-place edit etc.; otherwise
+    // re-pull. This is a bounded operation (single wallet RPC).
+    if (!m_model) return;
+    refreshTable();
 }
 
 void PricoinOrderbookPage::onNostrOfferReceived(const QString& uri)

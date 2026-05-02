@@ -192,6 +192,8 @@ if(ENABLE_WALLET)
       recentrequeststablemodel.h
       pricoin_nostr_client.cpp
       pricoin_nostr_client.h
+      pricoin_relay_settings_dialog.cpp
+      pricoin_relay_settings_dialog.h
       pricoinorderbookpage.cpp
       pricoinorderbookpage.h
       sendcoinsdialog.cpp
