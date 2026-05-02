@@ -38,6 +38,7 @@
 #include <swap/btc_musig2_adaptor.h>
 #include <swap/btc_musig2_runtime.h>
 #include <swap/btc_refund_tx.h>
+#include <crypto/hmac_sha256.h>
 #include <wallet/pricoin_adaptor_swap.h>
 #include <wallet/pricoin_btc_musig2_nonce_records.h>
 #include <wallet/pricoin_chain_watcher.h>
@@ -6533,6 +6534,213 @@ RPCMethod pricoin_swapwatch_broadcast_foreign()
     };
 }
 
+RPCMethod pricoin_swapwatch_adapt_btc_claim()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_adapt_btc_claim",
+        "Adapt the BTC claim adaptor pre-signature with a known scalar t,\n"
+        "build + finalize the BTC claim tx, broadcast it via the foreign-\n"
+        "chain backend, and register a swapwatch entry that auto-advances\n"
+        "the swap to Complete when the tx confirms.\n"
+        "\n"
+        "All the BTC-side state (pre-sig, parity, funding outpoint, agg\n"
+        "key, recipient) is read from the swap record. The caller supplies\n"
+        "`t_hex` — typically extracted from the counterparty's on-chain\n"
+        "PRIC claim tx via pricoin_jointspend_adaptor_extract, or\n"
+        "obtained directly if this wallet is the t holder.\n"
+        "\n"
+        "The swap must be in PreSigned or PricClaimed state with\n"
+        "btc_claim_presig populated. Returns {txid, sig, watch_kind,\n"
+        "watch_registered}.\n",
+        {
+            {"swap_id",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"t_hex",              RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte adaptor secret t — must satisfy t·G == swap.adaptor.T_G"},
+            {"refund_amount_sat",  RPCArg::Type::NUM,     RPCArg::Default{0},
+                "Output amount; if 0 defaults to (foreign_amount_sat - 1000) for fees."},
+            {"min_confirmations",  RPCArg::Type::NUM,     RPCArg::Default{1}, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "txid", "Broadcast txid"},
+                {RPCResult::Type::STR_HEX, "sig",  "64-byte BIP340 sig produced by Adapt"},
+                {RPCResult::Type::STR,     "watch_kind", "Always foreign_claim"},
+                {RPCResult::Type::BOOL,    "watch_registered", "True iff the watch entry was stored"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_adapt_btc_claim",
+            "<swap_id> <t_hex>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            const uint256 sid = ParseChainWatchSwapId(request.params[0]);
+            const std::string t_hex = request.params[1].get_str();
+            const int64_t  refund_arg = request.params[2].isNull() ? 0
+                : request.params[2].getInt<int64_t>();
+            const int32_t min_conf = request.params[3].isNull() ? 1
+                : request.params[3].getInt<int32_t>();
+
+            // ─── Load swap + sanity gates ────────────────────────
+            ::wallet::pricoin_adaptor_swap::AdaptorSwap snap;
+            if (::wallet::pricoin_adaptor_swap::Get(wallet, sid, snap)
+                != ::wallet::pricoin_adaptor_swap::LookupResult::Ok) {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "swap not found");
+            }
+            if (snap.state != ::wallet::pricoin_adaptor_swap::State::PreSigned
+                && snap.state != ::wallet::pricoin_adaptor_swap::State::PricClaimed) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "swap state must be PreSigned or PricClaimed for BTC adapt+claim");
+            }
+            if (snap.presigs.btc_claim_presig.size() != 64) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "btc_claim_presig missing or wrong size — set_pre_signed not run?");
+            }
+            if (snap.foreign_funding_txid.empty() || snap.foreign_funding_vout < 0) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "foreign funding outpoint not set on swap record");
+            }
+            if (snap.btc_bob_recipient_xonly_hex.size() != 64
+                || !IsHex(snap.btc_bob_recipient_xonly_hex)) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "btc_bob_recipient_xonly not set on swap record (BTC claim recipient)");
+            }
+
+            // ─── Parse t and validate length ─────────────────────
+            auto t_bytes = TryParseHex<unsigned char>(t_hex);
+            if (!t_bytes || t_bytes->size() != 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "t_hex must be 32-byte hex");
+            }
+            bma::Scalar t;
+            std::copy(t_bytes->begin(), t_bytes->end(), t.begin());
+
+            // ─── Compute agg_xonly = MuSig2 keyagg(alice_pub, bob_pub) ───
+            // Order is role-determined: [alice_pub, bob_pub]. My
+            // wallet's swap-identity priv signs the BIP340 events,
+            // so I know my role; the counterparty pub fills the other.
+            const std::string my_xonly = [&]() {
+                CKey priv;
+                const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+                if (!id.spend.IsValid()) return std::string{};
+                constexpr const char* kTag = "pricoin/swap/identity-v1";
+                for (uint8_t counter = 0; counter < 16; ++counter) {
+                    CHMAC_SHA256 hmac(UCharCast(id.spend.data()), 32);
+                    hmac.Write(reinterpret_cast<const unsigned char*>(kTag), std::strlen(kTag));
+                    hmac.Write(&counter, 1);
+                    unsigned char raw[32];
+                    hmac.Finalize(raw);
+                    priv.Set(raw, raw + 32, true);
+                    if (priv.IsValid()) {
+                        XOnlyPubKey xo(priv.GetPubKey());
+                        return HexStr(xo);
+                    }
+                }
+                return std::string{};
+            }();
+            if (my_xonly.size() != 64) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "swap-identity unavailable");
+            }
+            const std::string peer_compressed = HexStr(snap.counterparty_pub);
+            const std::string my_compressed = std::string("02") + my_xonly;
+            // Build [alice_pub, bob_pub] in role-order (Alice first).
+            const bool i_am_alice =
+                (snap.role == ::wallet::pricoin_adaptor_swap::Role::Alice);
+            const std::string alice_pub_hex = i_am_alice ? my_compressed : peer_compressed;
+            const std::string bob_pub_hex   = i_am_alice ? peer_compressed : my_compressed;
+
+            std::vector<CPubKey> pubs;
+            for (const auto& h : {alice_pub_hex, bob_pub_hex}) {
+                auto bytes = TryParseHex<unsigned char>(h);
+                if (!bytes || bytes->size() != 33) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        "internal: pubkey not 33-byte compressed");
+                }
+                pubs.emplace_back(std::span<const unsigned char>(bytes->data(), 33));
+            }
+            bma::KeyAggCache cache;
+            auto agg = bma::AggregatePubkeys(pubs, cache);
+            if (!agg) throw JSONRPCError(RPC_INTERNAL_ERROR, "MuSig2 keyagg failed");
+
+            // ─── Build the BTC claim tx skeleton ─────────────────
+            brt::BtcRefundTxParams p;
+            auto txid_opt = uint256::FromHex(snap.foreign_funding_txid);
+            if (!txid_opt) throw JSONRPCError(RPC_INTERNAL_ERROR,
+                "foreign_funding_txid not parseable");
+            p.funding_txid = *txid_opt;
+            p.funding_vout = static_cast<uint32_t>(snap.foreign_funding_vout);
+            p.funding_amount_sat = snap.foreign_amount_sat;
+            std::copy(agg->begin(), agg->end(), p.agg_xonly.begin());
+            // Recipient SPK = OP_1 OP_PUSHBYTES_32 <32-byte xonly>.
+            const auto rcpt_bytes = ParseHex(snap.btc_bob_recipient_xonly_hex);
+            p.recipient_script_pubkey = {0x51, 0x20};
+            p.recipient_script_pubkey.insert(p.recipient_script_pubkey.end(),
+                rcpt_bytes.begin(), rcpt_bytes.end());
+            // Default fee carve-out: 1000 sat.
+            constexpr int64_t kDefaultBtcFee = 1000;
+            p.refund_amount_sat = (refund_arg > 0)
+                ? refund_arg
+                : (snap.foreign_amount_sat - kDefaultBtcFee);
+            if (p.refund_amount_sat <= 0) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "refund_amount_sat must be positive (set explicitly if funding < default fee)");
+            }
+            p.nlocktime = 0;  // claim — no timelock
+
+            auto built = brt::Build(p);
+            if (!built) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "btc_refund_tx::Build rejected params");
+
+            // ─── Adapt presig with t → 64-byte BIP340 sig ────────
+            bma::SignatureBytes presig;
+            std::copy(snap.presigs.btc_claim_presig.begin(),
+                       snap.presigs.btc_claim_presig.end(), presig.begin());
+            auto final_sig = bma::Adapt(presig, t,
+                snap.presigs.btc_claim_nonce_parity);
+            if (!final_sig) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "Adapt failed — check t·G == T_G and parity");
+
+            // ─── Finalize witness + serialize ────────────────────
+            auto finalized = brt::Finalize(*built,
+                std::span<const unsigned char>{final_sig->data(), final_sig->size()});
+            if (!finalized) throw JSONRPCError(RPC_INTERNAL_ERROR,
+                "Finalize failed");
+            DataStream ds;
+            ds << TX_WITH_WITNESS(*finalized);
+            const std::string tx_hex_finalized = HexStr(
+                std::span<const unsigned char>{UCharCast(ds.data()), ds.size()});
+
+            // ─── Broadcast via foreign client ────────────────────
+            auto client = pcw::MakeForeignClientFromRegistry(snap.foreign_chain);
+            if (!client) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "no foreign-chain backend registered for chain '" + snap.foreign_chain + "'");
+            }
+            std::string broadcast_txid;
+            try {
+                broadcast_txid = client->Broadcast(tx_hex_finalized);
+            } catch (const std::exception& e) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                    std::string("foreign broadcast failed: ") + e.what());
+            }
+
+            // ─── Register watch ──────────────────────────────────
+            pcw::WatchEntry e;
+            e.swap_id = sid;
+            e.kind    = pcw::WatchKind::ForeignClaim;
+            e.txid_hex = broadcast_txid;
+            e.min_confirmations = min_conf;
+            const auto r = pcw::Add(wallet, e);
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("txid",             broadcast_txid);
+            out.pushKV("sig",              HexStr(*final_sig));
+            out.pushKV("watch_kind",       "foreign_claim");
+            out.pushKV("watch_registered", r == pcw::StoreResult::Ok);
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_swapwatch_broadcast_pric()
 {
     return RPCMethod{
@@ -6808,6 +7016,7 @@ RPCMethod pricoin_swapwatch_tick_once_export()          { return pricoin_swapwat
 RPCMethod pricoin_swapwatch_notify_export()             { return pricoin_swapwatch_notify(); }
 RPCMethod pricoin_swapwatch_broadcast_foreign_export()  { return pricoin_swapwatch_broadcast_foreign(); }
 RPCMethod pricoin_swapwatch_broadcast_pric_export()     { return pricoin_swapwatch_broadcast_pric(); }
+RPCMethod pricoin_swapwatch_adapt_btc_claim_export()    { return pricoin_swapwatch_adapt_btc_claim(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

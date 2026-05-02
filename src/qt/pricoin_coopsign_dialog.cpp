@@ -215,6 +215,7 @@ void CoopSignDialog::onComputeSighash()
     UniValue v;
     v.read(r.json);
     const QString sighash = QString::fromStdString(v["sighash"].get_str());
+    m_unsigned_tx_hex = QString::fromStdString(v["tx_hex"].get_str());
     if (m_in_msg) m_in_msg->setText(sighash);
     setStatus(tr("Sighash auto-filled (%1…). Proceed to step 2.").arg(sighash.left(16)));
 }
@@ -496,6 +497,19 @@ void CoopSignDialog::buildLayout(const QString& title)
         form->addRow(tr("Final output:"), m_out_step4);
         form->addRow(QString(), MakeCopyPasteRow(m_out_step4, box));
 
+        // Broadcast convenience — BtcPlain (refund) mode only. The
+        // adaptor variant produces a pre-sig that needs to be
+        // adapted with t before broadcast, which happens outside
+        // this dialog.
+        if (m_mode == Mode::BtcPlain) {
+            m_btn_broadcast = new QPushButton(
+                tr("Broadcast refund + watch + announce"), box);
+            m_btn_broadcast->setEnabled(false);
+            form->addRow(QString(), m_btn_broadcast);
+            connect(m_btn_broadcast, &QPushButton::clicked, this,
+                     &CoopSignDialog::onBroadcastClicked);
+        }
+
         steps_v->addWidget(box);
         connect(m_btn_step4, &QPushButton::clicked, this, &CoopSignDialog::onStep4Compute);
     }
@@ -706,6 +720,12 @@ void CoopSignDialog::onStep4Compute()
     setStatus(tr("Step 4 OK. Final %1 produced.")
         .arg(m_mode == Mode::BtcAdaptor ? tr("adaptor pre-signature")
                                          : tr("BIP340 signature")));
+    // Enable the refund-broadcast button now that we have the
+    // final sig + a saved unsigned tx_hex from sighash compute.
+    if (m_btn_broadcast) {
+        m_btn_broadcast->setEnabled(
+            !m_final_sig_hex.isEmpty() && !m_unsigned_tx_hex.isEmpty());
+    }
 }
 
 // ─── Nostr DM transport ──────────────────────────────────────────
@@ -821,6 +841,61 @@ void CoopSignDialog::onSendDmRound3()
     if (m_nostr->publishDirectMessage(m_peer_xonly, plaintext)) {
         setStatus(tr("Round-2 partial DM sent."));
     }
+}
+
+void CoopSignDialog::onBroadcastClicked()
+{
+    if (m_mode != Mode::BtcPlain) return;  // claim path adapts elsewhere
+    if (m_final_sig_hex.isEmpty() || m_unsigned_tx_hex.isEmpty()) {
+        setStatus(tr("Need step 4 final sig + sighash-compute output first."), true);
+        return;
+    }
+    if (m_swap_id.isEmpty()) {
+        setStatus(tr("No swap_id — open this dialog from the Swaps page."), true);
+        return;
+    }
+
+    // Step 1: pricoin_btc_swap_tx_finalize(tx_hex, sig64) → broadcastable hex.
+    {
+        UniValue p{UniValue::VARR};
+        p.push_back(m_unsigned_tx_hex.toStdString());
+        p.push_back(m_final_sig_hex.toStdString());
+        auto r = callRpc("pricoin_btc_swap_tx_finalize", p.write(0));
+        if (!r.ok) {
+            setStatus(tr("Finalize failed: %1").arg(QString::fromStdString(r.error_msg)), true);
+            return;
+        }
+        UniValue v;
+        v.read(r.json);
+        m_unsigned_tx_hex = QString::fromStdString(v["tx_hex"].get_str());
+    }
+
+    // Step 2: pricoin_swapwatch_broadcast_foreign(swap_id, foreign_refund, tx_hex, 1).
+    QString broadcast_txid;
+    {
+        UniValue p{UniValue::VARR};
+        p.push_back(m_swap_id.toStdString());
+        p.push_back("foreign_refund");
+        p.push_back(m_unsigned_tx_hex.toStdString());
+        p.push_back(1);  // min_confirmations
+        auto r = callRpc("pricoin_swapwatch_broadcast_foreign", p.write(0));
+        if (!r.ok) {
+            setStatus(tr("Broadcast failed: %1").arg(QString::fromStdString(r.error_msg)), true);
+            return;
+        }
+        UniValue v;
+        v.read(r.json);
+        broadcast_txid = QString::fromStdString(v["txid"].get_str());
+    }
+
+    // Step 3: announce to peer via Nostr (best effort).
+    if (m_nostr && m_relay_connected_count > 0 && !m_peer_xonly.isEmpty()) {
+        m_nostr->publishBroadcastAnnouncement(
+            m_peer_xonly, m_swap_id, "foreign_refund",
+            broadcast_txid, /*vout=*/-1, /*min_conf=*/1);
+    }
+    setStatus(tr("Broadcast OK — txid %1… (announced to peer if connected).")
+        .arg(broadcast_txid.left(16)));
 }
 
 void CoopSignDialog::onDmReceived(const QString& from_xonly_hex,

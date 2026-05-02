@@ -286,6 +286,7 @@ void PricCoopSignDialog::onRunBuildtx()
     const std::string z_other    = v["z_other"].get_str();
     const int         pi         = v["pi"].getInt<int>();
     const std::string ring_ml    = v["ring_ml"].write(0);
+    m_unsigned_tx_hex = QString::fromStdString(v["tx_hex"].get_str());
     if (m_in_msg) m_in_msg->setText(QString::fromStdString(sighash));
     if (m_in_pi)  m_in_pi->setText(QString::number(pi));
     if (m_in_ring_or_ring_ml && m_mode == Mode::PricPlain) {
@@ -848,6 +849,19 @@ void PricCoopSignDialog::buildLayout(const QString& title)
         layout->addWidget(new QLabel(tr("Final blob:"), box));
         layout->addWidget(m_out_step4);
         layout->addLayout(MakeCopyPasteRow(m_out_step4));
+
+        // Broadcast convenience: PricPlain (refund) only — the
+        // adaptor variant produces a pre-sig that needs to be
+        // adapted with t before it's broadcastable.
+        if (m_mode == Mode::PricPlain) {
+            m_btn_broadcast = new QPushButton(
+                tr("Broadcast refund + watch + announce"), box);
+            m_btn_broadcast->setEnabled(false);
+            layout->addWidget(m_btn_broadcast);
+            connect(m_btn_broadcast, &QPushButton::clicked, this,
+                     &PricCoopSignDialog::onBroadcastClicked);
+        }
+
         steps_v->addWidget(box);
         connect(m_btn_step4, &QPushButton::clicked, this, &PricCoopSignDialog::onStep4Compute);
     }
@@ -1235,4 +1249,47 @@ void PricCoopSignDialog::onStep4Compute()
         m_out_step4->setPlainText(QString::fromStdString(out.write(2)));
         setStatus(tr("Step 4 OK. Final CLSAG signature blob produced."));
     }
+    if (m_btn_broadcast) {
+        m_btn_broadcast->setEnabled(
+            !m_final_blob_hex.isEmpty() && !m_unsigned_tx_hex.isEmpty());
+    }
+}
+
+void PricCoopSignDialog::onBroadcastClicked()
+{
+    if (m_mode != Mode::PricPlain) return;
+    if (m_final_blob_hex.isEmpty() || m_unsigned_tx_hex.isEmpty()) {
+        setStatus(tr("Need step 4 final blob + buildtx output first."), true);
+        return;
+    }
+    if (m_swap_id.isEmpty()) {
+        setStatus(tr("No swap_id — open this dialog from the Swaps page."), true);
+        return;
+    }
+
+    // pricoin_swapwatch_broadcast_pric(swap_id, pric_refund, tx_hex, sig_hex, vout=-1, min_conf=1).
+    UniValue p{UniValue::VARR};
+    p.push_back(m_swap_id.toStdString());
+    p.push_back("pric_refund");
+    p.push_back(m_unsigned_tx_hex.toStdString());
+    p.push_back(m_final_blob_hex.toStdString());
+    p.push_back(-1);
+    p.push_back(1);
+    auto r = callRpc("pricoin_swapwatch_broadcast_pric", p.write(0));
+    if (!r.ok) {
+        setStatus(tr("Broadcast failed: %1").arg(QString::fromStdString(r.error_msg)), true);
+        return;
+    }
+    UniValue v;
+    v.read(r.json);
+    const QString broadcast_txid = QString::fromStdString(v["txid"].get_str());
+
+    // Announce to peer via Nostr (best effort).
+    if (m_nostr && m_relay_connected_count > 0 && !m_peer_xonly.isEmpty()) {
+        m_nostr->publishBroadcastAnnouncement(
+            m_peer_xonly, m_swap_id, "pric_refund",
+            broadcast_txid, /*vout=*/-1, /*min_conf=*/1);
+    }
+    setStatus(tr("Broadcast OK — txid %1… (announced to peer if connected).")
+        .arg(broadcast_txid.left(16)));
 }

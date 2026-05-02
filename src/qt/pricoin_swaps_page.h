@@ -59,6 +59,7 @@ private Q_SLOTS:
     void onSwapwatchAddClicked();
     void onSwapwatchRemoveClicked();
     void onSwapwatchRefresh();
+    void onAdaptBtcClaimClicked();
 
 private:
     WalletModel* m_model{nullptr};
@@ -82,6 +83,7 @@ private:
     QPushButton*        m_btn_sw_add{nullptr};
     QPushButton*        m_btn_sw_remove{nullptr};
     QPushButton*        m_btn_sw_refresh{nullptr};
+    QPushButton*        m_btn_adapt_btc_claim{nullptr};
     QTableView*         m_sw_table{nullptr};
     QStandardItemModel* m_sw_table_model{nullptr};
 

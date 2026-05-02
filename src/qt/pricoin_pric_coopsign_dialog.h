@@ -85,6 +85,7 @@ private Q_SLOTS:
     void onNostrConnectClicked();
     void onSendDmRound1();
     void onSendDmRound3();
+    void onBroadcastClicked();
     void onDmReceived(const QString& from_xonly_hex, const QString& plaintext);
     void onNostrLog(const QString& msg);
     void onNostrRelayStatus(const QString& url, bool connected);
@@ -112,6 +113,8 @@ private:
     QString m_s_others_json;            // JSON array of hex strings
     QString m_my_s_share;
     QString m_final_blob_hex;
+    QString m_unsigned_tx_hex;  // saved from buildtx for the
+                                 // refund-broadcast convenience path
 
     // Inputs that persist for cross-step recall.
     QString m_x_share, m_z_share;
@@ -185,6 +188,8 @@ private:
     QLineEdit*      m_in_peer_s_share{nullptr};
     QPushButton*    m_btn_step4{nullptr};
     QPlainTextEdit* m_out_step4{nullptr};
+    // Refund convenience: PricPlain mode only.
+    QPushButton*    m_btn_broadcast{nullptr};
 
     QLabel*         m_status_label{nullptr};
 

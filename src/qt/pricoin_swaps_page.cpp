@@ -162,8 +162,11 @@ void PricoinSwapsPage::buildLayout()
     auto* sw_bot = new QHBoxLayout();
     m_btn_sw_add    = new QPushButton(tr("Add watch…"),    sw_box);
     m_btn_sw_remove = new QPushButton(tr("Remove watch"),  sw_box);
+    m_btn_adapt_btc_claim = new QPushButton(
+        tr("Adapt + broadcast BTC claim…"), sw_box);
     sw_bot->addWidget(m_btn_sw_add);
     sw_bot->addWidget(m_btn_sw_remove);
+    sw_bot->addWidget(m_btn_adapt_btc_claim);
     sw_bot->addStretch();
     sw_outer->addLayout(sw_bot);
     outer->addWidget(sw_box);
@@ -178,6 +181,7 @@ void PricoinSwapsPage::buildLayout()
     connect(m_btn_sw_refresh, &QPushButton::clicked, this, &PricoinSwapsPage::onSwapwatchRefresh);
     connect(m_btn_sw_add,     &QPushButton::clicked, this, &PricoinSwapsPage::onSwapwatchAddClicked);
     connect(m_btn_sw_remove,  &QPushButton::clicked, this, &PricoinSwapsPage::onSwapwatchRemoveClicked);
+    connect(m_btn_adapt_btc_claim, &QPushButton::clicked, this, &PricoinSwapsPage::onAdaptBtcClaimClicked);
 
     if (auto* sm = m_table->selectionModel()) {
         connect(sm, &QItemSelectionModel::selectionChanged,
@@ -929,6 +933,44 @@ std::string PricoinSwapsPage::selectedSwapwatchKind() const
     auto* item = m_sw_table_model->item(sel.first().row(), 0);
     if (!item) return {};
     return item->data(Qt::UserRole + 2).toString().toStdString();
+}
+
+void PricoinSwapsPage::onAdaptBtcClaimClicked()
+{
+    if (!m_model) return;
+    const std::string sid = selectedSwapId();
+    if (sid.empty()) {
+        setStatus(tr("Select a swap row first."), true);
+        return;
+    }
+    bool ok = false;
+    const QString t_hex = QInputDialog::getText(
+        this, tr("Adapt + broadcast BTC claim"),
+        tr("32-byte adaptor secret t (hex). Extract via "
+            "pricoin_jointspend_adaptor_extract from the counterparty's "
+            "on-chain PRIC claim tx, or paste your own t_secret if you "
+            "are the t holder."),
+        QLineEdit::Password, QString(), &ok);
+    if (!ok || t_hex.size() != 64) {
+        if (ok) setStatus(tr("t must be 32-byte hex (64 chars)."), true);
+        return;
+    }
+    UniValue p{UniValue::VARR};
+    p.push_back(sid);
+    p.push_back(t_hex.toStdString());
+    p.push_back(0);  // refund_amount_sat — let the RPC default to (funding - 1000)
+    p.push_back(1);  // min_confirmations
+    std::string err;
+    auto r = CallWalletRpc(m_model, "pricoin_swapwatch_adapt_btc_claim", p, &err);
+    if (!r) {
+        setStatus(tr("Adapt+broadcast failed: %1").arg(QString::fromStdString(err)), true);
+        return;
+    }
+    const QString txid = QString::fromStdString((*r)["txid"].get_str());
+    setStatus(tr("BTC claim broadcast — txid %1… (watching for confirmations).")
+        .arg(txid.left(16)));
+    refreshTable();
+    onSwapwatchRefresh();
 }
 
 void PricoinSwapsPage::onSwapwatchRemoveClicked()

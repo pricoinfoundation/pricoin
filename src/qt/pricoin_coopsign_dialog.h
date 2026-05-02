@@ -102,6 +102,7 @@ private Q_SLOTS:
     void onNostrConnectClicked();
     void onSendDmRound2();
     void onSendDmRound3();
+    void onBroadcastClicked();
     void onDmReceived(const QString& from_xonly_hex, const QString& plaintext);
     void onNostrLog(const QString& msg);
     void onNostrRelayStatus(const QString& url, bool connected);
@@ -119,6 +120,8 @@ private:
     int     m_nonce_parity{-1};
     QString m_my_partial;         // 32-byte hex
     QString m_final_sig_hex;      // 64-byte hex (or pre-sig)
+    QString m_unsigned_tx_hex;    // saved from swap_tx_build for the
+                                   // refund-broadcast convenience path
 
     // Inputs that persist across steps for cross-step recall.
     QString m_my_pub;
@@ -161,6 +164,11 @@ private:
     QPlainTextEdit* m_in_peer_partial{nullptr};
     QPushButton*    m_btn_step4{nullptr};
     QPlainTextEdit* m_out_step4{nullptr};
+    // Refund convenience: BtcPlain mode only — finalize tx via
+    // pricoin_btc_swap_tx_finalize, broadcast via
+    // pricoin_swapwatch_broadcast_foreign (kind=foreign_refund),
+    // and announce to the peer via Nostr DM if connected.
+    QPushButton*    m_btn_broadcast{nullptr};
 
     QLabel* m_status_label{nullptr};
 
