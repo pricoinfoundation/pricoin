@@ -87,6 +87,10 @@ public:
 
     // True if at least one relay is currently connected.
     bool anyConnected() const;
+    // Count of currently-connected relays (0..relayUrls().size()).
+    // Useful for cooperative-sign dialogs that hook into a shared
+    // client that may already be connected.
+    int connectedCount() const;
 
     QStringList relayUrls() const { return m_relay_urls; }
 

@@ -359,6 +359,24 @@ public:
     virtual util::Result<std::array<unsigned char, 32>>
         nip04SharedKey(const std::string& peer_xonly_hex) = 0;
 
+    //! Pricoin: compute the one-time pubkey P_pi for a stealth
+    //! output given the recipient's stealth address + the sender's
+    //! ephemeral priv + the output index. P_pi = h_s·G + B, where
+    //! h_s = SHA256(\"pricoin/stealth/secret-v1\" || (eph·A) || idx)
+    //! and (A, B) come from decoding the stealth address.
+    //!
+    //! Used by the Bob T_H auto-derive helper to obtain P_pi
+    //! without manually entering it. The ephemeral priv can be
+    //! freshly generated (toy scope; the same ephemeral must be
+    //! used by walletsendct when funding to keep the on-chain
+    //! P_pi consistent with the adaptor materials).
+    //!
+    //! Returns the 33-byte compressed P_pi as hex.
+    virtual util::Result<std::string> computeStealthOneTimePubkey(
+        const std::string& stealth_address,
+        const std::string& ephemeral_priv_hex,
+        int32_t output_index) = 0;
+
     // Get a new address.
     virtual util::Result<CTxDestination> getNewDestination(OutputType type, const std::string& label) = 0;
 

@@ -4,9 +4,14 @@
 
 #include <qt/pricoin_swaps_page.h>
 
+#include <interfaces/node.h>
 #include <qt/pricoin_coopsign_dialog.h>
 #include <qt/pricoin_pric_coopsign_dialog.h>
 #include <qt/walletmodel.h>
+#include <random.h>
+#include <support/cleanse.h>
+#include <univalue.h>
+#include <util/strencodings.h>
 #include <util/translation.h>
 
 #include <QBrush>
@@ -328,6 +333,119 @@ void PricoinSwapsPage::onAdvanceClicked()
         t_secret->setPlaceholderText(tr("32-byte hex if Bob, empty if Alice"));
         form->addRow(tr("t_secret:"), t_secret);
         form->addRow(QString(), t_secret_label);
+
+        // Bob-only auto-derive helper: generates a fresh ephemeral
+        // r + a fresh t, computes P_pi from the snapshot's joint
+        // stealth address, then T_G + T_H + DLEQ proof in one shot.
+        // The chosen ephemeral pubkey R = r·G is surfaced so the
+        // user can wire it into the eventual walletsendct funding
+        // call (toy scope — the funding RPC currently doesn't accept
+        // a pinned ephemeral; if it picks a different one, the
+        // on-chain P_pi will diverge from the adaptor's binding and
+        // the swap will fail at sig time. Track in the swap notes.)
+        // Hidden for Alice (she receives these from Bob — paste).
+        QLineEdit* eph_edit = nullptr;
+        QLineEdit* p_pi_edit = nullptr;
+        if (snap.role == "bob") {
+            // The ephemeral PRIV r is surfaced (not the pub R) —
+            // the user needs r to reuse the same ephemeral when
+            // funding via walletsendct so the on-chain P_pi
+            // matches the adaptor binding. Keep this row safe by
+            // making it read-only after generation.
+            eph_edit = AddTextRow(form,
+                tr("Ephemeral priv r (record for funding):"), &dlg);
+            eph_edit->setReadOnly(true);
+            eph_edit->setEchoMode(QLineEdit::Password);
+            p_pi_edit = AddTextRow(form,
+                tr("Computed P_pi (read-only):"), &dlg);
+            p_pi_edit->setReadOnly(true);
+            auto* derive_btn = new QPushButton(
+                tr("Generate r + t → derive P_pi / T_G / T_H / DLEQ"), &dlg);
+            form->addRow(QString(), derive_btn);
+            QObject::connect(derive_btn, &QPushButton::clicked, &dlg,
+                [this, &dlg, T_G, T_H, dleq, t_secret, eph_edit, p_pi_edit, sid, snap]() {
+                const std::string joint_addr = snap.pric_joint_stealth_address;
+                if (joint_addr.empty()) {
+                    QMessageBox::warning(&dlg, tr("Auto-derive"),
+                        tr("Swap record has no joint stealth address."));
+                    return;
+                }
+                // Fresh ephemeral priv r — 32 random bytes.
+                unsigned char r_raw[32];
+                unsigned char t_raw[32];
+                GetStrongRandBytes(r_raw);
+                GetStrongRandBytes(t_raw);
+                const std::string r_hex = HexStr(std::span<const unsigned char>{r_raw, 32});
+                const std::string t_hex = HexStr(std::span<const unsigned char>{t_raw, 32});
+                memory_cleanse(r_raw, 32);
+                memory_cleanse(t_raw, 32);
+
+                // Compute P_pi from the joint stealth address +
+                // ephemeral. R = r·G is surfaced separately below
+                // for the user to wire into the funding step.
+                auto p_pi_or = m_model->wallet().computeStealthOneTimePubkey(
+                    joint_addr, r_hex, /*output_index=*/0);
+                if (!p_pi_or) {
+                    QMessageBox::warning(&dlg, tr("Auto-derive"),
+                        tr("computeStealthOneTimePubkey failed: %1")
+                            .arg(QString::fromStdString(util::ErrorString(p_pi_or).original)));
+                    return;
+                }
+                const std::string p_pi_hex = *p_pi_or;
+                p_pi_edit->setText(QString::fromStdString(p_pi_hex));
+
+                // pricoin_adaptor_compute_points(t, P_pi) for T_G/T_H.
+                UniValue p1{UniValue::VARR};
+                p1.push_back(t_hex);
+                p1.push_back(p_pi_hex);
+                UniValue r1;
+                try {
+                    r1 = m_model->node().executeRpc(
+                        "pricoin_adaptor_compute_points", p1, "");
+                } catch (const UniValue& e) {
+                    QMessageBox::warning(&dlg, tr("Auto-derive"),
+                        tr("compute_points failed: %1")
+                            .arg(QString::fromStdString(e.write())));
+                    return;
+                }
+                const std::string T_G_hex = r1["T_G"].get_str();
+                const std::string T_H_hex = r1["T_H"].get_str();
+
+                // pricoin_adaptor_dleq_prove(t, P_pi, T_G, T_H, label, payload).
+                // Use the swap_id as both binding label + payload.
+                UniValue p2{UniValue::VARR};
+                p2.push_back(t_hex);
+                p2.push_back(p_pi_hex);
+                p2.push_back(T_G_hex);
+                p2.push_back(T_H_hex);
+                p2.push_back(sid);
+                p2.push_back(sid);
+                UniValue r2;
+                try {
+                    r2 = m_model->node().executeRpc(
+                        "pricoin_adaptor_dleq_prove", p2, "");
+                } catch (const UniValue& e) {
+                    QMessageBox::warning(&dlg, tr("Auto-derive"),
+                        tr("dleq_prove failed: %1")
+                            .arg(QString::fromStdString(e.write())));
+                    return;
+                }
+                const std::string dleq_hex = r2["dleq"].get_str();
+
+                T_G->setText(QString::fromStdString(T_G_hex));
+                T_H->setText(QString::fromStdString(T_H_hex));
+                dleq->setPlainText(QString::fromStdString(dleq_hex));
+                t_secret->setText(QString::fromStdString(t_hex));
+                // Surface r in the ephemeral row (password-masked)
+                // so the user can copy it for the funding step.
+                // walletsendct currently picks its own ephemeral —
+                // pinning is TODO; for now the user must verify the
+                // on-chain P_pi after funding matches this one or
+                // re-run the adaptor setup with the funding's
+                // chosen ephemeral.
+                eph_edit->setText(QString::fromStdString(r_hex));
+            });
+        }
 
         // Refund timelocks (suggested defaults: arbitrary high values).
         auto* p_h = AddIntRow(form, tr("PRIC refund height:"),

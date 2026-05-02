@@ -738,6 +738,40 @@ public:
         return HexStr(sig);
     }
 
+    util::Result<std::string> computeStealthOneTimePubkey(
+        const std::string& stealth_address,
+        const std::string& ephemeral_priv_hex,
+        int32_t output_index) override
+    {
+        auto addr = ::pricoin::stealth::Decode(stealth_address);
+        if (!addr) {
+            return util::Error{Untranslated("could not decode stealth address")};
+        }
+        const auto eph_bytes = TryParseHex<unsigned char>(ephemeral_priv_hex);
+        if (!eph_bytes || eph_bytes->size() != 32) {
+            return util::Error{Untranslated("ephemeral priv must be 32-byte hex")};
+        }
+        CKey eph;
+        eph.Set(eph_bytes->begin(), eph_bytes->end(), /*compressed=*/true);
+        if (!eph.IsValid()) {
+            return util::Error{Untranslated("ephemeral priv invalid")};
+        }
+        if (output_index < 0) {
+            return util::Error{Untranslated("output_index must be >= 0")};
+        }
+        auto S = ::pricoin::stealth::ECDHPoint(eph, addr->view);
+        if (!S) {
+            return util::Error{Untranslated("ECDH on view pubkey failed")};
+        }
+        auto shared = ::pricoin::stealth::DeriveSharedSecret(
+            *S, static_cast<uint32_t>(output_index));
+        auto P_pi = ::pricoin::stealth::DeriveOneTimePubkey(shared, addr->spend);
+        if (!P_pi) {
+            return util::Error{Untranslated("DeriveOneTimePubkey failed")};
+        }
+        return HexStr(*P_pi);
+    }
+
     util::Result<std::array<unsigned char, 32>>
     nip04SharedKey(const std::string& peer_xonly_hex) override {
         CKey priv;

@@ -441,16 +441,19 @@ void PricoinOrderbookPage::onPublishClicked()
 
 void PricoinOrderbookPage::rebuildNostrClient()
 {
+    // The Nostr client is owned by WalletModel as a per-wallet
+    // singleton; both the orderbook page and the cooperative-sign
+    // dialogs share it. We don't own m_nostr — disconnect signals,
+    // ask the model to rebuild, then re-fetch + re-hook.
     if (m_nostr) {
-        m_nostr->disconnectAll();
-        m_nostr->deleteLater();
+        m_nostr->disconnect(this);
         m_nostr = nullptr;
         m_connected_relay_count = 0;
     }
     if (!m_model) return;
-    const QStringList relays = PricoinRelaySettingsDialog::loadFromSettings();
-    if (relays.isEmpty()) return;
-    m_nostr = new PricoinNostrClient(m_model, relays, this);
+    m_model->resetNostrClient();
+    m_nostr = m_model->getOrCreateNostrClient();
+    if (!m_nostr) return;
     connect(m_nostr, &PricoinNostrClient::offerReceived,
             this, &PricoinOrderbookPage::onNostrOfferReceived);
     connect(m_nostr, &PricoinNostrClient::log,
@@ -588,6 +591,14 @@ void PricoinOrderbookPage::onStartSwapClicked()
     // on Mode + role without another out-of-band exchange. Both
     // parties enter all four (the swap protocol requires both sides
     // to agree on these up front).
+    //
+    // Pre-fill the user's own PRIC stealth from their wallet — saves
+    // one paste. BTC P2TR address requires manual input (this wallet
+    // has no BTC keys; the user provides one from their BTC wallet).
+    const std::string my_stealth = m_model
+        ? m_model->wallet().getStealthAddress()
+        : "";
+
     auto* btc_alice_rcpt = new QLineEdit(&dlg);
     btc_alice_rcpt->setPlaceholderText(tr("32-byte x-only — Alice's BTC P2TR refund recipient"));
     form->addRow(tr("BTC refund (Alice's xonly):"), btc_alice_rcpt);
@@ -598,10 +609,16 @@ void PricoinOrderbookPage::onStartSwapClicked()
 
     auto* pric_alice_rcpt = new QLineEdit(&dlg);
     pric_alice_rcpt->setPlaceholderText(tr("Alice's PRIC stealth claim recipient"));
+    if (my_role == "alice" && !my_stealth.empty()) {
+        pric_alice_rcpt->setText(QString::fromStdString(my_stealth));
+    }
     form->addRow(tr("PRIC claim (Alice's stealth):"), pric_alice_rcpt);
 
     auto* pric_bob_rcpt = new QLineEdit(&dlg);
     pric_bob_rcpt->setPlaceholderText(tr("Bob's PRIC stealth refund recipient"));
+    if (my_role == "bob" && !my_stealth.empty()) {
+        pric_bob_rcpt->setText(QString::fromStdString(my_stealth));
+    }
     form->addRow(tr("PRIC refund (Bob's stealth):"), pric_bob_rcpt);
 
     auto* pric_lock = new QSpinBox(&dlg);

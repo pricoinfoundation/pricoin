@@ -23,6 +23,7 @@ class AddressTableModel;
 class ClientModel;
 class OptionsModel;
 class PlatformStyle;
+class PricoinNostrClient;
 class RecentRequestsTableModel;
 class SendCoinsRecipient;
 class TransactionTableModel;
@@ -139,6 +140,21 @@ public:
     ClientModel& clientModel() const { return *m_client_model; }
     void setClientModel(ClientModel* client_model);
 
+    // Pricoin: lazily-instantiated Nostr client owned by this
+    // wallet. Both the orderbook page (for kind=30030 offer
+    // events) and the cooperative-sign dialogs (for kind=4
+    // encrypted DMs) share this single client so we don't open
+    // separate WebSocket connections per surface.
+    //
+    // The client uses the relays saved by PricoinRelaySettingsDialog
+    // in QSettings. To rebuild after a relay-list change, call
+    // resetNostrClient().
+    PricoinNostrClient* getOrCreateNostrClient();
+    // Tear down + rebuild the shared client (e.g., after the user
+    // edits the relay list). The next getOrCreateNostrClient() call
+    // re-instantiates with the fresh relay set.
+    void resetNostrClient();
+
     QString getWalletName() const;
     QString getDisplayName() const;
 
@@ -157,6 +173,7 @@ public:
 
 private:
     std::unique_ptr<interfaces::Wallet> m_wallet;
+    PricoinNostrClient* m_nostr{nullptr};  // QObject-parented to this
     std::unique_ptr<interfaces::Handler> m_handler_unload;
     std::unique_ptr<interfaces::Handler> m_handler_status_changed;
     std::unique_ptr<interfaces::Handler> m_handler_address_book_changed;

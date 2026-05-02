@@ -708,9 +708,6 @@ void CoopSignDialog::onStep4Compute()
                                          : tr("BIP340 signature")));
 }
 
-void CoopSignDialog::onCopyButton() {}
-void CoopSignDialog::onPasteButton() {}
-
 // ─── Nostr DM transport ──────────────────────────────────────────
 
 void CoopSignDialog::updateNostrStatus()
@@ -742,29 +739,41 @@ void CoopSignDialog::updateNostrStatus()
 void CoopSignDialog::onNostrConnectClicked()
 {
     if (m_nostr) {
-        m_nostr->disconnectAll();
-        delete m_nostr;
+        // The client is owned by WalletModel and may be in use by
+        // the orderbook page or the other coopsign dialog — don't
+        // destroy it. Just unhook this dialog's signals.
+        m_nostr->disconnect(this);
         m_nostr = nullptr;
         m_relay_connected_count = 0;
         updateNostrStatus();
-        return;
-    }
-    if (m_relay_urls.isEmpty()) {
-        setStatus(tr("No Nostr relays configured. Use Orderbook → Relay settings… first."), true);
         return;
     }
     if (m_peer_xonly.isEmpty()) {
         setStatus(tr("Peer xonly unknown — DM destination cannot be determined."), true);
         return;
     }
-    m_nostr = new PricoinNostrClient(m_wm, m_relay_urls, this);
+    m_nostr = m_wm ? m_wm->getOrCreateNostrClient() : nullptr;
+    if (!m_nostr) {
+        setStatus(tr("No Nostr relays configured. Use Orderbook → Relay settings… first."), true);
+        return;
+    }
     connect(m_nostr, &PricoinNostrClient::log,
             this, &CoopSignDialog::onNostrLog);
     connect(m_nostr, &PricoinNostrClient::relayStatusChanged,
             this, &CoopSignDialog::onNostrRelayStatus);
     connect(m_nostr, &PricoinNostrClient::directMessageReceived,
             this, &CoopSignDialog::onDmReceived);
-    m_nostr->connectAll();
+    // If the shared client isn't connected yet, kick it off. If
+    // already connected (e.g., orderbook page hooked it earlier),
+    // existing connections persist; relayStatusChanged signals fire
+    // for any subsequent changes.
+    m_relay_urls = m_nostr->relayUrls();
+    if (m_nostr->connectedCount() == 0) {
+        m_nostr->connectAll();
+        m_relay_connected_count = 0;
+    } else {
+        m_relay_connected_count = m_nostr->connectedCount();
+    }
     updateNostrStatus();
 }
 

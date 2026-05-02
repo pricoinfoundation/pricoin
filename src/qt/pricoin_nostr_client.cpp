@@ -178,6 +178,16 @@ bool PricoinNostrClient::anyConnected() const
     return false;
 }
 
+int PricoinNostrClient::connectedCount() const
+{
+    int n = 0;
+    for (auto it = m_socket_by_url.constBegin();
+         it != m_socket_by_url.constEnd(); ++it) {
+        if (it.value()->state() == QAbstractSocket::ConnectedState) ++n;
+    }
+    return n;
+}
+
 void PricoinNostrClient::onConnected()
 {
     auto* sock = qobject_cast<QWebSocket*>(sender());

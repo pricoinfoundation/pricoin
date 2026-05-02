@@ -10,6 +10,8 @@
 #include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
 #include <qt/paymentserver.h>
+#include <qt/pricoin_nostr_client.h>
+#include <qt/pricoin_relay_settings_dialog.h>
 #include <qt/recentrequeststablemodel.h>
 #include <qt/sendcoinsdialog.h>
 #include <qt/transactiontablemodel.h>
@@ -57,6 +59,12 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
 
 WalletModel::~WalletModel()
 {
+    // Cleanly close any Nostr WebSocket connections before Qt
+    // tears down the parented PricoinNostrClient. Without this,
+    // sockets would close during destruction with a hard reset.
+    if (m_nostr) {
+        m_nostr->disconnectAll();
+    }
     unsubscribeFromCoreSignals();
 }
 
@@ -572,6 +580,23 @@ bool WalletModel::isWalletEnabled()
 QString WalletModel::getWalletName() const
 {
     return QString::fromStdString(m_wallet->getWalletName());
+}
+
+PricoinNostrClient* WalletModel::getOrCreateNostrClient()
+{
+    if (m_nostr) return m_nostr;
+    const QStringList relays = PricoinRelaySettingsDialog::loadFromSettings();
+    if (relays.isEmpty()) return nullptr;
+    m_nostr = new PricoinNostrClient(this, relays, this);
+    return m_nostr;
+}
+
+void WalletModel::resetNostrClient()
+{
+    if (!m_nostr) return;
+    m_nostr->disconnectAll();
+    m_nostr->deleteLater();
+    m_nostr = nullptr;
 }
 
 QString WalletModel::getDisplayName() const

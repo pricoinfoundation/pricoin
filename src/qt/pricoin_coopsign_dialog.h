@@ -106,9 +106,6 @@ private Q_SLOTS:
     void onNostrLog(const QString& msg);
     void onNostrRelayStatus(const QString& url, bool connected);
 
-    void onCopyButton();
-    void onPasteButton();
-
 private:
     WalletModel* m_wm{nullptr};
     Mode m_mode;

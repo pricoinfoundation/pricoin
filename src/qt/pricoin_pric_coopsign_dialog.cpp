@@ -337,29 +337,36 @@ void PricCoopSignDialog::updateNostrStatus()
 void PricCoopSignDialog::onNostrConnectClicked()
 {
     if (m_nostr) {
-        m_nostr->disconnectAll();
-        delete m_nostr;
+        // Shared client owned by WalletModel — only unhook this
+        // dialog's signals; don't tear it down.
+        m_nostr->disconnect(this);
         m_nostr = nullptr;
         m_relay_connected_count = 0;
         updateNostrStatus();
-        return;
-    }
-    if (m_relay_urls.isEmpty()) {
-        setStatus(tr("No Nostr relays configured. Use Orderbook → Relay settings… first."), true);
         return;
     }
     if (m_peer_xonly.isEmpty()) {
         setStatus(tr("Peer xonly unknown — DM destination cannot be determined."), true);
         return;
     }
-    m_nostr = new PricoinNostrClient(m_wm, m_relay_urls, this);
+    m_nostr = m_wm ? m_wm->getOrCreateNostrClient() : nullptr;
+    if (!m_nostr) {
+        setStatus(tr("No Nostr relays configured. Use Orderbook → Relay settings… first."), true);
+        return;
+    }
     connect(m_nostr, &PricoinNostrClient::log,
             this, &PricCoopSignDialog::onNostrLog);
     connect(m_nostr, &PricoinNostrClient::relayStatusChanged,
             this, &PricCoopSignDialog::onNostrRelayStatus);
     connect(m_nostr, &PricoinNostrClient::directMessageReceived,
             this, &PricCoopSignDialog::onDmReceived);
-    m_nostr->connectAll();
+    m_relay_urls = m_nostr->relayUrls();
+    if (m_nostr->connectedCount() == 0) {
+        m_nostr->connectAll();
+        m_relay_connected_count = 0;
+    } else {
+        m_relay_connected_count = m_nostr->connectedCount();
+    }
     updateNostrStatus();
 }
 
