@@ -337,8 +337,12 @@ std::optional<RewindResult> RewindRangeProof(
     return r;
 }
 
-void RunSelfTest()
+void RunSelfTest(const SelfTestProgressFn& progress)
 {
+    auto step = [&](const std::string& label) {
+        if (progress) progress(label);
+    };
+    step("CT round-trip");
     // 1. Create commitments for two inputs that fund a single output and a
     //    transparent fee. Test the full signer flow: pick blinds, balance
     //    them, commit, prove, verify, sum-check.
@@ -461,39 +465,48 @@ void RunSelfTest()
             parsed_tx.version, ::GetSerializeSize(TX_NO_WITNESS(parsed_tx)));
 
     // Phase 4a — exercise the CLSAG ring-signature primitives.
+    step("CLSAG single-layer");
     ::pricoin::ringsig::RunSelfTest();
     LogInfo("Pricoin ringsig (CLSAG single-layer) self-test passed");
 
     // Atomic-swap stage 2b — cooperative CLSAG signing (single-layer
     // and multi-layer flows both exercised).
+    step("Cooperative CLSAG (single + multi-layer)");
     ::pricoin::joint_ringsig::RunSelfTest();
     LogInfo("Pricoin joint_ringsig (cooperative CLSAG, single + multi-layer) self-test passed");
 
     // Atomic-swap phase 5 — adaptor-CLSAG (single-party + DLEQ).
+    step("Adaptor-CLSAG (single-party + DLEQ)");
     ::pricoin::adaptor_ringsig::RunSelfTest();
     LogInfo("Pricoin adaptor_ringsig (adaptor-CLSAG single-party + DLEQ) self-test passed");
 
     // Atomic-swap phase 5 — cooperative single-layer adaptor-CLSAG.
+    step("Cooperative adaptor-CLSAG (single-layer)");
     ::pricoin::adaptor_joint_ringsig::RunSelfTest();
     LogInfo("Pricoin adaptor_joint_ringsig (cooperative adaptor-CLSAG single-layer) self-test passed");
 
     // Atomic-swap phase 5 — cooperative multi-layer adaptor-CLSAG (v4 outputs).
+    step("Cooperative adaptor-CLSAG (multi-layer)");
     ::pricoin::adaptor_joint_ringsig::RunSelfTestML();
     LogInfo("Pricoin adaptor_joint_ringsig (cooperative adaptor-CLSAG multi-layer) self-test passed");
 
     // Atomic-swap phase 5 — joint-stealth proof-of-possession (rogue-key defense).
+    step("Joint stealth PoP (rogue-key defence)");
     ::pricoin::joint_stealth::RunPoPSelfTest();
     LogInfo("Pricoin joint_stealth PoP (rogue-key defense) self-test passed");
 
     // Atomic-swap phase 5 — BIP340 adaptor-Schnorr (foreign-chain leg).
+    step("BIP340 adaptor Schnorr");
     ::pricoin::swap::btc_adaptor_schnorr::RunSelfTest();
     LogInfo("Pricoin btc_adaptor_schnorr (single-party BIP340 adaptor) self-test passed");
 
     // Atomic-swap phase 5 — cooperative MuSig2 + adaptor (2-of-N foreign leg).
+    step("BTC MuSig2 + adaptor");
     ::pricoin::swap::btc_musig2_adaptor::RunSelfTest();
     LogInfo("Pricoin btc_musig2_adaptor (2-of-N MuSig2 + adaptor) self-test passed");
 
     // Atomic-swap phase 5 — cooperative-CLSAG nonce-reuse policy (§4.1a).
+    step("Nonce-reuse policy (CLSAG + BTC MuSig2)");
     ::pricoin::clsag_nonce_policy::RunSelfTest();
     LogInfo("Pricoin clsag_nonce_policy (§4.1a nonce-reuse defence) self-test passed");
 
@@ -504,12 +517,14 @@ void RunSelfTest()
     // Atomic-swap phase 5 — full cross-chain happy-path integration.
     // Walks Alice + Bob through one swap end-to-end (no chain) and
     // verifies the byte-equality of T_G + extract round-trips on both legs.
+    step("Atomic-swap E2E (cross-chain happy path)");
     ::pricoin::swap::atomic_swap_e2e_test::RunSelfTest();
     LogInfo("Pricoin atomic-swap E2E (cross-chain integration) self-test passed");
 
     // Atomic-swap phase 5 — refund-tx pre-signing (spec §6.2 step 7).
     // Validates timelock-constraint policy + non-adaptor cooperative
     // signing on both legs.
+    step("Refund timelock + cooperative refund sigs");
     ::pricoin::swap::refund::RunSelfTest();
     LogInfo("Pricoin swap refund (timelock policy + non-adaptor refund sigs) self-test passed");
 
@@ -517,6 +532,7 @@ void RunSelfTest()
     // Builds a real CTransaction, cooperatively signs the BIP341 sighash, attaches the
     // 64-byte sig as a P2TR key-path-spend witness, verifies the witness sig under the
     // aggregate XOnlyPubKey (= what bitcoind would do during script validation).
+    step("BTC refund-tx (BIP341 sighash + witness)");
     ::pricoin::swap::btc_refund_tx::RunSelfTest();
     LogInfo("Pricoin btc_refund_tx (BIP341 sighash + cooperative witness assembly) self-test passed");
 }

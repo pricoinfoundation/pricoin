@@ -11,6 +11,9 @@ qt_details_qttranslations_sha256_hash := c3c61d79c3d8fe316a20b3617c64673ce5b5519
 qt_details_qttools_file_name := qttools-$(qt_details_suffix)
 qt_details_qttools_sha256_hash := 02a4e219248b94f1333df843d25763f35251c1074cdc4fb5bda67d340f8c8b3a
 
+qt_details_qtwebsockets_file_name := qtwebsockets-$(qt_details_suffix)
+qt_details_qtwebsockets_sha256_hash := fc6310c1b12d6e22a31062727aa6574ed69239d036c8a4247b3b089902709b11
+
 qt_details_patches_path := $(PATCHES_PATH)/qt
 
 qt_details_top_download_path := https://raw.githubusercontent.com/qt/qt5/refs/heads/$(qt_details_version)

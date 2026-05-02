@@ -1501,8 +1501,18 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     // every startup while the integration is unstable. Cheap (~ms) and
     // catches any breakage in the secp256k1-zkp <-> wrapper interaction
     // before we touch user state.
+    //
+    // The progress callback surfaces stage names on the splash so the
+    // 2-5 second startup wait isn't an unexplained hang. (Bitcoin/Qt's
+    // CClientUIInterface::InitMessage already routes to the splash widget
+    // and the bitcoin-cli `-splash=*` flow.)
+    uiInterface.InitMessage(static_cast<std::string>(
+        _("Pricoin: running cryptographic self-tests…")));
     try {
-        pricoin::ct::RunSelfTest();
+        pricoin::ct::RunSelfTest([](const std::string& stage) {
+            uiInterface.InitMessage(strprintf(
+                _("Pricoin self-test: %s…"), stage).translated);
+        });
         LogInfo("Pricoin CT self-test passed");
     } catch (const std::exception& e) {
         return InitError(Untranslated(strprintf("Pricoin CT self-test failed: %s", e.what())));

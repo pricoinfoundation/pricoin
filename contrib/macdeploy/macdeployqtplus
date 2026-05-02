@@ -347,13 +347,23 @@ def deployPlugins(appBundleInfo: ApplicationBundleInfo, deploymentInfo: Deployme
     for dirpath, dirnames, filenames in os.walk(deploymentInfo.pluginPath):
         pluginDirectory = os.path.relpath(dirpath, deploymentInfo.pluginPath)
 
-        if pluginDirectory not in ['styles', 'platforms']:
+        # Pricoin: include the `tls` plugin directory so QSslSocket
+        # works at runtime (Nostr relays + future HTTPS surfaces use
+        # wss:// / https:// — without the TLS plugin Qt reports
+        # "SSL Sockets are not supported on this platform"). On
+        # macOS the candidate backends are libqsecuretransportbackend
+        # (Apple SecureTransport) and libqopensslbackend (if Qt was
+        # built linked to Homebrew openssl@3); ship whichever is
+        # present.
+        if pluginDirectory not in ['styles', 'platforms', 'tls']:
             continue
 
         for pluginName in filenames:
             pluginPath = os.path.join(pluginDirectory, pluginName)
 
-            if pluginName.split('.')[0] not in ['libqminimal', 'libqcocoa', 'libqmacstyle']:
+            allowed = ['libqminimal', 'libqcocoa', 'libqmacstyle',
+                        'libqsecuretransportbackend', 'libqopensslbackend']
+            if pluginName.split('.')[0] not in allowed:
                 continue
 
             plugins.append((pluginDirectory, pluginName))

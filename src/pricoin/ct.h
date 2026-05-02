@@ -9,8 +9,10 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace pricoin::ct {
@@ -86,7 +88,12 @@ std::optional<RewindResult> RewindRangeProof(
 // Throws std::runtime_error on failure. Used by the daemon at startup
 // while the wrapper is unstable; remove once the integration tests cover
 // the surface.
-void RunSelfTest();
+//
+// `progress` (optional) is fired at the start of each major sub-section
+// — used by init.cpp to surface stage names on the splash screen so the
+// 2-5 second startup wait isn't an unexplained hang.
+using SelfTestProgressFn = std::function<void(const std::string&)>;
+void RunSelfTest(const SelfTestProgressFn& progress = {});
 
 } // namespace pricoin::ct
 
