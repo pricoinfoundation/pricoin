@@ -6448,6 +6448,91 @@ RPCMethod pricoin_swapwatch_tick_once()
     };
 }
 
+RPCMethod pricoin_swapwatch_broadcast_foreign()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_broadcast_foreign",
+        "Submit a foreign-chain tx (BTC claim/refund) for relay AND register\n"
+        "a swapwatch entry for the resulting txid in one atomic call. The\n"
+        "watcher picks up the entry on its next tick and applies the matching\n"
+        "SetX transition once confirmations reach `min_confirmations`.\n"
+        "\n"
+        "`kind` should be one of `foreign_claim` (Bob's claim swept) or\n"
+        "`foreign_refund` (Alice's refund swept).\n"
+        "\n"
+        "Returns {txid, watch_kind} on success. If the broadcast succeeds but\n"
+        "the watch registration fails (e.g., wallet locked), the txid is\n"
+        "returned but the caller must add the watch manually.\n",
+        {
+            {"swap_id",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"kind",               RPCArg::Type::STR,     RPCArg::Optional::NO,
+                "foreign_claim | foreign_refund"},
+            {"tx_hex",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"min_confirmations",  RPCArg::Type::NUM,     RPCArg::Default{1}, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "txid", "Txid the backend accepted"},
+                {RPCResult::Type::STR,     "watch_kind", "Echo of the registered kind"},
+                {RPCResult::Type::BOOL,    "watch_registered", "True iff the watch entry was stored"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_broadcast_foreign",
+            "<swap_id> foreign_claim <hex> 1")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseChainWatchSwapId(request.params[0]);
+            const pcw::WatchKind k = ParseChainWatchKind(request.params[1]);
+            if (k != pcw::WatchKind::ForeignClaim && k != pcw::WatchKind::ForeignRefund) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "broadcast_foreign only supports foreign_claim or foreign_refund kinds");
+            }
+            const std::string tx_hex = request.params[2].get_str();
+            if (!IsHex(tx_hex) || tx_hex.empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "tx_hex must be non-empty hex");
+            }
+            const int32_t min_conf = request.params[3].isNull()
+                ? 1 : request.params[3].getInt<int32_t>();
+
+            // Look up the swap to get its foreign chain.
+            ::wallet::pricoin_adaptor_swap::AdaptorSwap s;
+            if (::wallet::pricoin_adaptor_swap::Get(*wallet_sp, sid, s)
+                != ::wallet::pricoin_adaptor_swap::LookupResult::Ok) {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "swap not found");
+            }
+            auto client = pcw::MakeForeignClientFromRegistry(s.foreign_chain);
+            if (!client) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "no foreign-chain backend registered for chain '" + s.foreign_chain + "'");
+            }
+            std::string txid;
+            try {
+                txid = client->Broadcast(tx_hex);
+            } catch (const std::exception& e) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                    std::string("foreign broadcast failed: ") + e.what());
+            }
+
+            // Register the watch — atomically with broadcast as far as
+            // the caller's view goes. If the wallet is locked we still
+            // returned the broadcast txid (the foreign tx is in flight)
+            // but warn that the watch wasn't recorded.
+            pcw::WatchEntry e;
+            e.swap_id = sid;
+            e.kind    = k;
+            e.txid_hex = txid;
+            e.min_confirmations = min_conf;
+            const auto r = pcw::Add(*wallet_sp, e);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("txid",             txid);
+            out.pushKV("watch_kind",       pcw::WatchKindName(k));
+            out.pushKV("watch_registered", r == pcw::StoreResult::Ok);
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_swapwatch_notify()
 {
     return RPCMethod{
@@ -6608,6 +6693,7 @@ RPCMethod pricoin_swapwatch_stop_export()               { return pricoin_swapwat
 RPCMethod pricoin_swapwatch_status_export()             { return pricoin_swapwatch_status(); }
 RPCMethod pricoin_swapwatch_tick_once_export()          { return pricoin_swapwatch_tick_once(); }
 RPCMethod pricoin_swapwatch_notify_export()             { return pricoin_swapwatch_notify(); }
+RPCMethod pricoin_swapwatch_broadcast_foreign_export()  { return pricoin_swapwatch_broadcast_foreign(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

@@ -16,10 +16,12 @@
 
 #include <QBrush>
 #include <QColor>
+#include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFont>
 #include <QFormLayout>
+#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QInputDialog>
@@ -33,6 +35,7 @@
 #include <QTableView>
 #include <QTextEdit>
 #include <QTimer>
+#include <QUrl>
 #include <QVBoxLayout>
 
 namespace {
@@ -121,10 +124,60 @@ void PricoinSwapsPage::buildLayout()
     bot->addStretch();
     outer->addLayout(bot);
 
+    // ─── Tier-3 swap-watcher panel ───
+    auto* sw_box = new QGroupBox(tr("Swap watcher (auto-advance from chain events)"), this);
+    sw_box->setStyleSheet(QStringLiteral("QGroupBox { font-weight: bold; }"));
+    auto* sw_outer = new QVBoxLayout(sw_box);
+
+    auto* sw_top = new QHBoxLayout();
+    m_btn_sw_start   = new QPushButton(tr("Start watcher"),   sw_box);
+    m_btn_sw_stop    = new QPushButton(tr("Stop watcher"),    sw_box);
+    m_btn_sw_tick    = new QPushButton(tr("Tick once"),       sw_box);
+    m_btn_sw_refresh = new QPushButton(tr("Refresh entries"), sw_box);
+    sw_top->addWidget(m_btn_sw_start);
+    sw_top->addWidget(m_btn_sw_stop);
+    sw_top->addWidget(m_btn_sw_tick);
+    sw_top->addWidget(m_btn_sw_refresh);
+    sw_top->addStretch();
+    m_sw_status_label = new QLabel(tr("Watcher: unknown"), sw_box);
+    m_sw_status_label->setWordWrap(true);
+    sw_top->addWidget(m_sw_status_label, /*stretch=*/1);
+    sw_outer->addLayout(sw_top);
+
+    m_sw_table_model = new QStandardItemModel(sw_box);
+    m_sw_table_model->setHorizontalHeaderLabels({
+        tr("Swap id"), tr("Kind"), tr("Txid"),
+        tr("Vout"), tr("Min conf")
+    });
+    m_sw_table = new QTableView(sw_box);
+    m_sw_table->setModel(m_sw_table_model);
+    m_sw_table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_sw_table->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_sw_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_sw_table->verticalHeader()->setVisible(false);
+    m_sw_table->horizontalHeader()->setStretchLastSection(true);
+    m_sw_table->setMaximumHeight(140);
+    sw_outer->addWidget(m_sw_table);
+
+    auto* sw_bot = new QHBoxLayout();
+    m_btn_sw_add    = new QPushButton(tr("Add watch…"),    sw_box);
+    m_btn_sw_remove = new QPushButton(tr("Remove watch"),  sw_box);
+    sw_bot->addWidget(m_btn_sw_add);
+    sw_bot->addWidget(m_btn_sw_remove);
+    sw_bot->addStretch();
+    sw_outer->addLayout(sw_bot);
+    outer->addWidget(sw_box);
+
     connect(m_btn_refresh, &QPushButton::clicked, this, &PricoinSwapsPage::onRefreshClicked);
     connect(m_btn_advance, &QPushButton::clicked, this, &PricoinSwapsPage::onAdvanceClicked);
     connect(m_btn_refund,  &QPushButton::clicked, this, &PricoinSwapsPage::onRefundClicked);
     connect(m_btn_abort,   &QPushButton::clicked, this, &PricoinSwapsPage::onAbortClicked);
+    connect(m_btn_sw_start,   &QPushButton::clicked, this, &PricoinSwapsPage::onSwapwatchStartClicked);
+    connect(m_btn_sw_stop,    &QPushButton::clicked, this, &PricoinSwapsPage::onSwapwatchStopClicked);
+    connect(m_btn_sw_tick,    &QPushButton::clicked, this, &PricoinSwapsPage::onSwapwatchTickClicked);
+    connect(m_btn_sw_refresh, &QPushButton::clicked, this, &PricoinSwapsPage::onSwapwatchRefresh);
+    connect(m_btn_sw_add,     &QPushButton::clicked, this, &PricoinSwapsPage::onSwapwatchAddClicked);
+    connect(m_btn_sw_remove,  &QPushButton::clicked, this, &PricoinSwapsPage::onSwapwatchRemoveClicked);
 
     if (auto* sm = m_table->selectionModel()) {
         connect(sm, &QItemSelectionModel::selectionChanged,
@@ -146,6 +199,7 @@ void PricoinSwapsPage::setModel(WalletModel* model)
                 this, &PricoinSwapsPage::onSelectionChanged);
     }
     refreshTable();
+    onSwapwatchRefresh();
     if (m_model && m_auto_refresh_timer && !m_auto_refresh_timer->isActive()) {
         m_auto_refresh_timer->start();
     }
@@ -247,7 +301,9 @@ void PricoinSwapsPage::onRefreshClicked()
 
 void PricoinSwapsPage::onAutoRefreshTick()
 {
-    if (m_model) refreshTable();
+    if (!m_model) return;
+    refreshTable();
+    onSwapwatchRefresh();
 }
 
 // ─── Advance-state dialogs (one per source state) ───────────────────
@@ -681,4 +737,219 @@ void PricoinSwapsPage::onAbortClicked()
     }
     refreshTable();
     setStatus(tr("Swap aborted."));
+}
+
+// ─── Tier-3 swap-watcher panel ──────────────────────────────────
+
+namespace {
+
+// Local helper: dispatch a wallet-RPC by name via node().executeRpc.
+// Returns std::nullopt on RPC error (with msg in *err).
+std::optional<UniValue> CallWalletRpc(WalletModel* wm,
+                                       const std::string& method,
+                                       const UniValue& params,
+                                       std::string* err)
+{
+    if (!wm) { if (err) *err = "wallet not attached"; return std::nullopt; }
+    const QString wallet_name = wm->getWalletName();
+    std::string uri;
+    if (!wallet_name.isEmpty()) {
+        QByteArray enc = QUrl::toPercentEncoding(wallet_name);
+        uri = "/wallet/" + std::string(enc.constData(), enc.length());
+    }
+    try {
+        return wm->node().executeRpc(method, params, uri);
+    } catch (const UniValue& e) {
+        if (err) {
+            if (e.isObject() && e.exists("message")) *err = e["message"].get_str();
+            else                                     *err = e.write();
+        }
+    } catch (const std::exception& e) {
+        if (err) *err = e.what();
+    } catch (...) {
+        if (err) *err = "unknown RPC error";
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
+void PricoinSwapsPage::onSwapwatchRefresh()
+{
+    if (!m_model) return;
+    std::string err;
+    auto status = CallWalletRpc(m_model, "pricoin_swapwatch_status", UniValue{UniValue::VARR}, &err);
+    auto entries = CallWalletRpc(m_model, "pricoin_swapwatch_list",   UniValue{UniValue::VARR}, &err);
+    if (!status || !entries) {
+        setStatus(tr("Swapwatch refresh failed: %1").arg(QString::fromStdString(err)), true);
+        return;
+    }
+    const bool running = (*status)["running"].get_bool();
+    const int  pending = (*status)["pending_entries"].getInt<int>();
+    m_sw_status_label->setText(tr("Watcher: %1 — %2 pending entries")
+        .arg(running ? tr("running") : tr("stopped"))
+        .arg(pending));
+    m_sw_status_label->setStyleSheet(running
+        ? QStringLiteral("QLabel { color: #1b5e20; }")
+        : QStringLiteral("QLabel { color: #b71c1c; }"));
+
+    const auto& arr = *entries;
+    m_sw_table_model->setRowCount(static_cast<int>(arr.size()));
+    for (size_t i = 0; i < arr.size(); ++i) {
+        const auto& e = arr[i];
+        const QString swap_id = QString::fromStdString(e["swap_id"].get_str());
+        auto* item0 = new QStandardItem(swap_id.left(12) + "…");
+        item0->setData(swap_id,                        Qt::UserRole + 1);
+        item0->setData(QString::fromStdString(e["kind"].get_str()), Qt::UserRole + 2);
+        m_sw_table_model->setItem(static_cast<int>(i), 0, item0);
+        m_sw_table_model->setItem(static_cast<int>(i), 1,
+            new QStandardItem(QString::fromStdString(e["kind"].get_str())));
+        const QString txid = QString::fromStdString(e["txid"].get_str());
+        m_sw_table_model->setItem(static_cast<int>(i), 2,
+            new QStandardItem(txid.left(16) + "…"));
+        const QString vout_s = e.exists("vout")
+            ? QString::number(e["vout"].getInt<int>())
+            : QStringLiteral("-");
+        m_sw_table_model->setItem(static_cast<int>(i), 3,
+            new QStandardItem(vout_s));
+        m_sw_table_model->setItem(static_cast<int>(i), 4,
+            new QStandardItem(QString::number(e["min_confirmations"].getInt<int>())));
+    }
+    m_sw_table->resizeColumnsToContents();
+}
+
+void PricoinSwapsPage::onSwapwatchStartClicked()
+{
+    if (!m_model) return;
+    UniValue params{UniValue::VARR};
+    params.push_back(30);  // 30s default poll interval
+    std::string err;
+    if (auto r = CallWalletRpc(m_model, "pricoin_swapwatch_start", params, &err)) {
+        setStatus(tr("Watcher started."));
+    } else {
+        setStatus(tr("Start failed: %1").arg(QString::fromStdString(err)), true);
+    }
+    onSwapwatchRefresh();
+}
+
+void PricoinSwapsPage::onSwapwatchStopClicked()
+{
+    if (!m_model) return;
+    std::string err;
+    if (auto r = CallWalletRpc(m_model, "pricoin_swapwatch_stop", UniValue{UniValue::VARR}, &err)) {
+        setStatus(tr("Watcher stopped."));
+    } else {
+        setStatus(tr("Stop failed: %1").arg(QString::fromStdString(err)), true);
+    }
+    onSwapwatchRefresh();
+}
+
+void PricoinSwapsPage::onSwapwatchTickClicked()
+{
+    if (!m_model) return;
+    std::string err;
+    if (auto r = CallWalletRpc(m_model, "pricoin_swapwatch_tick_once", UniValue{UniValue::VARR}, &err)) {
+        const int after = (*r)["pending_after"].getInt<int>();
+        setStatus(tr("Tick OK — %1 pending entries remaining.").arg(after));
+    } else {
+        setStatus(tr("Tick failed: %1").arg(QString::fromStdString(err)), true);
+    }
+    refreshTable();
+    onSwapwatchRefresh();
+}
+
+void PricoinSwapsPage::onSwapwatchAddClicked()
+{
+    if (!m_model) return;
+    const std::string sel_sid = selectedSwapId();
+
+    // Modal form: swap_id (default = selected), kind, txid, vout, min_conf.
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Add swap-watch entry"));
+    auto* form = new QFormLayout(&dlg);
+    auto* sid_edit = new QLineEdit(QString::fromStdString(sel_sid), &dlg);
+    sid_edit->setPlaceholderText(tr("32-byte swap_id hex"));
+    form->addRow(tr("Swap id:"), sid_edit);
+    auto* kind = new QComboBox(&dlg);
+    kind->addItems({QStringLiteral("foreign_funding"), QStringLiteral("pric_funding"),
+                    QStringLiteral("pric_claim"),     QStringLiteral("foreign_claim"),
+                    QStringLiteral("pric_refund"),    QStringLiteral("foreign_refund")});
+    form->addRow(tr("Kind:"), kind);
+    auto* txid_edit = new QLineEdit(&dlg);
+    txid_edit->setPlaceholderText(tr("32-byte tx id hex"));
+    form->addRow(tr("Txid:"), txid_edit);
+    auto* vout = new QSpinBox(&dlg);
+    vout->setRange(-1, 65535);
+    vout->setValue(0);
+    form->addRow(tr("Vout (-1 if not funding):"), vout);
+    auto* min_conf = new QSpinBox(&dlg);
+    min_conf->setRange(0, 1'000'000);
+    min_conf->setValue(1);
+    form->addRow(tr("Min confirmations:"), min_conf);
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(bb);
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    UniValue params{UniValue::VARR};
+    params.push_back(sid_edit->text().trimmed().toStdString());
+    params.push_back(kind->currentText().toStdString());
+    params.push_back(txid_edit->text().trimmed().toStdString());
+    params.push_back(vout->value());
+    params.push_back(min_conf->value());
+    std::string err;
+    if (CallWalletRpc(m_model, "pricoin_swapwatch_add", params, &err)) {
+        setStatus(tr("Watch entry added."));
+    } else {
+        setStatus(tr("Add failed: %1").arg(QString::fromStdString(err)), true);
+    }
+    onSwapwatchRefresh();
+}
+
+std::string PricoinSwapsPage::selectedSwapwatchSwapId() const
+{
+    if (!m_sw_table) return {};
+    auto* sm = m_sw_table->selectionModel();
+    if (!sm) return {};
+    const auto sel = sm->selectedRows();
+    if (sel.isEmpty()) return {};
+    auto* item = m_sw_table_model->item(sel.first().row(), 0);
+    if (!item) return {};
+    return item->data(Qt::UserRole + 1).toString().toStdString();
+}
+
+std::string PricoinSwapsPage::selectedSwapwatchKind() const
+{
+    if (!m_sw_table) return {};
+    auto* sm = m_sw_table->selectionModel();
+    if (!sm) return {};
+    const auto sel = sm->selectedRows();
+    if (sel.isEmpty()) return {};
+    auto* item = m_sw_table_model->item(sel.first().row(), 0);
+    if (!item) return {};
+    return item->data(Qt::UserRole + 2).toString().toStdString();
+}
+
+void PricoinSwapsPage::onSwapwatchRemoveClicked()
+{
+    if (!m_model) return;
+    const std::string sid = selectedSwapwatchSwapId();
+    const std::string knd = selectedSwapwatchKind();
+    if (sid.empty() || knd.empty()) {
+        setStatus(tr("Select an entry in the swap-watch table first."), true);
+        return;
+    }
+    UniValue params{UniValue::VARR};
+    params.push_back(sid);
+    params.push_back(knd);
+    std::string err;
+    if (auto r = CallWalletRpc(m_model, "pricoin_swapwatch_remove", params, &err)) {
+        const bool removed = (*r)["removed"].get_bool();
+        setStatus(removed ? tr("Watch entry removed.")
+                          : tr("Watch entry was not present."));
+    } else {
+        setStatus(tr("Remove failed: %1").arg(QString::fromStdString(err)), true);
+    }
+    onSwapwatchRefresh();
 }

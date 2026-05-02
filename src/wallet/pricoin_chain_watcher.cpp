@@ -308,6 +308,28 @@ void MockForeignChainClient::ClearTxStatus(const std::string& txid_hex)
     m_tx_status.erase(txid_hex);
 }
 
+std::string MockForeignChainClient::Broadcast(const std::string& tx_hex)
+{
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_last_broadcast = tx_hex;
+    if (m_broadcast_response_txid.empty()) {
+        throw std::runtime_error("MockForeignChainClient: no broadcast response configured");
+    }
+    return m_broadcast_response_txid;
+}
+
+void MockForeignChainClient::SetBroadcastResponse(const std::string& txid)
+{
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_broadcast_response_txid = txid;
+}
+
+std::string MockForeignChainClient::LastBroadcast() const
+{
+    std::lock_guard<std::mutex> lk(m_mu);
+    return m_last_broadcast;
+}
+
 // ─── ChainWatcher service ───────────────────────────────────────
 
 ChainWatcher::ChainWatcher(::wallet::CWallet& wallet,

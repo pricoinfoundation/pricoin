@@ -984,6 +984,7 @@ RPCMethod pricoin_swapwatch_stop_export();
 RPCMethod pricoin_swapwatch_status_export();
 RPCMethod pricoin_swapwatch_tick_once_export();
 RPCMethod pricoin_swapwatch_notify_export();
+RPCMethod pricoin_swapwatch_broadcast_foreign_export();
 RPCMethod pricoin_listownct_export();
 RPCMethod walletsendct_from_ct_export();
 RPCMethod walletsendct_ring_export();
@@ -1076,6 +1077,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &pricoin_swapwatch_status_export},
         {"wallet", &pricoin_swapwatch_tick_once_export},
         {"wallet", &pricoin_swapwatch_notify_export},
+        {"wallet", &pricoin_swapwatch_broadcast_foreign_export},
         {"wallet", &pricoin_listownct_export},
         {"wallet", &walletsendct_from_ct_export},
         {"wallet", &walletsendct_ring_export},

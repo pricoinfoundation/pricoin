@@ -125,6 +125,13 @@ public:
     // the return: nullopt = unreachable; ForeignTxStatus.found=false
     // = relay says no such tx.
     virtual std::optional<ForeignTxStatus> TxStatus(const std::string& txid_hex) = 0;
+
+    // Broadcast a hex-encoded tx to the foreign chain. Returns the
+    // txid the backend accepted (typically equal to the locally-
+    // computed hash). Throws on failure — wraps the underlying
+    // backend error in std::runtime_error so the wallet library
+    // doesn't need to link the swap module's exception type.
+    virtual std::string Broadcast(const std::string& tx_hex) = 0;
 };
 
 // Pluggable factory for resolving a foreign-chain client by chain
@@ -150,14 +157,20 @@ public:
     std::optional<int> TipHeight() override;
     std::optional<ForeignTxStatus> TxStatus(const std::string& txid_hex) override;
 
+    std::string Broadcast(const std::string& tx_hex) override;
+
     // Test config — protected by an internal mutex.
     void SetTipHeight(std::optional<int> h);
     void SetTxStatus(const std::string& txid_hex, ForeignTxStatus s);
     void ClearTxStatus(const std::string& txid_hex);
+    void SetBroadcastResponse(const std::string& txid);
+    std::string LastBroadcast() const;
 private:
-    std::mutex m_mu;
+    mutable std::mutex m_mu;
     std::optional<int> m_tip_height;
     std::map<std::string, ForeignTxStatus> m_tx_status;
+    std::string m_broadcast_response_txid;
+    std::string m_last_broadcast;
 };
 
 // ─── Persistence + lookup ────────────────────────────────────────

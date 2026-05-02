@@ -53,6 +53,12 @@ private Q_SLOTS:
     void onRefundClicked();
     void onSelectionChanged();
     void onAutoRefreshTick();
+    void onSwapwatchStartClicked();
+    void onSwapwatchStopClicked();
+    void onSwapwatchTickClicked();
+    void onSwapwatchAddClicked();
+    void onSwapwatchRemoveClicked();
+    void onSwapwatchRefresh();
 
 private:
     WalletModel* m_model{nullptr};
@@ -68,12 +74,25 @@ private:
     QTextEdit*   m_next_action_view{nullptr};
     QTimer*      m_auto_refresh_timer{nullptr};
 
+    // ─── Tier-3 swap-watcher panel ───
+    QLabel*             m_sw_status_label{nullptr};
+    QPushButton*        m_btn_sw_start{nullptr};
+    QPushButton*        m_btn_sw_stop{nullptr};
+    QPushButton*        m_btn_sw_tick{nullptr};
+    QPushButton*        m_btn_sw_add{nullptr};
+    QPushButton*        m_btn_sw_remove{nullptr};
+    QPushButton*        m_btn_sw_refresh{nullptr};
+    QTableView*         m_sw_table{nullptr};
+    QStandardItemModel* m_sw_table_model{nullptr};
+
     std::vector<interfaces::Wallet::PricoinAdaptorSwapSnapshot> m_swaps;
 
     void buildLayout();
     void refreshTable();
     void setStatus(const QString& msg, bool error = false);
     std::string selectedSwapId() const;
+    std::string selectedSwapwatchSwapId() const;
+    std::string selectedSwapwatchKind()   const;
 };
 
 #endif // BITCOIN_QT_PRICOIN_SWAPS_PAGE_H

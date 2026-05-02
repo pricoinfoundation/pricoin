@@ -1597,6 +1597,16 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                         return std::nullopt;
                     }
                 }
+                std::string Broadcast(const std::string& tx_hex) override {
+                    try {
+                        return m_backend->Broadcast(tx_hex);
+                    } catch (const ::pricoin::swap::ChainBackendError& e) {
+                        // Re-throw as std::runtime_error so the wallet
+                        // library doesn't need to link the swap module's
+                        // exception type.
+                        throw std::runtime_error(e.what());
+                    }
+                }
             private:
                 std::shared_ptr<::pricoin::swap::ChainBackend> m_backend;
             };

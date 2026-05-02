@@ -13,9 +13,13 @@
 #include <util/string.h>
 #include <util/translation.h>
 #include <wallet/context.h>
+#include <wallet/pricoin_chain_watcher.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
+
+#include <algorithm>
+#include <chrono>
 
 #include <univalue.h>
 
@@ -168,6 +172,19 @@ void StartWallets(WalletContext& context)
 {
     for (const std::shared_ptr<CWallet>& pwallet : GetWallets(context)) {
         pwallet->postInitProcess();
+        // Tier-3: auto-start the per-wallet swap watcher unless the
+        // operator opted out via -pricoinswapwatch=0. The watcher
+        // polls the foreign-chain backends registered by init.cpp
+        // and auto-advances the AdaptorSwap state machine when
+        // confirmations on registered txids reach threshold.
+        const int sw = context.args->GetIntArg("-pricoinswapwatch", 1);
+        if (sw != 0) {
+            const int interval = context.args->GetIntArg(
+                "-pricoinswapwatch_interval", 30);
+            const auto clamped = std::clamp(interval, 1, 3600);
+            ::wallet::pricoin_chain_watcher::StartManaged(
+                *pwallet, std::chrono::seconds{clamped});
+        }
     }
 
     context.scheduler->scheduleEvery([&context] { MaybeResendWalletTxs(context); }, 1min);
@@ -179,6 +196,11 @@ void UnloadWallets(WalletContext& context)
     while (!wallets.empty()) {
         auto wallet = wallets.back();
         wallets.pop_back();
+        // Stop the per-wallet swap watcher BEFORE RemoveWallet —
+        // the watcher's polling thread holds a reference into
+        // wallet state and would deadlock if torn down concurrent
+        // with RemoveWallet's locking.
+        ::wallet::pricoin_chain_watcher::StopManaged(*wallet);
         std::vector<bilingual_str> warnings;
         RemoveWallet(context, wallet, /* load_on_start= */ std::nullopt, warnings);
         WaitForDeleteWallet(std::move(wallet));
