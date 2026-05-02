@@ -241,6 +241,14 @@ private:
     // both cases the entry should be removed from the pending set).
     bool HandleEntry(const WatchEntry& e);
 
+    // Per-chain error backoff. When a backend query fails (returns
+    // nullopt — indicating "unreachable", as opposed to "tx not
+    // found"), record the time and skip queries for that chain
+    // until the cooldown elapses. Without this a flaky relay
+    // would be hammered every Tick.
+    bool IsChainCoolingDown(const std::string& chain_name) const;
+    void RecordChainError(const std::string& chain_name);
+
     // PRIC-leg confirmation lookup via the embedded chainstate.
     // Returns the same shape as IForeignChainClient::TxStatus.
     std::optional<ForeignTxStatus> PricTxStatus(const std::string& txid_hex);
@@ -251,6 +259,14 @@ private:
     std::thread m_thread;
     std::atomic<bool> m_stopping{false};
     std::atomic<int64_t> m_transitions_applied{0};
+
+    // Backoff state. Mutex-protected because Tick() may run on the
+    // poll thread while TickOnce() is called from the main thread
+    // in tests.
+    mutable std::mutex m_backoff_mu;
+    std::map<std::string, std::chrono::steady_clock::time_point>
+        m_chain_error_at;
+    static constexpr std::chrono::seconds kBackoffCooldown{60};
 };
 
 // ─── Per-wallet polling manager ─────────────────────────────────

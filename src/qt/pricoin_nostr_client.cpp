@@ -383,6 +383,27 @@ bool PricoinNostrClient::publishDirectMessage(const QString& peer_xonly_hex,
     return sent > 0;
 }
 
+bool PricoinNostrClient::publishBroadcastAnnouncement(
+    const QString& peer_xonly_hex,
+    const QString& swap_id_hex,
+    const QString& kind,
+    const QString& txid_hex,
+    int32_t vout,
+    int32_t min_confirmations)
+{
+    QJsonObject env;
+    env.insert("v",       1);
+    env.insert("type",    QStringLiteral("tx_announce"));
+    env.insert("swap_id", swap_id_hex);
+    env.insert("kind",    kind);
+    env.insert("txid",    txid_hex);
+    env.insert("vout",    vout);
+    env.insert("min_confirmations", min_confirmations);
+    const QString plaintext = QString::fromUtf8(
+        QJsonDocument(env).toJson(QJsonDocument::Compact));
+    return publishDirectMessage(peer_xonly_hex, plaintext);
+}
+
 bool PricoinNostrClient::verifyEvent(const QString& pubkey_hex,
                                       const QString& id_hex,
                                       const QString& sig_hex,

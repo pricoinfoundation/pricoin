@@ -6533,6 +6533,119 @@ RPCMethod pricoin_swapwatch_broadcast_foreign()
     };
 }
 
+RPCMethod pricoin_swapwatch_broadcast_pric()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_broadcast_pric",
+        "Submit a cooperatively-assembled v4 spend tx to the local pricoin\n"
+        "mempool AND register a swapwatch entry for the resulting txid in one\n"
+        "atomic call. Wraps pricoin_jointspend_submittx; on success the\n"
+        "watcher picks up the entry on its next tick and applies the matching\n"
+        "SetX transition once the embedded chainstate sees `min_confirmations`.\n"
+        "\n"
+        "`kind` should be one of `pric_funding`, `pric_claim`, `pric_refund`.\n",
+        {
+            {"swap_id",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"kind",               RPCArg::Type::STR,     RPCArg::Optional::NO,
+                "pric_funding | pric_claim | pric_refund"},
+            {"tx_hex",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Skeleton tx hex from pricoin_jointspend_buildtx"},
+            {"signature_hex",      RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Hex-encoded pricoin::ringsig::Signature"},
+            {"vout",               RPCArg::Type::NUM,     RPCArg::Default{-1},
+                "Output index — required for pric_funding"},
+            {"min_confirmations",  RPCArg::Type::NUM,     RPCArg::Default{1}, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "txid", "Broadcast txid"},
+                {RPCResult::Type::NUM,     "size", "Final tx size with signature"},
+                {RPCResult::Type::STR,     "watch_kind", "Echo of the registered kind"},
+                {RPCResult::Type::BOOL,    "watch_registered", "True iff the watch entry was stored"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_broadcast_pric",
+            "<swap_id> pric_claim <tx_hex> <sig_hex>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+
+            const uint256 sid = ParseChainWatchSwapId(request.params[0]);
+            const pcw::WatchKind k = ParseChainWatchKind(request.params[1]);
+            if (k != pcw::WatchKind::PricFunding
+                && k != pcw::WatchKind::PricClaim
+                && k != pcw::WatchKind::PricRefund) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "broadcast_pric only supports pric_funding / pric_claim / pric_refund");
+            }
+            const std::string tx_hex = request.params[2].get_str();
+            const std::string sig_hex = request.params[3].get_str();
+            const int32_t vout = request.params[4].isNull() ? -1 : request.params[4].getInt<int32_t>();
+            const int32_t min_conf = request.params[5].isNull()
+                ? 1 : request.params[5].getInt<int32_t>();
+            if (k == pcw::WatchKind::PricFunding && vout < 0) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "pric_funding requires vout >= 0");
+            }
+
+            // Decode + validate + inject the cooperative signature —
+            // duplicates pricoin_jointspend_submittx's body. Could
+            // factor out, but the tx-validation guards live with
+            // submittx and are easier kept local here.
+            CMutableTransaction mtx;
+            if (!DecodeHexTx(mtx, tx_hex, /*try_no_witness=*/true, /*try_witness=*/true)) {
+                throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "tx hex failed to decode");
+            }
+            if (mtx.version != PRICOIN_CT_VERSION) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "tx is not a v4 confidential tx");
+            }
+            if (mtx.ct_bundle.ring_inputs.size() != 1) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "expected exactly one ring input (joint-spend convention)");
+            }
+            auto sig_bytes = TryParseHex<unsigned char>(sig_hex);
+            if (!sig_bytes) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "signature_hex invalid");
+            }
+            DataStream ds{std::span<const unsigned char>{*sig_bytes}};
+            pricoin::ringsig::Signature sig;
+            try {
+                ds >> sig;
+            } catch (const std::exception& e) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    std::string("signature deserialise failed: ") + e.what());
+            }
+            mtx.ct_bundle.ring_inputs[0].sig = std::move(sig);
+
+            CTransactionRef tx_ref = MakeTransactionRef(std::move(mtx));
+            std::string err_str;
+            if (!wallet.chain().broadcastTransaction(
+                    tx_ref, MAX_MONEY,
+                    node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL,
+                    err_str)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "broadcast failed: " + err_str);
+            }
+            const std::string txid = tx_ref->GetHash().ToString();
+
+            // Register the watch.
+            pcw::WatchEntry e;
+            e.swap_id = sid;
+            e.kind    = k;
+            e.txid_hex = txid;
+            e.vout     = vout;
+            e.min_confirmations = min_conf;
+            const auto r = pcw::Add(wallet, e);
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("txid",             txid);
+            out.pushKV("size",             (int)::GetSerializeSize(TX_WITH_WITNESS(*tx_ref)));
+            out.pushKV("watch_kind",       pcw::WatchKindName(k));
+            out.pushKV("watch_registered", r == pcw::StoreResult::Ok);
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_swapwatch_notify()
 {
     return RPCMethod{
@@ -6694,6 +6807,7 @@ RPCMethod pricoin_swapwatch_status_export()             { return pricoin_swapwat
 RPCMethod pricoin_swapwatch_tick_once_export()          { return pricoin_swapwatch_tick_once(); }
 RPCMethod pricoin_swapwatch_notify_export()             { return pricoin_swapwatch_notify(); }
 RPCMethod pricoin_swapwatch_broadcast_foreign_export()  { return pricoin_swapwatch_broadcast_foreign(); }
+RPCMethod pricoin_swapwatch_broadcast_pric_export()     { return pricoin_swapwatch_broadcast_pric(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

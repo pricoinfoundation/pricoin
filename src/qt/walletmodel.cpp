@@ -19,6 +19,7 @@
 #include <common/args.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
+#include <univalue.h>
 #include <key_io.h>
 #include <node/interface_ui.h>
 #include <node/types.h>
@@ -588,6 +589,11 @@ PricoinNostrClient* WalletModel::getOrCreateNostrClient()
     const QStringList relays = PricoinRelaySettingsDialog::loadFromSettings();
     if (relays.isEmpty()) return nullptr;
     m_nostr = new PricoinNostrClient(this, relays, this);
+    // Wallet-tier auto-handler — fires on any inbound DM, alongside
+    // any per-dialog hooks that filter by swap. The handler picks
+    // out tx_announce envelopes and auto-adds a swapwatch entry.
+    connect(m_nostr, &PricoinNostrClient::directMessageReceived,
+            this, &WalletModel::onAutoSwapwatchDM);
     return m_nostr;
 }
 
@@ -597,6 +603,57 @@ void WalletModel::resetNostrClient()
     m_nostr->disconnectAll();
     m_nostr->deleteLater();
     m_nostr = nullptr;
+}
+
+void WalletModel::onAutoSwapwatchDM(const QString& from_xonly_hex,
+                                      const QString& plaintext)
+{
+    UniValue env;
+    if (!env.read(plaintext.toStdString()) || !env.isObject()) return;
+    if (!env.exists("type") || env["type"].get_str() != "tx_announce") return;
+    if (!env.exists("swap_id") || !env.exists("kind") || !env.exists("txid")) return;
+
+    const std::string swap_id = env["swap_id"].get_str();
+    const std::string kind    = env["kind"].get_str();
+    const std::string txid    = env["txid"].get_str();
+    if (txid.size() != 64) return;
+
+    // Cross-check sender against the swap's counterparty. Without
+    // this, a stranger could DM us a forged announcement and we'd
+    // happily watch their tx. The Nostr layer already verifies the
+    // BIP340 sig, so from_xonly is authentic — we just need to
+    // ensure that pubkey matches the swap's counterparty.
+    auto snap = wallet().adaptorSwapGet(swap_id);
+    if (!snap) return;
+    const std::string& cp = snap->counterparty_pubkey_hex;
+    // counterparty_pubkey is 33-byte compressed; strip the parity
+    // prefix to compare with xonly (32 bytes).
+    if (cp.size() < 66 || cp.substr(2) != from_xonly_hex.toStdString()) return;
+
+    const int32_t vout = env.exists("vout") ? env["vout"].getInt<int32_t>() : -1;
+    const int32_t min_conf = env.exists("min_confirmations")
+        ? env["min_confirmations"].getInt<int32_t>() : 1;
+
+    // Dispatch via wallet RPC so we go through the same input
+    // validation + persistence as a manual swapwatch_add.
+    UniValue params{UniValue::VARR};
+    params.push_back(swap_id);
+    params.push_back(kind);
+    params.push_back(txid);
+    params.push_back(vout);
+    params.push_back(min_conf);
+    const std::string uri = "/wallet/" + getWalletName().toStdString();
+    try {
+        node().executeRpc("pricoin_swapwatch_add", params, uri);
+        // No UI feedback — this happens silently in the background.
+        // The Swaps page panel will pick it up on its next refresh.
+    } catch (const UniValue&) {
+        // Duplicate entry is fine (idempotent peer announcements);
+        // bad input is rare and silently dropped — the Nostr DM
+        // sender is trusted by sig but may have malformed payload.
+    } catch (const std::exception&) {
+        // Same — silent.
+    }
 }
 
 QString WalletModel::getDisplayName() const

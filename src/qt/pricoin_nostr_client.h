@@ -85,6 +85,20 @@ public:
     bool publishDirectMessage(const QString& peer_xonly_hex,
                                const QString& plaintext);
 
+    // Tier-3 helper: announce that this wallet broadcast a swap-leg
+    // tx, so the peer can auto-add a swapwatch entry. Builds the
+    // standard envelope:
+    //   {"v":1,"type":"tx_announce",
+    //    "swap_id":..., "kind":..., "txid":..., "vout":N}
+    // and DMs it to `peer_xonly_hex`. Returns true if at least one
+    // relay was sent to.
+    bool publishBroadcastAnnouncement(const QString& peer_xonly_hex,
+                                        const QString& swap_id_hex,
+                                        const QString& kind,
+                                        const QString& txid_hex,
+                                        int32_t vout,
+                                        int32_t min_confirmations);
+
     // True if at least one relay is currently connected.
     bool anyConnected() const;
     // Count of currently-connected relays (0..relayUrls().size()).

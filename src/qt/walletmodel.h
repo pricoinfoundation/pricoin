@@ -171,6 +171,23 @@ public:
     // Otherwise, uses the wallet's cached available balance.
     CAmount getAvailableBalance(const wallet::CCoinControl* control);
 
+private Q_SLOTS:
+    // Tier-3: handle inbound NIP-04 DMs that announce a peer
+    // broadcasting a swap leg's tx. Adds a swapwatch entry so the
+    // local poll loop auto-advances the AdaptorSwap state machine
+    // when the announced tx confirms.
+    //
+    // Envelope (decrypted plaintext):
+    //   {"v":1, "type":"tx_announce",
+    //    "swap_id":"<hex>", "kind":"<WatchKind>",
+    //    "txid":"<hex>", "vout":<int>, "min_confirmations":<int>}
+    //
+    // Authenticated by NIP-04 (sender's BIP340 sig over the event id),
+    // plus a swap_id-counterparty cross-check: the sender's xonly
+    // must match the swap record's counterparty_pubkey.
+    void onAutoSwapwatchDM(const QString& from_xonly_hex,
+                            const QString& plaintext);
+
 private:
     std::unique_ptr<interfaces::Wallet> m_wallet;
     PricoinNostrClient* m_nostr{nullptr};  // QObject-parented to this

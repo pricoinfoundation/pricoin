@@ -441,6 +441,20 @@ std::optional<ForeignTxStatus> ChainWatcher::PricTxStatus(const std::string& txi
     return s;
 }
 
+bool ChainWatcher::IsChainCoolingDown(const std::string& chain_name) const
+{
+    std::lock_guard<std::mutex> lk(m_backoff_mu);
+    auto it = m_chain_error_at.find(chain_name);
+    if (it == m_chain_error_at.end()) return false;
+    return (std::chrono::steady_clock::now() - it->second) < kBackoffCooldown;
+}
+
+void ChainWatcher::RecordChainError(const std::string& chain_name)
+{
+    std::lock_guard<std::mutex> lk(m_backoff_mu);
+    m_chain_error_at[chain_name] = std::chrono::steady_clock::now();
+}
+
 bool ChainWatcher::HandleEntry(const WatchEntry& e)
 {
     using namespace ::wallet::pricoin_adaptor_swap;
@@ -459,6 +473,10 @@ bool ChainWatcher::HandleEntry(const WatchEntry& e)
             // Swap gone (aborted/refunded externally) — drop entry.
             return true;
         }
+        // Backoff guard — if this chain errored recently, skip the
+        // query and leave the entry pending. The next Tick after
+        // the cooldown will retry.
+        if (IsChainCoolingDown(s.foreign_chain)) return false;
         // Resolve client: prefer the explicitly-injected map (for
         // tests that wire in mocks), fall back to the registry-
         // backed adapter (the production path that uses the
@@ -476,6 +494,12 @@ bool ChainWatcher::HandleEntry(const WatchEntry& e)
             return false;
         }
         st = client->TxStatus(e.txid_hex);
+        if (!st) {
+            // Backend unreachable — record the error so we cool
+            // down before retrying. Tx-not-found returns
+            // st->found=false, which is NOT this branch.
+            RecordChainError(s.foreign_chain);
+        }
     } else {
         st = PricTxStatus(e.txid_hex);
     }
