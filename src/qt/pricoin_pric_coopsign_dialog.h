@@ -59,9 +59,13 @@ public:
         PricAdaptor,  // claim — single-layer + adaptor
     };
 
+    // `swap_id` may be empty; if non-empty the dialog looks up the
+    // wallet's PricoinAdaptorSwap record and pre-fills T_G + dleq_t
+    // in adaptor mode (the rest stays user-supplied).
     PricCoopSignDialog(WalletModel* wallet_model,
                        Mode mode,
                        const QString& title,
+                       const std::string& swap_id,
                        QWidget* parent = nullptr);
 
     // Final result. PricPlain → 32-byte signature_hex (final CLSAG sig
@@ -74,6 +78,8 @@ private Q_SLOTS:
     void onStep2Compute();
     void onStep3Compute();
     void onStep4Compute();
+    void onRunBuildtx();
+    void onRunLoadshare();
 
 private:
     WalletModel* m_wm{nullptr};
@@ -131,6 +137,26 @@ private:
     QLineEdit*      m_in_session_payload{nullptr};
     // ring/ring_ml + s_others input pasted as JSON:
     QPlainTextEdit* m_in_ring_or_ring_ml{nullptr};
+
+    // ─── Buildtx helper (spender-only — pre-fills msg/ring_ml/pi/z) ───
+    QLineEdit*      m_in_bt_joint_txid{nullptr};
+    QLineEdit*      m_in_bt_joint_vout{nullptr};
+    QLineEdit*      m_in_bt_joint_value{nullptr};
+    QLineEdit*      m_in_bt_joint_blind{nullptr};
+    QLineEdit*      m_in_bt_dest{nullptr};
+    QLineEdit*      m_in_bt_dest_amount{nullptr};
+    QLineEdit*      m_in_bt_fee{nullptr};
+    QLineEdit*      m_in_bt_ring_size{nullptr};
+    QLineEdit*      m_in_bt_nlocktime{nullptr};
+    QPushButton*    m_btn_run_buildtx{nullptr};
+    QPlainTextEdit* m_out_buildtx{nullptr};
+
+    // ─── Loadshare helper (auto-derives x_share / blind / value) ───
+    QLineEdit*      m_in_ls_my_partial{nullptr};
+    QLineEdit*      m_in_ls_peer_partial{nullptr};
+    QComboBox*      m_in_ls_absorb{nullptr};   // "true" | "false"
+    QPushButton*    m_btn_run_loadshare{nullptr};
+    QPlainTextEdit* m_out_loadshare{nullptr};
 
     // ─── Step 1: My round 1 (local; persists nonce record) ───
     QPushButton*    m_btn_step1{nullptr};

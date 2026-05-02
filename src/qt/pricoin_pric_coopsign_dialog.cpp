@@ -73,6 +73,7 @@ void MakeMono(QPlainTextEdit* edit)
 PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
                                         Mode mode,
                                         const QString& title,
+                                        const std::string& swap_id,
                                         QWidget* parent)
     : QDialog(parent),
       m_wm(wallet_model),
@@ -81,6 +82,205 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
     setModal(true);
     resize(880, 900);
     buildLayout(title);
+
+    // Pre-fill from the swap record where we can: adaptor materials
+    // (claim leg only) + buildtx-helper joint-funding fields + the
+    // refund nlocktime (refund leg).
+    if (!swap_id.empty() && m_wm) {
+        auto snap = m_wm->wallet().adaptorSwapGet(swap_id);
+        if (snap) {
+            if (m_mode == Mode::PricAdaptor) {
+                if (m_in_T_G && !snap->adaptor_T_G_hex.empty()) {
+                    m_in_T_G->setText(QString::fromStdString(snap->adaptor_T_G_hex));
+                }
+                if (m_in_dleq_t && !snap->adaptor_dleq_blob_hex.empty()) {
+                    m_in_dleq_t->setPlainText(QString::fromStdString(snap->adaptor_dleq_blob_hex));
+                }
+            }
+            // Buildtx helper auto-pulls.
+            if (m_in_bt_joint_txid && !snap->pric_funding_txid_hex.empty()) {
+                m_in_bt_joint_txid->setText(QString::fromStdString(snap->pric_funding_txid_hex));
+            }
+            if (m_in_bt_joint_vout && snap->pric_funding_vout >= 0) {
+                m_in_bt_joint_vout->setText(QString::number(snap->pric_funding_vout));
+            }
+            if (m_in_bt_joint_value && snap->pric_amount_sat > 0) {
+                // Joint output value in PRIC = sat / 1e8.
+                const double v = static_cast<double>(snap->pric_amount_sat) / 1.0e8;
+                m_in_bt_joint_value->setText(QString::number(v, 'f', 8));
+                if (m_in_bt_dest_amount) {
+                    // Default dest amount = joint value minus the
+                    // 0.00001 default fee. User can override.
+                    m_in_bt_dest_amount->setText(QString::number(v - 0.00001, 'f', 8));
+                }
+            }
+            // Refund leg: nlocktime = pric_refund_height.
+            if (m_mode == Mode::PricPlain && m_in_bt_nlocktime
+                && snap->pric_refund_height > 0) {
+                m_in_bt_nlocktime->setText(QString::number(snap->pric_refund_height));
+            }
+        }
+    }
+}
+
+void PricCoopSignDialog::onRunLoadshare()
+{
+    const QString joint_txid = m_in_bt_joint_txid ? m_in_bt_joint_txid->text().trimmed() : QString{};
+    const QString joint_vout = m_in_bt_joint_vout ? m_in_bt_joint_vout->text().trimmed() : QString{};
+    if (joint_txid.size() != 64) {
+        setStatus(tr("Joint txid must be 32-byte hex (fill it in the Buildtx helper above first)"), true);
+        return;
+    }
+    bool vout_ok = false;
+    int vout = joint_vout.toInt(&vout_ok);
+    if (!vout_ok || vout < 0) {
+        setStatus(tr("Joint vout invalid"), true);
+        return;
+    }
+    const QString my_p   = m_in_ls_my_partial->text().trimmed();
+    const QString peer_p = m_in_ls_peer_partial->text().trimmed();
+    if (my_p.isEmpty() || peer_p.isEmpty()) {
+        setStatus(tr("Provide both partials (run pricoin_jointscan_partial first)"), true);
+        return;
+    }
+    const std::string absorb = m_in_ls_absorb->currentText().toStdString();
+
+    // Need the joint tx_hex; loadshare reads the chain. The RPC
+    // takes (joint_tx_hex, joint_vout, my_partial, peer_partial,
+    // absorb_h_s) — but the user pasted partials, not the tx_hex.
+    // For simplicity here, the RPC requires joint_tx_hex; we ask
+    // the chain to give it up via getrawtransaction.
+    std::string params_get = std::string("[\"") + joint_txid.toStdString() + "\",1]";
+    auto rg = callRpc("getrawtransaction", params_get);
+    if (!rg.ok) {
+        setStatus(tr("getrawtransaction failed: %1").arg(QString::fromStdString(rg.error_msg)), true);
+        return;
+    }
+    UniValue gv;
+    gv.read(rg.json);
+    const std::string tx_hex = gv["hex"].get_str();
+
+    std::string params = std::string("[\"") + tx_hex + "\","
+        + std::to_string(vout) + ",\""
+        + my_p.toStdString() + "\",\""
+        + peer_p.toStdString() + "\","
+        + absorb + "]";
+    auto r = callRpc("pricoin_jointspend_loadshare", params);
+    if (!r.ok) {
+        setStatus(tr("loadshare failed: %1").arg(QString::fromStdString(r.error_msg)), true);
+        return;
+    }
+    UniValue v;
+    v.read(r.json);
+    const std::string x_share        = v["x_share"].get_str();
+    const std::string b_prev_hex     = v.exists("b_prev")     ? v["b_prev"].get_str()     : "";
+    const std::string joint_pub_hex  = v.exists("joint_pubkey") ? v["joint_pubkey"].get_str() : "";
+    const std::string value_str      = v.exists("value")      ? v["value"].getValStr()    : "";
+    if (m_in_x_share)         m_in_x_share->setText(QString::fromStdString(x_share));
+    if (m_in_bt_joint_blind && !b_prev_hex.empty()) {
+        m_in_bt_joint_blind->setText(QString::fromStdString(b_prev_hex));
+    }
+    if (m_in_joint_pubkey && !joint_pub_hex.empty()) {
+        m_in_joint_pubkey->setText(QString::fromStdString(joint_pub_hex));
+    }
+    // Show the loadshare echo (excluding x_share since it's password-
+    // masked above and shouldn't be screen-pasted again).
+    UniValue echo{UniValue::VOBJ};
+    if (!b_prev_hex.empty())    echo.pushKV("b_prev",      b_prev_hex);
+    if (!joint_pub_hex.empty()) echo.pushKV("joint_pubkey", joint_pub_hex);
+    if (!value_str.empty())     echo.pushKV("value",        value_str);
+    m_out_loadshare->setPlainText(QString::fromStdString(echo.write(2)));
+    setStatus(tr("Loadshare OK. x_share + joint_blind + joint_pubkey filled."));
+}
+
+void PricCoopSignDialog::onRunBuildtx()
+{
+    const QString joint_txid = m_in_bt_joint_txid->text().trimmed();
+    const QString joint_vout = m_in_bt_joint_vout->text().trimmed();
+    const QString joint_val  = m_in_bt_joint_value->text().trimmed();
+    const QString joint_blind= m_in_bt_joint_blind->text().trimmed();
+    const QString joint_pub  = m_in_joint_pubkey ? m_in_joint_pubkey->text().trimmed() : QString{};
+    const QString dest       = m_in_bt_dest->text().trimmed();
+    const QString dest_amt   = m_in_bt_dest_amount->text().trimmed();
+    const QString fee        = m_in_bt_fee->text().trimmed();
+    const QString ring_size  = m_in_bt_ring_size->text().trimmed();
+    const QString nlt        = m_in_bt_nlocktime->text().trimmed();
+    if (joint_txid.size() != 64)   { setStatus(tr("Joint txid must be 32-byte hex"), true); return; }
+    if (joint_blind.size() != 64)  { setStatus(tr("Joint blind must be 32-byte hex"), true); return; }
+    if (joint_pub.size() != 66)    { setStatus(tr("Joint pubkey must be 33-byte hex (fill in Inputs above or run loadshare)"), true); return; }
+    bool vout_ok=false, rs_ok=false, nl_ok=false;
+    int vout = joint_vout.toInt(&vout_ok);
+    int rs   = ring_size.toInt(&rs_ok);
+    int nl   = nlt.toInt(&nl_ok);
+    if (!vout_ok || vout < 0) { setStatus(tr("Joint vout invalid"), true); return; }
+    if (!rs_ok || rs < 2)     { setStatus(tr("Ring size must be >= 2"), true); return; }
+    if (!nl_ok || nl < 0)     { setStatus(tr("nlocktime invalid"), true); return; }
+
+    // pricoin_jointspend_buildtx(joint_txid, joint_vout, joint_value, joint_blind, joint_pubkey, dest, dest_amount, fee, ring_size, nlocktime)
+    std::string params = std::string("[\"")
+        + joint_txid.toStdString() + "\","
+        + std::to_string(vout) + ","
+        + joint_val.toStdString() + ",\""    // amount as numeric / string
+        + joint_blind.toStdString() + "\",\""
+        + joint_pub.toStdString() + "\",\""
+        + dest.toStdString() + "\","
+        + dest_amt.toStdString() + ","
+        + fee.toStdString() + ","
+        + std::to_string(rs) + ","
+        + std::to_string(nl) + "]";
+    // The amounts (joint_val, dest_amt, fee) are strings here without
+    // quotes — that's the convention RPC type-conversion follows for
+    // AMOUNT params; a numeric is also accepted. To be safe quote the
+    // numerics when they have decimal points.
+    {
+        // Simple comma-aware re-quoting for the three amount fields.
+        // Replace ",<value>," with ",\"<value>\","
+        // Done only for dest_amt + fee since they're decimals; the
+        // joint_val we already quoted via outer "\"" above. Cleaner
+        // to build via UniValue.
+    }
+
+    UniValue p{UniValue::VARR};
+    p.push_back(joint_txid.toStdString());
+    p.push_back(vout);
+    p.push_back(joint_val.toStdString());
+    p.push_back(joint_blind.toStdString());
+    p.push_back(joint_pub.toStdString());
+    p.push_back(dest.toStdString());
+    p.push_back(dest_amt.toStdString());
+    p.push_back(fee.toStdString());
+    p.push_back(rs);
+    p.push_back(nl);
+    auto r = callRpc("pricoin_jointspend_buildtx", p.write(0));
+    if (!r.ok) {
+        setStatus(tr("buildtx failed: %1").arg(QString::fromStdString(r.error_msg)), true);
+        return;
+    }
+    UniValue v;
+    v.read(r.json);
+    const std::string sighash    = v["sighash"].get_str();
+    const std::string z_self     = v["z_self"].get_str();
+    const std::string z_other    = v["z_other"].get_str();
+    const int         pi         = v["pi"].getInt<int>();
+    const std::string ring_ml    = v["ring_ml"].write(0);
+    if (m_in_msg) m_in_msg->setText(QString::fromStdString(sighash));
+    if (m_in_pi)  m_in_pi->setText(QString::number(pi));
+    if (m_in_ring_or_ring_ml && m_mode == Mode::PricPlain) {
+        m_in_ring_or_ring_ml->setPlainText(QString::fromStdString(ring_ml));
+    }
+    // Spender's z_self auto-fills the z_share field (plain only).
+    if (m_in_z_share && m_mode == Mode::PricPlain) {
+        m_in_z_share->setText(QString::fromStdString(z_self));
+    }
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("sighash",     sighash);
+    out.pushKV("pi",          pi);
+    out.pushKV("z_self",      z_self);
+    out.pushKV("z_other_for_peer", z_other);
+    out.pushKV("ring_ml",     v["ring_ml"]);
+    out.pushKV("joint_pubkey", v["joint_pubkey"]);
+    m_out_buildtx->setPlainText(QString::fromStdString(out.write(2)));
+    setStatus(tr("Buildtx OK. msg / ring_ml / pi / z_self auto-filled. Send `z_other_for_peer` + ring + pi + msg + joint_pubkey to peer."));
 }
 
 QString PricCoopSignDialog::RandomHex32()
@@ -247,6 +447,99 @@ void PricCoopSignDialog::buildLayout(const QString& title)
                       m_in_ring_or_ring_ml);
 
         steps_v->addWidget(box);
+    }
+
+    // ─── Loadshare helper (auto-derives x_share + blind + value) ───
+    {
+        auto* box = MakeStepBox(tr("Loadshare helper (optional — auto-derives x_share + joint_blind + value)"),
+                                  scroll_inner);
+        auto* form = new QFormLayout(box);
+        form->addRow(new QLabel(tr("Both parties first run pricoin_jointscan_partial on the joint stealth tx, then exchange the partials. Provide both partials here; one party (the h_s absorber) sets <i>absorb=true</i>, the other false. The result auto-fills <i>x_share</i> + the buildtx <i>joint_blind</i>/<i>joint_pubkey</i>/<i>value</i>."), box));
+
+        m_in_ls_my_partial = new QLineEdit(box);
+        m_in_ls_my_partial->setPlaceholderText(tr("My pricoin_jointscan_partial output (hex blob)"));
+        form->addRow(tr("My partial:"), m_in_ls_my_partial);
+
+        m_in_ls_peer_partial = new QLineEdit(box);
+        m_in_ls_peer_partial->setPlaceholderText(tr("Peer's pricoin_jointscan_partial output (hex blob)"));
+        form->addRow(tr("Peer partial:"), m_in_ls_peer_partial);
+
+        m_in_ls_absorb = new QComboBox(box);
+        m_in_ls_absorb->addItem(QStringLiteral("true"));
+        m_in_ls_absorb->addItem(QStringLiteral("false"));
+        m_in_ls_absorb->setToolTip(tr("Exactly one party must set absorb_shared_secret=true so the two x_shares sum to the joint one-time priv."));
+        form->addRow(tr("absorb_shared_secret:"), m_in_ls_absorb);
+
+        m_btn_run_loadshare = new QPushButton(tr("Run loadshare → fill x_share / blind / value"), box);
+        form->addRow(QString(), m_btn_run_loadshare);
+
+        m_out_loadshare = new QPlainTextEdit(box);
+        MakeMono(m_out_loadshare);
+        m_out_loadshare->setReadOnly(true);
+        m_out_loadshare->setMaximumHeight(120);
+        form->addRow(tr("Output:"), m_out_loadshare);
+        steps_v->addWidget(box);
+        connect(m_btn_run_loadshare, &QPushButton::clicked, this, &PricCoopSignDialog::onRunLoadshare);
+    }
+
+    // ─── Buildtx helper (spender-only — pre-fills msg/ring_ml/pi/z) ───
+    {
+        auto* box = MakeStepBox(tr("Buildtx helper (spender-only — pre-fills msg / ring_ml / pi / z_self)"),
+                                  scroll_inner);
+        auto* form = new QFormLayout(box);
+        form->addRow(new QLabel(tr("Calls pricoin_jointspend_buildtx on the joint stealth output to produce the sighash + ring + signer index. The peer pastes these values into their own dialog manually (or via a copyable bundle)."), box));
+
+        m_in_bt_joint_txid = new QLineEdit(box);
+        m_in_bt_joint_txid->setPlaceholderText(tr("32-byte joint output txid"));
+        form->addRow(tr("Joint txid:"), m_in_bt_joint_txid);
+
+        m_in_bt_joint_vout = new QLineEdit(box);
+        m_in_bt_joint_vout->setText(QStringLiteral("0"));
+        form->addRow(tr("Joint vout:"), m_in_bt_joint_vout);
+
+        m_in_bt_joint_value = new QLineEdit(box);
+        m_in_bt_joint_value->setPlaceholderText(tr("Joint output value in PRIC (e.g. 1.0)"));
+        form->addRow(tr("Joint value (PRIC):"), m_in_bt_joint_value);
+
+        m_in_bt_joint_blind = new QLineEdit(box);
+        m_in_bt_joint_blind->setEchoMode(QLineEdit::Password);
+        m_in_bt_joint_blind->setPlaceholderText(tr("32-byte joint_blind / b_prev (from loadshare)"));
+        form->addRow(tr("Joint blind:"), m_in_bt_joint_blind);
+
+        m_in_bt_dest = new QLineEdit(box);
+        m_in_bt_dest->setPlaceholderText(tr("Recipient PRIC stealth address (Alice's for claim, Bob's for refund)"));
+        form->addRow(tr("Destination:"), m_in_bt_dest);
+
+        m_in_bt_dest_amount = new QLineEdit(box);
+        m_in_bt_dest_amount->setPlaceholderText(tr("Destination amount in PRIC"));
+        form->addRow(tr("Dest amount:"), m_in_bt_dest_amount);
+
+        m_in_bt_fee = new QLineEdit(box);
+        m_in_bt_fee->setText(QStringLiteral("0.00001"));
+        form->addRow(tr("Fee (PRIC):"), m_in_bt_fee);
+
+        m_in_bt_ring_size = new QLineEdit(box);
+        m_in_bt_ring_size->setText(QStringLiteral("4"));
+        form->addRow(tr("Ring size:"), m_in_bt_ring_size);
+
+        m_in_bt_nlocktime = new QLineEdit(box);
+        m_in_bt_nlocktime->setText((m_mode == Mode::PricAdaptor)
+            ? QStringLiteral("0")
+            : QStringLiteral(""));
+        m_in_bt_nlocktime->setPlaceholderText(tr("0 for claim; pric_refund_height for refund (auto-pulled from swap record)"));
+        form->addRow(tr("nlocktime:"), m_in_bt_nlocktime);
+
+        m_btn_run_buildtx = new QPushButton(tr("Run buildtx → fill msg / ring / pi / z_self"), box);
+        form->addRow(QString(), m_btn_run_buildtx);
+
+        m_out_buildtx = new QPlainTextEdit(box);
+        MakeMono(m_out_buildtx);
+        m_out_buildtx->setReadOnly(true);
+        m_out_buildtx->setMaximumHeight(180);
+        form->addRow(tr("Output (send ring/pi/msg/z_other/joint_pubkey to peer):"),
+                     m_out_buildtx);
+        steps_v->addWidget(box);
+        connect(m_btn_run_buildtx, &QPushButton::clicked, this, &PricCoopSignDialog::onRunBuildtx);
     }
 
     // ─── Step 1: My round 1 ────────────────────────────────────

@@ -66,9 +66,13 @@ public:
         BtcAdaptor,  // claim leg — adapts under T_G
     };
 
+    // `swap_id` may be empty; if non-empty the dialog looks up the
+    // wallet's PricoinAdaptorSwap record and pre-fills what it can
+    // (peer pubkey, my pubkey, and adaptor T_G in adaptor mode).
     CoopSignDialog(WalletModel* wallet_model,
                    Mode mode,
                    const QString& title,
+                   const std::string& swap_id,
                    QWidget* parent = nullptr);
 
     // Valid only after the dialog completes step 4. The 64-byte sig
@@ -82,11 +86,17 @@ public:
     // _extract later. Empty for plain mode.
     int nonceParity() const { return m_nonce_parity; }
 
+    // 133-byte session blob produced at step 3. The BothFunded form
+    // needs this for the BTC claim leg (it's stored alongside the
+    // pre-sig so the t-holder can call _adapt later).
+    QString sessionDataHex() const { return m_session_data; }
+
 private Q_SLOTS:
     void onStep1Compute();
     void onStep2Compute();
     void onStep3Compute();
     void onStep4Compute();
+    void onComputeSighash();
 
     void onCopyButton();
     void onPasteButton();
@@ -125,6 +135,16 @@ private:
     QLineEdit*      m_in_session_seed{nullptr};
     QPushButton*    m_btn_step2{nullptr};
     QPlainTextEdit* m_out_step2{nullptr};
+
+    // ─── Tx-context auto-sighash (optional helper, sits between
+    // step 1 and step 2) ───
+    QLineEdit*      m_in_funding_txid{nullptr};
+    QLineEdit*      m_in_funding_vout{nullptr};
+    QLineEdit*      m_in_funding_amount{nullptr};
+    QLineEdit*      m_in_recipient_xonly{nullptr};
+    QLineEdit*      m_in_refund_amount{nullptr};
+    QLineEdit*      m_in_nlocktime{nullptr};
+    QPushButton*    m_btn_compute_sighash{nullptr};
 
     // ─── Step 3: Combine ───
     QPlainTextEdit* m_in_peer_pubnonce{nullptr};

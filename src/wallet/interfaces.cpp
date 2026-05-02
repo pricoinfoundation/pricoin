@@ -4,6 +4,7 @@
 
 #include <interfaces/wallet.h>
 
+#include <algorithm>
 #include <common/args.h>
 #include <crypto/hmac_sha256.h>
 #include <consensus/amount.h>
@@ -415,6 +416,26 @@ public:
         o.created_time = s.created_time;
         o.updated_time = s.updated_time;
         o.next_action = ::wallet::pricoin_adaptor_swap::NextActionHint(s);
+        // Surface the on-record adaptor materials once they've been
+        // set (T_G is all-zero before SetAdaptorMaterials).
+        const bool has_adaptor = std::any_of(
+            s.T_G.begin(), s.T_G.end(),
+            [](unsigned char b) { return b != 0; });
+        if (has_adaptor) {
+            o.adaptor_T_G_hex = HexStr(s.T_G);
+            o.adaptor_dleq_blob_hex = HexStr(s.dleq_proof_blob);
+        }
+        o.foreign_funding_txid     = s.foreign_funding_txid;
+        o.foreign_funding_vout     = s.foreign_funding_vout;
+        o.foreign_funding_height   = s.foreign_funding_height;
+        if (!s.pric_funding_txid.IsNull()) {
+            o.pric_funding_txid_hex = s.pric_funding_txid.ToString();
+        }
+        o.pric_funding_vout        = s.pric_funding_vout;
+        o.pric_funding_height      = s.pric_funding_height;
+        o.pric_refund_height       = s.pric_refund_height;
+        o.foreign_refund_height    = s.foreign_refund_height;
+        o.delta_min_blocks         = s.delta_min_blocks;
         return o;
     }
 

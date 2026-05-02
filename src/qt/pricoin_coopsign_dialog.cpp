@@ -78,6 +78,7 @@ void MakeMono(QPlainTextEdit* edit)
 CoopSignDialog::CoopSignDialog(WalletModel* wallet_model,
                                 Mode mode,
                                 const QString& title,
+                                const std::string& swap_id,
                                 QWidget* parent)
     : QDialog(parent),
       m_wm(wallet_model),
@@ -86,6 +87,108 @@ CoopSignDialog::CoopSignDialog(WalletModel* wallet_model,
     setModal(true);
     resize(820, 740);
     buildLayout(title);
+
+    // If a swap_id was given, pre-fill what we can from the wallet's
+    // adaptor-swap record. Saves the user from re-typing fields the
+    // wallet already knows.
+    if (!swap_id.empty() && m_wm) {
+        auto snap = m_wm->wallet().adaptorSwapGet(swap_id);
+        if (snap) {
+            // Peer pubkey: the swap's counterparty_pubkey, 33-byte
+            // compressed already.
+            if (m_in_peer_pub && !snap->counterparty_pubkey_hex.empty()) {
+                m_in_peer_pub->setText(QString::fromStdString(snap->counterparty_pubkey_hex));
+            }
+            // My pubkey: take the wallet's BIP340 swap-identity x-only
+            // and synthesise the 33-byte compressed (even-y) form by
+            // prefixing 0x02. BIP327 keyagg accepts this; the parity
+            // is internal to the keyagg cache.
+            const std::string xonly = m_wm->wallet().getSwapIdentityXOnlyHex();
+            if (m_in_my_pub && xonly.size() == 64) {
+                m_in_my_pub->setText(QStringLiteral("02") + QString::fromStdString(xonly));
+            }
+            // Adaptor T_G (claim leg only).
+            if (m_mode == Mode::BtcAdaptor && m_in_adaptor_T_G
+                && !snap->adaptor_T_G_hex.empty()) {
+                m_in_adaptor_T_G->setText(QString::fromStdString(snap->adaptor_T_G_hex));
+            }
+            // Funding outpoint + amount: auto-fill the tx-context
+            // helper rows once they exist (built later in
+            // buildLayout). Done after the layout is up via a
+            // single-shot timer-style assignment.
+            if (m_in_funding_txid && !snap->foreign_funding_txid.empty()) {
+                m_in_funding_txid->setText(QString::fromStdString(snap->foreign_funding_txid));
+            }
+            if (m_in_funding_vout && snap->foreign_funding_vout >= 0) {
+                m_in_funding_vout->setText(QString::number(snap->foreign_funding_vout));
+            }
+            if (m_in_funding_amount && snap->foreign_amount_sat > 0) {
+                m_in_funding_amount->setText(QString::number(snap->foreign_amount_sat));
+                // Default refund amount = funding amount minus a
+                // tiny fee (1000 sat). The user can override this.
+                if (m_in_refund_amount && snap->foreign_amount_sat > 1000) {
+                    m_in_refund_amount->setText(QString::number(snap->foreign_amount_sat - 1000));
+                }
+            }
+            // Refund mode: nlocktime = foreign_refund_height.
+            if (m_mode == Mode::BtcPlain && m_in_nlocktime
+                && snap->foreign_refund_height > 0) {
+                m_in_nlocktime->setText(QString::number(snap->foreign_refund_height));
+            }
+        }
+    }
+}
+
+void CoopSignDialog::onComputeSighash()
+{
+    if (m_agg_xonly.isEmpty()) {
+        setStatus(tr("Run step 1 (keyagg) first — sighash binds to agg_xonly."), true);
+        return;
+    }
+    const QString f_txid = m_in_funding_txid->text().trimmed();
+    const QString f_vout = m_in_funding_vout->text().trimmed();
+    const QString f_amt  = m_in_funding_amount->text().trimmed();
+    const QString rcpt   = m_in_recipient_xonly->text().trimmed();
+    const QString r_amt  = m_in_refund_amount->text().trimmed();
+    const QString nlt    = m_in_nlocktime->text().trimmed();
+    if (f_txid.size() != 64) {
+        setStatus(tr("Funding txid must be 32-byte hex"), true); return;
+    }
+    bool vout_ok = false, fa_ok = false, ra_ok = false, nl_ok = false;
+    int  vout = f_vout.toInt(&vout_ok);
+    long long fa = f_amt.toLongLong(&fa_ok);
+    long long ra = r_amt.toLongLong(&ra_ok);
+    int  nl   = nlt.toInt(&nl_ok);
+    if (!vout_ok || vout < 0) { setStatus(tr("Funding vout invalid"), true); return; }
+    if (!fa_ok || fa <= 0)    { setStatus(tr("Funding amount sat invalid"), true); return; }
+    if (!ra_ok || ra <= 0)    { setStatus(tr("Output amount sat invalid"), true); return; }
+    if (!nl_ok || nl < 0)     { setStatus(tr("nlocktime invalid"), true); return; }
+    if (rcpt.size() != 64) {
+        setStatus(tr("Recipient x-only must be 32-byte hex"), true); return;
+    }
+    // Synthesize the P2TR scriptPubKey from the recipient x-only:
+    //   OP_1 OP_PUSHBYTES_32 <32 bytes> = 0x51 0x20 ...
+    const std::string spk_hex = std::string("5120") + rcpt.toStdString();
+
+    // pricoin_btc_swap_tx_build(funding_txid, funding_vout, funding_amount_sat, agg_xonly, recipient_script_pubkey, refund_amount_sat, nlocktime)
+    std::string params = std::string("[\"")
+        + f_txid.toStdString() + "\","
+        + std::to_string(vout) + ","
+        + std::to_string(fa) + ",\""
+        + m_agg_xonly.toStdString() + "\",\""
+        + spk_hex + "\","
+        + std::to_string(ra) + ","
+        + std::to_string(nl) + "]";
+    auto r = callRpc("pricoin_btc_swap_tx_build", params);
+    if (!r.ok) {
+        setStatus(tr("swap_tx_build failed: %1").arg(QString::fromStdString(r.error_msg)), true);
+        return;
+    }
+    UniValue v;
+    v.read(r.json);
+    const QString sighash = QString::fromStdString(v["sighash"].get_str());
+    if (m_in_msg) m_in_msg->setText(sighash);
+    setStatus(tr("Sighash auto-filled (%1…). Proceed to step 2.").arg(sighash.left(16)));
 }
 
 QString CoopSignDialog::RandomHex32()
@@ -190,6 +293,51 @@ void CoopSignDialog::buildLayout(const QString& title)
         form->addRow(QString(), MakeCopyPasteRow(m_out_step1, box));
         steps_v->addWidget(box);
         connect(m_btn_step1, &QPushButton::clicked, this, &CoopSignDialog::onStep1Compute);
+    }
+
+    // ─── Tx-context helper (between step 1 and step 2) ─────────
+    {
+        auto* box = MakeStepBox(tr("Tx context (optional helper — auto-compute sighash)"),
+                                  scroll_inner);
+        auto* form = new QFormLayout(box);
+        form->addRow(new QLabel(tr("Calls pricoin_btc_swap_tx_build with the funding "
+                                    "outpoint + recipient + amount + nlocktime; the "
+                                    "resulting BIP341 sighash auto-fills the Sighash "
+                                    "field below."), box));
+
+        m_in_funding_txid = new QLineEdit(box);
+        m_in_funding_txid->setPlaceholderText(tr("32-byte funding txid (auto-pulled from swap record if available)"));
+        form->addRow(tr("Funding txid:"), m_in_funding_txid);
+
+        m_in_funding_vout = new QLineEdit(box);
+        m_in_funding_vout->setPlaceholderText(tr("0"));
+        form->addRow(tr("Funding vout:"), m_in_funding_vout);
+
+        m_in_funding_amount = new QLineEdit(box);
+        m_in_funding_amount->setPlaceholderText(tr("Funding amount in sat"));
+        form->addRow(tr("Funding amount sat:"), m_in_funding_amount);
+
+        m_in_recipient_xonly = new QLineEdit(box);
+        m_in_recipient_xonly->setPlaceholderText(tr("Recipient 32-byte x-only pubkey hex (P2TR — for claim use Bob's, for refund use Alice's)"));
+        form->addRow(tr("Recipient (x-only):"), m_in_recipient_xonly);
+
+        m_in_refund_amount = new QLineEdit(box);
+        m_in_refund_amount->setPlaceholderText(tr("Output amount in sat (= funding minus fee)"));
+        form->addRow(tr("Output amount sat:"), m_in_refund_amount);
+
+        m_in_nlocktime = new QLineEdit(box);
+        m_in_nlocktime->setText(m_mode == Mode::BtcAdaptor
+            ? QStringLiteral("0")
+            : QStringLiteral(""));
+        m_in_nlocktime->setPlaceholderText(m_mode == Mode::BtcAdaptor
+            ? tr("0 (claim — no timelock)")
+            : tr("Refund block height (= foreign_refund_height; auto-pulled from swap record)"));
+        form->addRow(tr("nlocktime:"), m_in_nlocktime);
+
+        m_btn_compute_sighash = new QPushButton(tr("Compute sighash → fill below"), box);
+        form->addRow(QString(), m_btn_compute_sighash);
+        steps_v->addWidget(box);
+        connect(m_btn_compute_sighash, &QPushButton::clicked, this, &CoopSignDialog::onComputeSighash);
     }
 
     // ─── Step 2: My round-1 ────────────────────────────────────

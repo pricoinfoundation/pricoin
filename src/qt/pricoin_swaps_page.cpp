@@ -399,46 +399,66 @@ void PricoinSwapsPage::onAdvanceClicked()
         form->addRow(new QLabel(tr("Paste the 4 cooperative pre-signatures "
                                     "(spec §6.2 step 5+6+7) as hex blobs."), &dlg));
         auto* btc_p   = AddBlobRow(form, tr("BTC claim pre-sig (64 bytes hex):"), &dlg, 50);
-        // Launcher for the BTC claim adaptor cooperative-signing
-        // dialog. The user runs the 4-step protocol, copies the
-        // resulting `sig` field, and pastes it into the
-        // btc_claim_presig blob above. Likewise for session/parity.
-        auto* btc_claim_helper = new QPushButton(tr("Sign BTC claim adaptor… (cooperative)"), &dlg);
-        QObject::connect(btc_claim_helper, &QPushButton::clicked, &dlg, [this, &dlg]() {
-            CoopSignDialog d(m_model, CoopSignDialog::Mode::BtcAdaptor,
-                             tr("BTC claim adaptor pre-sig"), &dlg);
-            d.exec();
-        });
-        form->addRow(QString(), btc_claim_helper);
         auto* btc_s   = AddBlobRow(form, tr("BTC claim session (133 bytes hex):"), &dlg, 60);
         auto* btc_par = AddIntRow (form, tr("BTC claim nonce parity (0/1):"), &dlg, 0, 1, 0);
+        // Launcher for the BTC claim adaptor cooperative-signing
+        // dialog. On dialog close with a final sig, the three BTC-
+        // claim form fields auto-fill — saves the user from manually
+        // copy-pasting blob/session/parity back into this form.
+        auto* btc_claim_helper = new QPushButton(tr("Sign BTC claim adaptor… (cooperative)"), &dlg);
+        QObject::connect(btc_claim_helper, &QPushButton::clicked, &dlg,
+            [this, &dlg, sid, btc_p, btc_s, btc_par]() {
+            CoopSignDialog d(m_model, CoopSignDialog::Mode::BtcAdaptor,
+                             tr("BTC claim adaptor pre-sig"), sid, &dlg);
+            d.exec();
+            if (!d.finalSigHex().isEmpty()) {
+                btc_p->setPlainText(d.finalSigHex());
+                if (!d.sessionDataHex().isEmpty()) {
+                    btc_s->setPlainText(d.sessionDataHex());
+                }
+                btc_par->setValue(d.nonceParity());
+            }
+        });
+        form->addRow(QString(), btc_claim_helper);
         auto* pric_p  = AddBlobRow(form, tr("PRIC claim pre-sig blob (hex):"), &dlg, 80);
         // Launcher for the PRIC claim adaptor-CLSAG cooperative dialog.
         auto* pric_claim_helper = new QPushButton(tr("Sign PRIC claim adaptor… (cooperative)"), &dlg);
-        QObject::connect(pric_claim_helper, &QPushButton::clicked, &dlg, [this, &dlg]() {
+        QObject::connect(pric_claim_helper, &QPushButton::clicked, &dlg,
+            [this, &dlg, sid, pric_p]() {
             PricCoopSignDialog d(m_model, PricCoopSignDialog::Mode::PricAdaptor,
-                                 tr("PRIC claim adaptor pre-sig"), &dlg);
+                                 tr("PRIC claim adaptor pre-sig"), sid, &dlg);
             d.exec();
+            if (!d.finalBlobHex().isEmpty()) {
+                pric_p->setPlainText(d.finalBlobHex());
+            }
         });
         form->addRow(QString(), pric_claim_helper);
         auto* btc_r   = AddBlobRow(form, tr("BTC refund sig (64 bytes hex):"), &dlg, 50);
         // Launcher for the BTC refund cooperative-signing dialog
         // (plain MuSig2, no adaptor).
         auto* btc_refund_helper = new QPushButton(tr("Sign BTC refund sig… (cooperative)"), &dlg);
-        QObject::connect(btc_refund_helper, &QPushButton::clicked, &dlg, [this, &dlg]() {
+        QObject::connect(btc_refund_helper, &QPushButton::clicked, &dlg,
+            [this, &dlg, sid, btc_r]() {
             CoopSignDialog d(m_model, CoopSignDialog::Mode::BtcPlain,
-                             tr("BTC refund cooperative sig"), &dlg);
+                             tr("BTC refund cooperative sig"), sid, &dlg);
             d.exec();
+            if (!d.finalSigHex().isEmpty()) {
+                btc_r->setPlainText(d.finalSigHex());
+            }
         });
         form->addRow(QString(), btc_refund_helper);
         auto* pric_r  = AddBlobRow(form, tr("PRIC refund sig blob (hex):"), &dlg, 80);
         // Launcher for the PRIC refund cooperative-CLSAG dialog
         // (multi-layer plain — no adaptor).
         auto* pric_refund_helper = new QPushButton(tr("Sign PRIC refund sig… (cooperative)"), &dlg);
-        QObject::connect(pric_refund_helper, &QPushButton::clicked, &dlg, [this, &dlg]() {
+        QObject::connect(pric_refund_helper, &QPushButton::clicked, &dlg,
+            [this, &dlg, sid, pric_r]() {
             PricCoopSignDialog d(m_model, PricCoopSignDialog::Mode::PricPlain,
-                                 tr("PRIC refund cooperative sig"), &dlg);
+                                 tr("PRIC refund cooperative sig"), sid, &dlg);
             d.exec();
+            if (!d.finalBlobHex().isEmpty()) {
+                pric_r->setPlainText(d.finalBlobHex());
+            }
         });
         form->addRow(QString(), pric_refund_helper);
         AddOkCancel(form, &dlg);

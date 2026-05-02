@@ -218,6 +218,27 @@ public:
         int64_t     created_time{0};
         int64_t     updated_time{0};
         std::string next_action;         // role-aware hint
+        // Adaptor materials, populated once SetAdaptorMaterials runs.
+        // Empty before AdaptorReady. The cooperative-sign dialogs
+        // pre-fill T_G / dleq_t from these on construction.
+        std::string adaptor_T_G_hex;
+        std::string adaptor_dleq_blob_hex;
+        // Funding outpoints + heights — the cooperative-sign dialogs
+        // need them to auto-compute the BIP341 sighash (BTC) and the
+        // joint-spend buildtx context (PRIC). Empty / zero before
+        // the corresponding leg is funded.
+        std::string foreign_funding_txid;
+        int32_t     foreign_funding_vout{-1};
+        int32_t     foreign_funding_height{0};
+        std::string pric_funding_txid_hex;
+        int32_t     pric_funding_vout{-1};
+        int32_t     pric_funding_height{0};
+        // Refund timelocks — the dialogs use foreign_refund_height
+        // as nlocktime for the BTC refund leg, and pric_refund_height
+        // for the PRIC refund leg.
+        int32_t     pric_refund_height{0};
+        int32_t     foreign_refund_height{0};
+        int32_t     delta_min_blocks{0};
     };
 
     struct PricoinAdaptorSwapCreateParams {
