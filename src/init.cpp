@@ -71,6 +71,7 @@
 #ifdef ENABLE_WALLET
 #include <wallet/pricoin_adaptor_swap.h>
 #include <wallet/pricoin_btc_musig2_nonce_records.h>
+#include <wallet/pricoin_chain_watcher.h>
 #include <wallet/pricoin_clsag_nonce_records.h>
 #include <wallet/pricoin_offer.h>
 #include <wallet/pricoin_stealth.h>
@@ -449,6 +450,7 @@ void Shutdown(NodeContext& node)
     try { wallet::pricoin_adaptor_swap::Shutdown(); } catch (...) {}
     try { wallet::pricoin_btc_musig2_nonce_records::Shutdown(); } catch (...) {}
     try { wallet::pricoin_offer::Shutdown(); } catch (...) {}
+    try { wallet::pricoin_chain_watcher::Shutdown(); } catch (...) {}
 #endif
     // Drop chain-watch backends (libevent state etc.). Independent of
     // the wallet — backends live at the process level.

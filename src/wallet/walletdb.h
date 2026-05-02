@@ -116,6 +116,12 @@ extern const std::string PRICOIN_BTC_MUSIG2_NONCE;
 // the maker's signing key is volatile per call — but uniform at-rest
 // posture matches the rest of the wallet).
 extern const std::string PRICOIN_OFFER;
+// Tier-3 chain-watcher pending entry. Multi-row, keyed by 32-byte
+// (swap_id || kind_byte) digest. Encrypted at rest. Each entry says
+// "watch this txid; when ≥N confirmations reached on the foreign or
+// PRIC chain, advance the swap state machine via the matching SetX
+// transition." See wallet/pricoin_chain_watcher.cpp.
+extern const std::string PRICOIN_CHAIN_WATCH;
 extern const std::string PURPOSE;
 extern const std::string SETTINGS;
 extern const std::string TX;
@@ -364,6 +370,12 @@ public:
                             const std::vector<unsigned char>& blob);
     bool ErasePricoinOffer(const uint256& order_id);
     bool ReadAllPricoinOffers(
+        std::map<uint256, std::vector<unsigned char>>& out);
+    // Tier-3 chain-watcher pending entry. Keyed by SHA256(swap_id || kind).
+    bool WritePricoinChainWatch(const uint256& digest,
+                                  const std::vector<unsigned char>& blob);
+    bool ErasePricoinChainWatch(const uint256& digest);
+    bool ReadAllPricoinChainWatches(
         std::map<uint256, std::vector<unsigned char>>& out);
     //! Begin a new transaction
     bool TxnBegin();

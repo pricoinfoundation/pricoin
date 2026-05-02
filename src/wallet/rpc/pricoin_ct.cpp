@@ -40,6 +40,7 @@
 #include <swap/btc_refund_tx.h>
 #include <wallet/pricoin_adaptor_swap.h>
 #include <wallet/pricoin_btc_musig2_nonce_records.h>
+#include <wallet/pricoin_chain_watcher.h>
 #include <wallet/pricoin_clsag_nonce_records.h>
 #include <wallet/pricoin_offer.h>
 #include <wallet/pricoin_ct_send.h>
@@ -6202,6 +6203,215 @@ RPCMethod pricoin_offer_export_uri()
     };
 }
 
+// ─── Tier-3 chain-watcher RPCs ──────────────────────────────────
+
+namespace pcw = ::wallet::pricoin_chain_watcher;
+
+uint256 ParseChainWatchSwapId(const UniValue& v)
+{
+    auto sid = uint256::FromHex(v.get_str());
+    if (!sid) throw JSONRPCError(RPC_INVALID_PARAMETER, "swap_id must be 32-byte hex");
+    return *sid;
+}
+
+pcw::WatchKind ParseChainWatchKind(const UniValue& v)
+{
+    auto k = pcw::ParseWatchKind(v.get_str());
+    if (!k) throw JSONRPCError(RPC_INVALID_PARAMETER,
+        "kind must be one of: foreign_funding, pric_funding, pric_claim, foreign_claim, pric_refund, foreign_refund");
+    return *k;
+}
+
+void ThrowFromChainWatchStore(pcw::StoreResult r)
+{
+    using SR = pcw::StoreResult;
+    switch (r) {
+    case SR::Ok: return;
+    case SR::InvalidInput: throw JSONRPCError(RPC_INVALID_PARAMETER, "invalid input for chainwatch entry");
+    case SR::Locked:       throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "wallet locked");
+    case SR::WriteFailed:  throw JSONRPCError(RPC_WALLET_ERROR, "wallet write failed");
+    case SR::Duplicate:    throw JSONRPCError(RPC_INVALID_REQUEST, "duplicate entry for (swap_id, kind)");
+    case SR::NotFound:     throw JSONRPCError(RPC_INVALID_REQUEST, "no chainwatch entry for that (swap_id, kind)");
+    }
+    throw JSONRPCError(RPC_INVALID_PARAMETER, "unknown chainwatch error");
+}
+
+UniValue ChainWatchEntryToJSON(const pcw::WatchEntry& e)
+{
+    UniValue o{UniValue::VOBJ};
+    o.pushKV("swap_id",            e.swap_id.ToString());
+    o.pushKV("kind",               pcw::WatchKindName(e.kind));
+    o.pushKV("txid",               e.txid_hex);
+    if (e.vout >= 0) o.pushKV("vout", e.vout);
+    o.pushKV("min_confirmations",  e.min_confirmations);
+    o.pushKV("added_unix",         e.added_unix);
+    return o;
+}
+
+RPCMethod pricoin_swapwatch_add()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_add",
+        "Tier-3 chain watcher: register a candidate txid for an in-flight swap.\n"
+        "When the txid reaches `min_confirmations` confirmations on the relevant\n"
+        "chain (foreign chain via the configured client; PRIC chain via the\n"
+        "embedded chainstate), the watcher applies the matching SetX transition\n"
+        "to the AdaptorSwap state machine and removes the entry.\n",
+        {
+            {"swap_id",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO,  "32-byte adaptor-swap id"},
+            {"kind",                RPCArg::Type::STR,     RPCArg::Optional::NO,
+                "foreign_funding | pric_funding | pric_claim | foreign_claim | pric_refund | foreign_refund"},
+            {"txid",                RPCArg::Type::STR_HEX, RPCArg::Optional::NO,  "32-byte tx id"},
+            {"vout",                RPCArg::Type::NUM,     RPCArg::Default{-1},   "Output index — required for funding kinds"},
+            {"min_confirmations",   RPCArg::Type::NUM,     RPCArg::Default{1},    "Confirmation threshold (1 default for regtest)"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Stored entry" },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_add", "<swap_id> foreign_funding <txid> 0 1")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            pcw::WatchEntry e;
+            e.swap_id = ParseChainWatchSwapId(request.params[0]);
+            e.kind    = ParseChainWatchKind(request.params[1]);
+            e.txid_hex = request.params[2].get_str();
+            if (e.txid_hex.size() != 64 || !IsHex(e.txid_hex)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "txid must be 32-byte hex");
+            }
+            e.vout = request.params[3].isNull() ? -1 : request.params[3].getInt<int32_t>();
+            e.min_confirmations = request.params[4].isNull()
+                ? 1 : request.params[4].getInt<int32_t>();
+            ThrowFromChainWatchStore(pcw::Add(*wallet_sp, e));
+            return ChainWatchEntryToJSON(e);
+        }
+    };
+}
+
+RPCMethod pricoin_swapwatch_remove()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_remove",
+        "Remove a pending chainwatch entry. NotFound is non-fatal — the call\n"
+        "succeeds with `removed=false`.\n",
+        {
+            {"swap_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"kind",    RPCArg::Type::STR,     RPCArg::Optional::NO, "Same enum as add"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::BOOL, "removed", "True if the entry existed and was removed"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_remove", "<swap_id> foreign_funding")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseChainWatchSwapId(request.params[0]);
+            const pcw::WatchKind k = ParseChainWatchKind(request.params[1]);
+            const auto r = pcw::Remove(*wallet_sp, sid, k);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("removed", r == pcw::StoreResult::Ok);
+            if (r != pcw::StoreResult::Ok && r != pcw::StoreResult::NotFound) {
+                ThrowFromChainWatchStore(r);
+            }
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_swapwatch_list()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_list",
+        "List all pending chainwatch entries.\n",
+        {},
+        RPCResult{ RPCResult::Type::ANY, "", "Array of pending chainwatch entries" },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_list", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            std::vector<pcw::WatchEntry> all;
+            const auto r = pcw::List(*wallet_sp, all);
+            if (r != pcw::StoreResult::Ok) ThrowFromChainWatchStore(r);
+            UniValue out{UniValue::VARR};
+            for (const auto& e : all) out.push_back(ChainWatchEntryToJSON(e));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_swapwatch_notify()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_notify",
+        "Manually fire a chainwatch transition without polling. The call\n"
+        "applies the matching SetX transition to the AdaptorSwap state machine\n"
+        "and (if a matching pending entry exists) removes it.\n"
+        "\n"
+        "Used by external chain-monitoring scripts that observe foreign-chain\n"
+        "confirmations and push them to the wallet, bypassing the watcher's\n"
+        "own polling loop. Also used by tests to drive transitions\n"
+        "deterministically.\n",
+        {
+            {"swap_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"kind",    RPCArg::Type::STR,     RPCArg::Optional::NO, "Same enum as add"},
+            {"txid",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte tx id"},
+            {"vout",    RPCArg::Type::NUM,     RPCArg::Default{-1},  "Funding kinds only"},
+            {"height",  RPCArg::Type::NUM,     RPCArg::Default{-1},  "Confirmation block height"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated swap record" },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_notify",
+            "<swap_id> foreign_funding <txid> 0 800000")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            using namespace ::wallet::pricoin_adaptor_swap;
+            using TR = TransitionResult;
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid  = ParseChainWatchSwapId(request.params[0]);
+            const pcw::WatchKind k = ParseChainWatchKind(request.params[1]);
+            const std::string txid_hex = request.params[2].get_str();
+            if (txid_hex.size() != 64 || !IsHex(txid_hex)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "txid must be 32-byte hex");
+            }
+            const int32_t vout   = request.params[3].isNull() ? -1 : request.params[3].getInt<int32_t>();
+            const int32_t height = request.params[4].isNull() ? -1 : request.params[4].getInt<int32_t>();
+
+            TR r = TR::InvalidInput;
+            switch (k) {
+            case pcw::WatchKind::ForeignFunding:
+                r = SetBtcFunded(*wallet_sp, sid, txid_hex, vout, height);
+                break;
+            case pcw::WatchKind::PricFunding: {
+                auto t = uint256::FromHex(txid_hex);
+                if (!t) throw JSONRPCError(RPC_INVALID_PARAMETER, "txid invalid");
+                r = SetPricFunded(*wallet_sp, sid, *t, vout, height);
+                break;
+            }
+            case pcw::WatchKind::PricClaim: {
+                auto t = uint256::FromHex(txid_hex);
+                if (!t) throw JSONRPCError(RPC_INVALID_PARAMETER, "txid invalid");
+                r = SetPricClaimed(*wallet_sp, sid, *t);
+                break;
+            }
+            case pcw::WatchKind::ForeignClaim:
+                r = SetComplete(*wallet_sp, sid, txid_hex);
+                break;
+            case pcw::WatchKind::PricRefund: {
+                auto t = uint256::FromHex(txid_hex);
+                if (!t) throw JSONRPCError(RPC_INVALID_PARAMETER, "txid invalid");
+                r = SetRefunded(*wallet_sp, sid, *t, /*foreign=*/std::string{});
+                break;
+            }
+            case pcw::WatchKind::ForeignRefund:
+                r = SetRefunded(*wallet_sp, sid, /*pric=*/uint256{}, txid_hex);
+                break;
+            }
+            if (r != TR::Ok) ThrowFromAdaptorSwapTransition(r);
+            (void)pcw::Remove(*wallet_sp, sid, k);
+            AdaptorSwap out;
+            (void)Get(*wallet_sp, sid, out);
+            return AdaptorSwapToJSON(out);
+        }
+    };
+}
+
 } // namespace (close BTC MuSig2 wire RPCs anonymous block — balances open at 4840)
 
 } // namespace (close outer anonymous — balances open at 590; exports + helpers below are at namespace wallet level)
@@ -6279,6 +6489,10 @@ RPCMethod pricoin_offer_fill_export()                    { return pricoin_offer_
 RPCMethod pricoin_offer_unmatch_export()                 { return pricoin_offer_unmatch(); }
 RPCMethod pricoin_offer_find_matches_export()            { return pricoin_offer_find_matches(); }
 RPCMethod pricoin_offer_export_uri_export()              { return pricoin_offer_export_uri(); }
+RPCMethod pricoin_swapwatch_add_export()                { return pricoin_swapwatch_add(); }
+RPCMethod pricoin_swapwatch_remove_export()             { return pricoin_swapwatch_remove(); }
+RPCMethod pricoin_swapwatch_list_export()               { return pricoin_swapwatch_list(); }
+RPCMethod pricoin_swapwatch_notify_export()             { return pricoin_swapwatch_notify(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }
