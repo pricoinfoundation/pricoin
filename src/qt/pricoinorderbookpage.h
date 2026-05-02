@@ -18,8 +18,11 @@ class PlatformStyle;
 QT_BEGIN_NAMESPACE
 class QTableView;
 class QStandardItemModel;
+class QSortFilterProxyModel;
 class QPushButton;
 class QLabel;
+class QCheckBox;
+class QComboBox;
 class QTimer;
 QT_END_NAMESPACE
 
@@ -71,6 +74,7 @@ private Q_SLOTS:
     void onNostrLog(const QString& msg);
     void onNostrRelayStatus(const QString& url, bool connected);
     void onAutoRefreshTick();
+    void onFilterChanged();
 
 private:
     WalletModel* m_model{nullptr};
@@ -78,6 +82,10 @@ private:
 
     QTableView* m_table{nullptr};
     QStandardItemModel* m_table_model{nullptr};
+    QSortFilterProxyModel* m_proxy{nullptr};
+    QCheckBox*  m_filter_active_only{nullptr};
+    QComboBox*  m_filter_origin{nullptr};
+    QComboBox*  m_filter_chain{nullptr};
     QPushButton* m_btn_create{nullptr};
     QPushButton* m_btn_import{nullptr};
     QPushButton* m_btn_refresh{nullptr};

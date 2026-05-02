@@ -190,6 +190,8 @@ if(ENABLE_WALLET)
       receiverequestdialog.h
       recentrequeststablemodel.cpp
       recentrequeststablemodel.h
+      pricoin_match_dialog.cpp
+      pricoin_match_dialog.h
       pricoin_nostr_client.cpp
       pricoin_nostr_client.h
       pricoin_relay_settings_dialog.cpp

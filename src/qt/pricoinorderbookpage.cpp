@@ -4,6 +4,7 @@
 
 #include <qt/pricoinorderbookpage.h>
 
+#include <qt/pricoin_match_dialog.h>
 #include <qt/pricoin_nostr_client.h>
 #include <qt/pricoin_relay_settings_dialog.h>
 #include <qt/walletmodel.h>
@@ -25,7 +26,9 @@
 #include <QPushButton>
 #include <QSpinBox>
 #include <QBrush>
+#include <QCheckBox>
 #include <QColor>
+#include <QSortFilterProxyModel>
 #include <QStandardItemModel>
 #include <QTableView>
 #include <QTextEdit>
@@ -163,6 +166,37 @@ void PricoinOrderbookPage::buildLayout()
     top_row->addWidget(m_status_label, /*stretch=*/1);
     outer->addLayout(top_row);
 
+    // Filter row.
+    auto* filter_row = new QHBoxLayout();
+    m_filter_active_only = new QCheckBox(tr("Active only"), this);
+    m_filter_active_only->setChecked(true);
+    filter_row->addWidget(m_filter_active_only);
+
+    filter_row->addWidget(new QLabel(tr("Origin:"), this));
+    m_filter_origin = new QComboBox(this);
+    m_filter_origin->addItem(tr("All"),      QStringLiteral("all"));
+    m_filter_origin->addItem(tr("Local"),    QStringLiteral("local"));
+    m_filter_origin->addItem(tr("Imported"), QStringLiteral("imported"));
+    filter_row->addWidget(m_filter_origin);
+
+    filter_row->addWidget(new QLabel(tr("Chain:"), this));
+    m_filter_chain = new QComboBox(this);
+    m_filter_chain->addItem(tr("All"), QStringLiteral("all"));
+    m_filter_chain->addItem(QStringLiteral("BTC"), QStringLiteral("btc"));
+    m_filter_chain->addItem(QStringLiteral("LTC"), QStringLiteral("ltc"));
+    filter_row->addWidget(m_filter_chain);
+    filter_row->addStretch();
+    outer->addLayout(filter_row);
+
+    connect(m_filter_active_only, &QCheckBox::stateChanged,
+            this, &PricoinOrderbookPage::onFilterChanged);
+    connect(m_filter_origin,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &PricoinOrderbookPage::onFilterChanged);
+    connect(m_filter_chain,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &PricoinOrderbookPage::onFilterChanged);
+
     // Table.
     m_table_model = new QStandardItemModel(this);
     m_table_model->setHorizontalHeaderLabels({
@@ -171,12 +205,17 @@ void PricoinOrderbookPage::buildLayout()
         tr("Status"), tr("Remaining"), tr("In flight"),
         tr("Expires"), tr("Notes")
     });
+    // QSortFilterProxyModel between the source model and the view —
+    // gives us click-to-sort headers for free. Filtering by status /
+    // origin / chain is done at refresh time (re-populates source).
+    m_proxy = new QSortFilterProxyModel(this);
+    m_proxy->setSourceModel(m_table_model);
     m_table = new QTableView(this);
-    m_table->setModel(m_table_model);
+    m_table->setModel(m_proxy);
     m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_table->setSelectionMode(QAbstractItemView::SingleSelection);
     m_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    m_table->setSortingEnabled(false);
+    m_table->setSortingEnabled(true);
     m_table->verticalHeader()->setVisible(false);
     m_table->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
     m_table->horizontalHeader()->setStretchLastSection(true);
@@ -263,9 +302,26 @@ void PricoinOrderbookPage::refreshTable()
         return;
     }
     m_orders = m_model->wallet().offerList();
-    m_table_model->setRowCount(static_cast<int>(m_orders.size()));
-    for (size_t i = 0; i < m_orders.size(); ++i) {
-        const auto& o = m_orders[i];
+
+    // Apply filters.
+    const bool active_only = m_filter_active_only && m_filter_active_only->isChecked();
+    const QString origin_f = m_filter_origin
+        ? m_filter_origin->currentData().toString() : QStringLiteral("all");
+    const QString chain_f  = m_filter_chain
+        ? m_filter_chain->currentData().toString() : QStringLiteral("all");
+
+    std::vector<interfaces::Wallet::PricoinOfferSnapshot> filtered;
+    filtered.reserve(m_orders.size());
+    for (const auto& o : m_orders) {
+        if (active_only && o.status != "active" && o.status != "matched") continue;
+        if (origin_f != "all" && QString::fromStdString(o.origin) != origin_f) continue;
+        if (chain_f != "all" && QString::fromStdString(o.foreign_chain) != chain_f) continue;
+        filtered.push_back(o);
+    }
+
+    m_table_model->setRowCount(static_cast<int>(filtered.size()));
+    for (size_t i = 0; i < filtered.size(); ++i) {
+        const auto& o = filtered[i];
         const QString id_short = QString::fromStdString(o.order_id).left(12) + "…";
         const QString rate = (o.max_pric_amount_sat > 0)
             ? QString::asprintf("%.8f",
@@ -273,7 +329,11 @@ void PricoinOrderbookPage::refreshTable()
                 static_cast<double>(o.max_pric_amount_sat))
             : QStringLiteral("-");
         int col = 0;
-        m_table_model->setItem(static_cast<int>(i), col++, new QStandardItem(id_short));
+        auto* id_item = new QStandardItem(id_short);
+        // Stash the full order_id on the row so selection mapping is
+        // robust to sort/filter ordering. selectedOrderId() reads it back.
+        id_item->setData(QString::fromStdString(o.order_id), Qt::UserRole + 1);
+        m_table_model->setItem(static_cast<int>(i), col++, id_item);
         m_table_model->setItem(static_cast<int>(i), col++, new QStandardItem(QString::fromStdString(o.origin)));
         m_table_model->setItem(static_cast<int>(i), col++, new QStandardItem(QString::fromStdString(o.side)));
         m_table_model->setItem(static_cast<int>(i), col++, new QStandardItem(QString::fromStdString(o.foreign_chain)));
@@ -310,9 +370,14 @@ std::string PricoinOrderbookPage::selectedOrderId() const
     if (!sm) return {};
     const auto sel = sm->selectedRows();
     if (sel.isEmpty()) return {};
-    const int row = sel.first().row();
-    if (row < 0 || row >= static_cast<int>(m_orders.size())) return {};
-    return m_orders[row].order_id;
+    // Map proxy index → source index → UserRole+1 on column 0 (the
+    // full order_id stashed in refreshTable).
+    QModelIndex proxy_idx = sel.first();
+    QModelIndex src_idx = m_proxy ? m_proxy->mapToSource(proxy_idx) : proxy_idx;
+    if (src_idx.row() < 0) return {};
+    QStandardItem* item = m_table_model->item(src_idx.row(), 0);
+    if (!item) return {};
+    return item->data(Qt::UserRole + 1).toString().toStdString();
 }
 
 void PricoinOrderbookPage::onSelectionChanged()
@@ -421,6 +486,11 @@ void PricoinOrderbookPage::onAutoRefreshTick()
     // Bail out if there's a pending in-place edit etc.; otherwise
     // re-pull. This is a bounded operation (single wallet RPC).
     if (!m_model) return;
+    refreshTable();
+}
+
+void PricoinOrderbookPage::onFilterChanged()
+{
     refreshTable();
 }
 
@@ -668,20 +738,43 @@ void PricoinOrderbookPage::onFindMatchesClicked()
     if (!m_model) return;
     const std::string oid = selectedOrderId();
     if (oid.empty()) return;
-    const auto cands = m_model->wallet().offerFindMatches(oid);
+    auto cands = m_model->wallet().offerFindMatches(oid);
     if (cands.empty()) {
         QMessageBox::information(this, tr("Find matches"),
             tr("No imported orders price-cross with this one."));
         return;
     }
-    QStringList lines;
-    lines << tr("%1 candidate(s) — best first:").arg(cands.size());
-    for (const auto& c : cands) {
-        lines << tr("  %1… max %2 PRIC")
-            .arg(QString::fromStdString(c.their_order_id).left(12))
-            .arg(FormatSat(c.max_actual_pric_sat));
+    // Snapshot the wallet's full order list so the dialog can look up
+    // the maker's rate for the trade preview.
+    const auto all_orders = m_model->wallet().offerList();
+    interfaces::Wallet::PricoinOfferSnapshot mine{};
+    bool found = false;
+    for (const auto& o : all_orders) {
+        if (o.order_id == oid) { mine = o; found = true; break; }
     }
-    QMessageBox::information(this, tr("Find matches"), lines.join('\n'));
+    if (!found) {
+        setStatus(tr("Selected order vanished — refresh and retry."), true);
+        return;
+    }
+    PricoinMatchDialog dlg(mine, std::move(cands), all_orders, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    const std::string their_id = dlg.chosenTheirOrderId();
+    const int64_t actual_pric = dlg.chosenActualPricSat();
+    if (their_id.empty() || actual_pric <= 0) return;
+
+    auto r = m_model->wallet().offerMatch(oid, their_id, actual_pric);
+    if (!r) {
+        setStatus(tr("Match failed: %1")
+            .arg(QString::fromStdString(util::ErrorString(r).original)), true);
+        return;
+    }
+    refreshTable();
+    setStatus(tr("Matched %1 PRIC against %2…")
+        .arg(QString::asprintf("%lld.%08lld",
+            static_cast<long long>(actual_pric / 100'000'000),
+            static_cast<long long>(actual_pric % 100'000'000)))
+        .arg(QString::fromStdString(their_id).left(12)));
 }
 
 void PricoinOrderbookPage::onFillClicked()
