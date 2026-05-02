@@ -41,6 +41,7 @@
 #include <wallet/pricoin_adaptor_swap.h>
 #include <wallet/pricoin_btc_musig2_nonce_records.h>
 #include <wallet/pricoin_clsag_nonce_records.h>
+#include <wallet/pricoin_offer.h>
 #include <wallet/pricoin_ct_send.h>
 #include <wallet/pricoin_stealth.h>
 #include <wallet/pricoin_swap_ceremony.h>
@@ -5740,6 +5741,434 @@ RPCMethod pricoin_btc_p2tr_address()
     };
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Phase 6 — orderbook offer RPCs.
+// Tier 1 of UI work: local order management, signed URIs for off-band
+// exchange, price-cross matching, partial-fill state machine.
+// ─────────────────────────────────────────────────────────────────
+
+namespace pof = ::wallet::pricoin_offer;
+
+const char* OfferSideStr(pof::Side s)
+{
+    return s == pof::Side::BuyPric ? "buy_pric" : "sell_pric";
+}
+
+pof::Side ParseOfferSide(const std::string& s)
+{
+    if (s == "buy_pric")  return pof::Side::BuyPric;
+    if (s == "sell_pric") return pof::Side::SellPric;
+    throw JSONRPCError(RPC_INVALID_PARAMETER, "side must be \"buy_pric\" or \"sell_pric\"");
+}
+
+const char* OfferChainStr(pof::ForeignChain c)
+{
+    return c == pof::ForeignChain::Btc ? "btc" : "ltc";
+}
+
+pof::ForeignChain ParseOfferChain(const std::string& s)
+{
+    if (s == "btc") return pof::ForeignChain::Btc;
+    if (s == "ltc") return pof::ForeignChain::Ltc;
+    throw JSONRPCError(RPC_INVALID_PARAMETER, "foreign_chain must be \"btc\" or \"ltc\"");
+}
+
+const char* OfferStatusStr(pof::Status s)
+{
+    switch (s) {
+    case pof::Status::Active:    return "active";
+    case pof::Status::Matched:   return "matched";
+    case pof::Status::Filled:    return "filled";
+    case pof::Status::Cancelled: return "cancelled";
+    case pof::Status::Expired:   return "expired";
+    }
+    return "unknown";
+}
+
+const char* OfferOriginStr(pof::Origin o)
+{
+    return o == pof::Origin::Local ? "local" : "imported";
+}
+
+UniValue OfferToJSON(const pof::Order& o)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("order_id",        o.payload.order_id.ToString());
+    out.pushKV("origin",          OfferOriginStr(o.origin));
+    out.pushKV("side",            OfferSideStr(o.payload.side));
+    out.pushKV("foreign_chain",   OfferChainStr(o.payload.foreign_chain));
+    out.pushKV("max_pric_amount_sat",       o.payload.max_pric_amount_sat);
+    out.pushKV("foreign_amount_at_max_sat", o.payload.foreign_amount_at_max_sat);
+    out.pushKV("expiry_unix_sec", o.payload.expiry_unix_sec);
+    out.pushKV("maker_pubkey",    HexStr(o.payload.maker_pubkey));
+    out.pushKV("status",          OfferStatusStr(o.status));
+    out.pushKV("pric_remaining_sat", o.pric_remaining_sat);
+    out.pushKV("pric_in_flight_sat", o.pric_in_flight_sat);
+    if (!o.matched_with_order_id.IsNull()) {
+        out.pushKV("matched_with_order_id", o.matched_with_order_id.ToString());
+    }
+    out.pushKV("notes",           o.notes);
+    out.pushKV("created_time",    o.created_time);
+    out.pushKV("updated_time",    o.updated_time);
+    return out;
+}
+
+[[noreturn]] void ThrowFromOfferCreate(pof::CreateResult r)
+{
+    using R = pof::CreateResult;
+    switch (r) {
+    case R::Ok: assert(false);
+    case R::InvalidInput:
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            "amounts and expiry must be > 0");
+    case R::Locked:
+        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+    case R::DerivationFailed:
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+            "swap-identity priv unavailable (wallet locked or not initialized)");
+    case R::WriteFailed:
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "wallet write failed");
+    }
+    assert(false);
+}
+
+[[noreturn]] void ThrowFromOfferImport(pof::ImportResult r)
+{
+    using R = pof::ImportResult;
+    switch (r) {
+    case R::Ok: assert(false);
+    case R::InvalidUri:
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            "URI did not parse as a pricoffer:v1 envelope");
+    case R::InvalidSignature:
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            "offer signature does not verify against maker_pubkey");
+    case R::Duplicate:
+        throw JSONRPCError(RPC_INVALID_REQUEST,
+            "an order with this order_id is already in the wallet");
+    case R::AlreadyExpired:
+        throw JSONRPCError(RPC_INVALID_REQUEST,
+            "offer expiry has already passed; ask the maker for a fresh URI");
+    case R::Locked:
+        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+    case R::WriteFailed:
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "wallet write failed");
+    }
+    assert(false);
+}
+
+[[noreturn]] void ThrowFromOfferMutate(pof::MutateResult r)
+{
+    using R = pof::MutateResult;
+    switch (r) {
+    case R::Ok: assert(false);
+    case R::NotFound:
+        throw JSONRPCError(RPC_INVALID_REQUEST, "no order with that id");
+    case R::InvalidState:
+        throw JSONRPCError(RPC_INVALID_REQUEST,
+            "current state does not permit this transition");
+    case R::InvalidInput:
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "invalid input");
+    case R::PriceCrossFailed:
+        throw JSONRPCError(RPC_INVALID_REQUEST,
+            "orders do not price-cross (or amounts/chain mismatch)");
+    case R::Locked:
+        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+    case R::WriteFailed:
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "wallet write failed");
+    }
+    assert(false);
+}
+
+uint256 ParseOrderId(const std::string& s)
+{
+    auto u = uint256::FromHex(s);
+    if (!u) throw JSONRPCError(RPC_INVALID_PARAMETER, "order_id must be 32-byte hex");
+    return *u;
+}
+
+RPCMethod pricoin_offer_create()
+{
+    return RPCMethod{
+        "pricoin_offer_create",
+        "Create a local order in the wallet's orderbook. Generates a fresh\n"
+        "order_id, signs the offer with the wallet's swap-identity priv, and\n"
+        "returns the record + the canonical pricoffer:v1/<base64> URI suitable\n"
+        "for off-band exchange (paste, QR, IM).\n",
+        {
+            {"side",                      RPCArg::Type::STR,    RPCArg::Optional::NO, "\"buy_pric\" or \"sell_pric\""},
+            {"foreign_chain",             RPCArg::Type::STR,    RPCArg::Optional::NO, "\"btc\" or \"ltc\""},
+            {"max_pric_amount_sat",       RPCArg::Type::NUM,    RPCArg::Optional::NO, "Max PRIC amount (sats)"},
+            {"foreign_amount_at_max_sat", RPCArg::Type::NUM,    RPCArg::Optional::NO, "Foreign amount IF max_pric is fully traded — implies the rate"},
+            {"expiry_unix_sec",           RPCArg::Type::NUM,    RPCArg::Optional::NO, "Unix-seconds expiry (must be in the future)"},
+            {"notes",                     RPCArg::Type::STR,    RPCArg::Default{""},  "Free-form local note"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::ANY,     "record", "Order record (see pricoin_offer_get)"},
+                {RPCResult::Type::STR,     "uri",    "pricoffer:v1/... canonical URI"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_offer_create",
+            "sell_pric btc 100000000 50000000 1800000000 \"my first sell offer\"")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            pof::CreateParams p;
+            p.side          = ParseOfferSide(request.params[0].get_str());
+            p.foreign_chain = ParseOfferChain(request.params[1].get_str());
+            p.max_pric_amount_sat       = request.params[2].getInt<int64_t>();
+            p.foreign_amount_at_max_sat = request.params[3].getInt<int64_t>();
+            p.expiry_unix_sec           = request.params[4].getInt<int64_t>();
+            p.notes = request.params[5].isNull() ? "" : request.params[5].get_str();
+
+            pof::Order o;
+            auto r = pof::Create(*wallet_sp, p, o);
+            if (r != pof::CreateResult::Ok) ThrowFromOfferCreate(r);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("record", OfferToJSON(o));
+            out.pushKV("uri",    pof::EncodeUri(o.payload));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_offer_import()
+{
+    return RPCMethod{
+        "pricoin_offer_import",
+        "Import an offer from a counterparty's pricoffer:v1/<base64> URI.\n"
+        "Verifies the maker's signature; rejects duplicates, malformed URIs,\n"
+        "and expired offers.\n",
+        {
+            {"uri", RPCArg::Type::STR, RPCArg::Optional::NO, "pricoffer:v1/<base64> URI"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Imported order record" },
+        RPCExamples{HelpExampleCli("pricoin_offer_import", "pricoffer:v1/<base64>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            pof::Order o;
+            auto r = pof::Import(*wallet_sp, request.params[0].get_str(), o);
+            if (r != pof::ImportResult::Ok) ThrowFromOfferImport(r);
+            return OfferToJSON(o);
+        }
+    };
+}
+
+RPCMethod pricoin_offer_get()
+{
+    return RPCMethod{
+        "pricoin_offer_get",
+        "Read an order by id.\n",
+        { {"order_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""} },
+        RPCResult{ RPCResult::Type::ANY, "", "Order record" },
+        RPCExamples{HelpExampleCli("pricoin_offer_get", "<order_id>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            pof::Order o;
+            auto r = pof::Get(*wallet_sp, ParseOrderId(request.params[0].get_str()), o);
+            if (r == pof::LookupResult::Locked) throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+            if (r == pof::LookupResult::NotFound) throw JSONRPCError(RPC_INVALID_REQUEST, "no order with that id");
+            return OfferToJSON(o);
+        }
+    };
+}
+
+RPCMethod pricoin_offer_list()
+{
+    return RPCMethod{
+        "pricoin_offer_list",
+        "List all orders in this wallet's orderbook (local + imported).\n",
+        {},
+        RPCResult{ RPCResult::Type::ARR, "", "",
+            {{RPCResult::Type::ANY, "", "Order record"}} },
+        RPCExamples{HelpExampleCli("pricoin_offer_list", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            std::vector<pof::Order> all;
+            auto r = pof::List(*wallet_sp, all);
+            if (r == pof::LookupResult::Locked) throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+            UniValue out{UniValue::VARR};
+            for (const auto& o : all) out.push_back(OfferToJSON(o));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_offer_cancel()
+{
+    return RPCMethod{
+        "pricoin_offer_cancel",
+        "Operator-cancel an order. Allowed from Active or Matched (cancelling\n"
+        "a Matched order also releases the in-flight reservation). Terminal.\n",
+        { {"order_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""} },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated order record" },
+        RPCExamples{HelpExampleCli("pricoin_offer_cancel", "<order_id>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 oid = ParseOrderId(request.params[0].get_str());
+            auto r = pof::Cancel(*wallet_sp, oid);
+            if (r != pof::MutateResult::Ok) ThrowFromOfferMutate(r);
+            pof::Order o;
+            (void)pof::Get(*wallet_sp, oid, o);
+            return OfferToJSON(o);
+        }
+    };
+}
+
+RPCMethod pricoin_offer_match()
+{
+    return RPCMethod{
+        "pricoin_offer_match",
+        "Match my order against their order for the chosen actual_pric_amount.\n"
+        "Both must be Active and price-cross. Both transition to Matched with\n"
+        "pric_in_flight = actual_pric_amount.\n",
+        {
+            {"my_order_id",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"their_order_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"actual_pric_amount_sat", RPCArg::Type::NUM, RPCArg::Optional::NO, "≤ min(both pric_remaining_sat)"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::ANY, "my_order",    "My order after match"},
+                {RPCResult::Type::ANY, "their_order", "Their order after match"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_offer_match", "<my_id> <their_id> 100000000")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 mine   = ParseOrderId(request.params[0].get_str());
+            const uint256 theirs = ParseOrderId(request.params[1].get_str());
+            const int64_t amount = request.params[2].getInt<int64_t>();
+            auto r = pof::Match(*wallet_sp, mine, theirs, amount);
+            if (r != pof::MutateResult::Ok) ThrowFromOfferMutate(r);
+            pof::Order m, t;
+            (void)pof::Get(*wallet_sp, mine, m);
+            (void)pof::Get(*wallet_sp, theirs, t);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("my_order",    OfferToJSON(m));
+            out.pushKV("their_order", OfferToJSON(t));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_offer_fill()
+{
+    return RPCMethod{
+        "pricoin_offer_fill",
+        "Mark a Matched order as filled (swap completed). Decrements remaining\n"
+        "by in_flight; transitions to Filled if remaining=0, else back to Active.\n",
+        { {"order_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""} },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated order record" },
+        RPCExamples{HelpExampleCli("pricoin_offer_fill", "<order_id>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 oid = ParseOrderId(request.params[0].get_str());
+            auto r = pof::Fill(*wallet_sp, oid);
+            if (r != pof::MutateResult::Ok) ThrowFromOfferMutate(r);
+            pof::Order o;
+            (void)pof::Get(*wallet_sp, oid, o);
+            return OfferToJSON(o);
+        }
+    };
+}
+
+RPCMethod pricoin_offer_unmatch()
+{
+    return RPCMethod{
+        "pricoin_offer_unmatch",
+        "Release a Matched order back to Active without consuming. Used when\n"
+        "the swap setup aborts before reaching finality (the residual amount\n"
+        "is preserved for a future match).\n",
+        { {"order_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""} },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated order record" },
+        RPCExamples{HelpExampleCli("pricoin_offer_unmatch", "<order_id>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 oid = ParseOrderId(request.params[0].get_str());
+            auto r = pof::Unmatch(*wallet_sp, oid);
+            if (r != pof::MutateResult::Ok) ThrowFromOfferMutate(r);
+            pof::Order o;
+            (void)pof::Get(*wallet_sp, oid, o);
+            return OfferToJSON(o);
+        }
+    };
+}
+
+RPCMethod pricoin_offer_find_matches()
+{
+    return RPCMethod{
+        "pricoin_offer_find_matches",
+        "Find imported orders that price-cross with my order, sorted best-first.\n",
+        { {"my_order_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""} },
+        RPCResult{ RPCResult::Type::ARR, "", "",
+            {{RPCResult::Type::OBJ, "", "",
+                {
+                    {RPCResult::Type::STR_HEX, "their_order_id",          ""},
+                    {RPCResult::Type::NUM,     "their_max_pric_sat",      ""},
+                    {RPCResult::Type::NUM,     "their_foreign_at_max_sat",""},
+                    {RPCResult::Type::NUM,     "max_actual_pric_sat",     "Best fill amount given remaining on both sides"},
+                    {RPCResult::Type::NUM,     "price_advantage_milli",   "Sort key (bigger = better for me)"},
+                }
+            }} },
+        RPCExamples{HelpExampleCli("pricoin_offer_find_matches", "<my_order_id>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 oid = ParseOrderId(request.params[0].get_str());
+            std::vector<pof::MatchCandidate> cands;
+            auto r = pof::FindMatches(*wallet_sp, oid, cands);
+            if (r == pof::LookupResult::Locked) throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+            if (r == pof::LookupResult::NotFound) throw JSONRPCError(RPC_INVALID_REQUEST, "no order with that id");
+            UniValue out{UniValue::VARR};
+            for (const auto& c : cands) {
+                UniValue obj{UniValue::VOBJ};
+                obj.pushKV("their_order_id",            c.their_order_id.ToString());
+                obj.pushKV("their_max_pric_sat",        c.their_max_pric_sat);
+                obj.pushKV("their_foreign_at_max_sat",  c.their_foreign_at_max_sat);
+                obj.pushKV("max_actual_pric_sat",       c.max_actual_pric_sat);
+                obj.pushKV("price_advantage_milli",     c.price_advantage_milli);
+                out.push_back(obj);
+            }
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_offer_export_uri()
+{
+    return RPCMethod{
+        "pricoin_offer_export_uri",
+        "Re-export a local order's pricoffer URI (for re-publishing).\n"
+        "Imported orders return an empty string.\n",
+        { {"order_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""} },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR, "uri", ""}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_offer_export_uri", "<order_id>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 oid = ParseOrderId(request.params[0].get_str());
+            std::string uri;
+            auto r = pof::ExportUri(*wallet_sp, oid, uri);
+            if (r == pof::LookupResult::Locked) throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet locked");
+            if (r == pof::LookupResult::NotFound) throw JSONRPCError(RPC_INVALID_REQUEST, "no order with that id");
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("uri", uri);
+            return out;
+        }
+    };
+}
+
 } // namespace (close BTC MuSig2 wire RPCs anonymous block — balances open at 4840)
 
 } // namespace (close outer anonymous — balances open at 590; exports + helpers below are at namespace wallet level)
@@ -5807,6 +6236,16 @@ RPCMethod pricoin_btc_musig2_nonce_erase_export()        { return pricoin_btc_mu
 RPCMethod pricoin_btc_swap_tx_build_export()             { return pricoin_btc_swap_tx_build(); }
 RPCMethod pricoin_btc_swap_tx_finalize_export()          { return pricoin_btc_swap_tx_finalize(); }
 RPCMethod pricoin_btc_p2tr_address_export()              { return pricoin_btc_p2tr_address(); }
+RPCMethod pricoin_offer_create_export()                  { return pricoin_offer_create(); }
+RPCMethod pricoin_offer_import_export()                  { return pricoin_offer_import(); }
+RPCMethod pricoin_offer_get_export()                     { return pricoin_offer_get(); }
+RPCMethod pricoin_offer_list_export()                    { return pricoin_offer_list(); }
+RPCMethod pricoin_offer_cancel_export()                  { return pricoin_offer_cancel(); }
+RPCMethod pricoin_offer_match_export()                   { return pricoin_offer_match(); }
+RPCMethod pricoin_offer_fill_export()                    { return pricoin_offer_fill(); }
+RPCMethod pricoin_offer_unmatch_export()                 { return pricoin_offer_unmatch(); }
+RPCMethod pricoin_offer_find_matches_export()            { return pricoin_offer_find_matches(); }
+RPCMethod pricoin_offer_export_uri_export()              { return pricoin_offer_export_uri(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

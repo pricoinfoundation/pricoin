@@ -111,6 +111,11 @@ extern const std::string PRICOIN_ADAPTOR_SWAP;
 // at rest via EncryptWalletBlob — the contents are public but the
 // envelope keeps the wallet's at-rest posture uniform.
 extern const std::string PRICOIN_BTC_MUSIG2_NONCE;
+// Phase 6 — orderbook offer record. Multi-row, keyed by uint256 order_id.
+// Encrypted at rest via EncryptWalletBlob (carries no secret material —
+// the maker's signing key is volatile per call — but uniform at-rest
+// posture matches the rest of the wallet).
+extern const std::string PRICOIN_OFFER;
 extern const std::string PURPOSE;
 extern const std::string SETTINGS;
 extern const std::string TX;
@@ -353,6 +358,12 @@ public:
                                      const std::vector<unsigned char>& blob);
     bool ErasePricoinBtcMusig2Nonce(const uint256& digest);
     bool ReadAllPricoinBtcMusig2Nonces(
+        std::map<uint256, std::vector<unsigned char>>& out);
+    // Phase 6 — orderbook offers.
+    bool WritePricoinOffer(const uint256& order_id,
+                            const std::vector<unsigned char>& blob);
+    bool ErasePricoinOffer(const uint256& order_id);
+    bool ReadAllPricoinOffers(
         std::map<uint256, std::vector<unsigned char>>& out);
     //! Begin a new transaction
     bool TxnBegin();
