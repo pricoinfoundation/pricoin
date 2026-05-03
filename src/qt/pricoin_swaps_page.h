@@ -61,6 +61,7 @@ private Q_SLOTS:
     void onSwapwatchRefresh();
     void onAdaptBtcClaimClicked();
     void onAdaptPricClaimClicked();
+    void onLtcRefundClicked();
 
 private:
     WalletModel* m_model{nullptr};
@@ -86,6 +87,7 @@ private:
     QPushButton*        m_btn_sw_refresh{nullptr};
     QPushButton*        m_btn_adapt_btc_claim{nullptr};
     QPushButton*        m_btn_adapt_pric_claim{nullptr};
+    QPushButton*        m_btn_ltc_refund{nullptr};
     QTableView*         m_sw_table{nullptr};
     QStandardItemModel* m_sw_table_model{nullptr};
 

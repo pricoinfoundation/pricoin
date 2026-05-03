@@ -7049,8 +7049,18 @@ RPCMethod pricoin_ltc_claim_swap()
                 throw JSONRPCError(RPC_WALLET_ERROR,
                     std::string("LTC broadcast failed: ") + e.what());
             }
+            // Register a foreign_claim watch so the swapwatch advances
+            // the swap to Complete when the claim confirms.
+            pcw::WatchEntry e;
+            e.swap_id = sid;
+            e.kind = pcw::WatchKind::ForeignClaim;
+            e.txid_hex = txid;
+            e.vout = 0;
+            e.min_confirmations = 1;
+            const auto wr = pcw::Add(wallet, e);
             UniValue out{UniValue::VOBJ};
             out.pushKV("txid", txid);
+            out.pushKV("watch_registered", wr == pcw::StoreResult::Ok);
             return out;
         }
     };
@@ -7123,8 +7133,18 @@ RPCMethod pricoin_ltc_refund_swap()
                 throw JSONRPCError(RPC_WALLET_ERROR,
                     std::string("LTC broadcast failed: ") + e.what());
             }
+            // Register a foreign_refund watch so the swapwatch
+            // advances the swap to Refunded when this confirms.
+            pcw::WatchEntry e;
+            e.swap_id = sid;
+            e.kind = pcw::WatchKind::ForeignRefund;
+            e.txid_hex = txid;
+            e.vout = 0;
+            e.min_confirmations = 1;
+            const auto wr = pcw::Add(wallet, e);
             UniValue out{UniValue::VOBJ};
             out.pushKV("txid", txid);
+            out.pushKV("watch_registered", wr == pcw::StoreResult::Ok);
             return out;
         }
     };

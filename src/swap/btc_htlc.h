@@ -142,6 +142,16 @@ std::vector<unsigned char> BuildRefundTx(
 // for callers building the redeem script.
 std::array<unsigned char, 32> Sha256Preimage(std::span<const unsigned char> preimage);
 
+// End-to-end correctness self-test for the discrete-log-bound HTLC.
+// Builds the redeem script, a fake funding tx, the claim tx, and the
+// refund tx; runs the script interpreter on each witness to confirm
+// the script accepts the honest paths and rejects:
+//   * a claim with the wrong t (knowledge of dlog of T_G failure)
+//   * a refund before the timelock height
+// Throws on any mismatch — wired into Pricoin's startup self-test
+// gauntlet so a regression fails the daemon at boot.
+void RunDLHTLCSelfTest();
+
 // ─── Discrete-log-bound HTLC ─────────────────────────────────────
 //
 // Variant of the HTLC above where the claim path is bound to

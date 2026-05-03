@@ -19,6 +19,7 @@
 #include <pricoin/btc_musig2_nonce_policy.h>
 #include <pricoin/clsag_nonce_policy.h>
 #include <swap/atomic_swap_e2e_test.h>
+#include <swap/btc_htlc.h>
 #include <swap/btc_adaptor_schnorr.h>
 #include <swap/btc_musig2_adaptor.h>
 #include <swap/btc_refund_tx.h>
@@ -520,6 +521,14 @@ void RunSelfTest(const SelfTestProgressFn& progress)
     step("Atomic-swap E2E (cross-chain happy path)");
     ::pricoin::swap::atomic_swap_e2e_test::RunSelfTest();
     LogInfo("Pricoin atomic-swap E2E (cross-chain integration) self-test passed");
+
+    // Phase B — discrete-log-bound HTLC primitive (LTC swap leg).
+    // Verifies BuildDLHTLCScript / BuildDLClaimTx / BuildRefundTx
+    // through the full script interpreter: honest claim accepts, wrong
+    // t rejects, honest refund accepts, early refund rejects via CLTV.
+    step("LTC DL-HTLC (discrete-log binding via T_G script enforcement)");
+    ::pricoin::swap::btc_htlc::RunDLHTLCSelfTest();
+    LogInfo("Pricoin DL-HTLC (LTC swap leg) self-test passed");
 
     // Atomic-swap phase 5 — refund-tx pre-signing (spec §6.2 step 7).
     // Validates timelock-constraint policy + non-adaptor cooperative

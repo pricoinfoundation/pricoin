@@ -7,14 +7,17 @@
 #include <bech32.h>
 #include <crypto/sha256.h>
 #include <hash.h>
+#include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
 #include <script/script.h>
+#include <script/script_error.h>
 #include <streams.h>
 #include <uint256.h>
 #include <util/strencodings.h>
 
 #include <cstring>
+#include <stdexcept>
 
 namespace pricoin::swap::btc_htlc {
 
@@ -405,6 +408,186 @@ std::vector<unsigned char> BuildRefundTx(
         /*nLockTime=*/static_cast<uint32_t>(timeout));
     SignAndAttachWitness(mtx, 0, funding, sender_priv, /*claim_path=*/false, /*preimage=*/{});
     return SerializeTxWithWitness(mtx);
+}
+
+// ─── Self-test ──────────────────────────────────────────────────
+
+namespace {
+
+CMutableTransaction ParseTxBytes(std::span<const unsigned char> bytes)
+{
+    DataStream ds{bytes};
+    CMutableTransaction mtx;
+    ds >> TX_WITH_WITNESS(mtx);
+    return mtx;
+}
+
+void Check(bool cond, const char* what)
+{
+    if (!cond) {
+        throw std::runtime_error(std::string("DL-HTLC self-test failed: ") + what);
+    }
+}
+
+} // namespace
+
+void RunDLHTLCSelfTest()
+{
+    // Honest setup: alice + bob keypairs, secret t, timeout height.
+    CKey alice_priv; alice_priv.MakeNewKey(/*fCompressed=*/true);
+    CKey bob_priv;   bob_priv.MakeNewKey(  /*fCompressed=*/true);
+    const CPubKey alice_pub = alice_priv.GetPubKey();
+    const CPubKey bob_pub   = bob_priv.GetPubKey();
+
+    // Random valid scalar t. (CKey::MakeNewKey rejects out-of-range
+    // scalars, so we use that as a uniform sampler.)
+    CKey t_priv; t_priv.MakeNewKey(/*fCompressed=*/true);
+    std::array<unsigned char, 32> t_bytes{};
+    std::memcpy(t_bytes.data(), t_priv.begin(), 32);
+    const CPubKey T_G_pub = t_priv.GetPubKey();
+    Check(T_G_pub.IsValid() && T_G_pub.size() == 33, "T_G valid");
+
+    constexpr int64_t kTimeout = 1'000'000;
+
+    const CScript redeem = BuildDLHTLCScript(
+        std::span<const unsigned char>(T_G_pub.data(), 33),
+        alice_pub, bob_pub, kTimeout);
+    const CScript spk = BuildHTLCScriptPubKey(redeem);
+
+    // Synthetic prior-tx funding the HTLC. We don't broadcast — only
+    // its txid (= hash of the in-memory tx) is what HTLCFunding needs.
+    CMutableTransaction prev;
+    prev.version = 2;
+    prev.nLockTime = 0;
+    {
+        CTxIn in;
+        in.prevout = COutPoint{Txid::FromUint256(uint256::ONE), 0};
+        in.nSequence = 0xfffffffe;
+        prev.vin.push_back(std::move(in));
+    }
+    {
+        CTxOut o;
+        o.nValue = 100'000'000;          // 1.0 LTC
+        o.scriptPubKey = spk;
+        prev.vout.push_back(std::move(o));
+    }
+    const Txid prev_txid = CTransaction(prev).GetHash();
+
+    HTLCFunding f;
+    f.prev_txid     = prev_txid.ToUint256();
+    f.prev_vout     = 0;
+    f.prev_value    = prev.vout[0].nValue;
+    f.redeem_script = redeem;
+
+    // Destination: P2WPKH paying alice's pubkey (just a placeholder
+    // SPK so the spending tx has a valid output).
+    const CKeyID alice_keyid = alice_pub.GetID();
+    const CScript dest = CScript()
+        << OP_0
+        << std::vector<unsigned char>(alice_keyid.begin(), alice_keyid.end());
+    constexpr CAmount kFee = 1000;
+
+    const std::vector<CTxOut> spent_outputs{prev.vout[0]};
+
+    // ─── Honest claim ───────────────────────────────────
+    {
+        auto tx_bytes = BuildDLClaimTx(
+            f, std::span<const unsigned char>(t_bytes.data(), 32),
+            alice_priv, dest, kFee);
+        CMutableTransaction spend = ParseTxBytes(tx_bytes);
+        PrecomputedTransactionData txdata;
+        txdata.Init(spend, std::vector<CTxOut>{spent_outputs}, /*force=*/true);
+        MutableTransactionSignatureChecker checker(
+            &spend, /*nIn=*/0, prev.vout[0].nValue, txdata,
+            MissingDataBehavior::FAIL);
+        ScriptError serror = SCRIPT_ERR_OK;
+        const bool ok = VerifyScript(
+            CScript{}, spk, &spend.vin[0].scriptWitness,
+            STANDARD_SCRIPT_VERIFY_FLAGS, checker, &serror);
+        Check(ok && serror == SCRIPT_ERR_OK, "honest DL claim verify");
+    }
+
+    // ─── Wrong t ────────────────────────────────────────
+    {
+        CKey wrong_t; wrong_t.MakeNewKey(true);
+        std::array<unsigned char, 32> wrong{};
+        std::memcpy(wrong.data(), wrong_t.begin(), 32);
+        auto tx_bytes = BuildDLClaimTx(
+            f, std::span<const unsigned char>(wrong.data(), 32),
+            alice_priv, dest, kFee);
+        CMutableTransaction spend = ParseTxBytes(tx_bytes);
+        PrecomputedTransactionData txdata;
+        txdata.Init(spend, std::vector<CTxOut>{spent_outputs}, /*force=*/true);
+        MutableTransactionSignatureChecker checker(
+            &spend, 0, prev.vout[0].nValue, txdata, MissingDataBehavior::FAIL);
+        ScriptError serror = SCRIPT_ERR_OK;
+        const bool ok = VerifyScript(
+            CScript{}, spk, &spend.vin[0].scriptWitness,
+            STANDARD_SCRIPT_VERIFY_FLAGS, checker, &serror);
+        Check(!ok, "wrong-t claim must fail");
+    }
+
+    // ─── Honest refund (after timelock) ────────────────
+    {
+        auto tx_bytes = BuildRefundTx(f, kTimeout, bob_priv, dest, kFee);
+        CMutableTransaction spend = ParseTxBytes(tx_bytes);
+        Check(spend.nLockTime == kTimeout, "refund nLockTime set");
+        // The MutableTransactionSignatureChecker does not by itself
+        // simulate a chain tip — CHECKLOCKTIMEVERIFY validates the
+        // tx's nLockTime field against the timelock pushed by the
+        // script, so the on-chain "is the height past timelock?"
+        // policy is the network's job. The script here checks that
+        // tx.nLockTime ≥ pushed_timeout, which we satisfy.
+        PrecomputedTransactionData txdata;
+        txdata.Init(spend, std::vector<CTxOut>{spent_outputs}, /*force=*/true);
+        MutableTransactionSignatureChecker checker(
+            &spend, 0, prev.vout[0].nValue, txdata, MissingDataBehavior::FAIL);
+        ScriptError serror = SCRIPT_ERR_OK;
+        const bool ok = VerifyScript(
+            CScript{}, spk, &spend.vin[0].scriptWitness,
+            STANDARD_SCRIPT_VERIFY_FLAGS, checker, &serror);
+        Check(ok && serror == SCRIPT_ERR_OK, "honest DL refund verify");
+    }
+
+    // ─── Refund with too-low nLockTime ─────────────────
+    // CLTV check is `tx.nLockTime ≥ script-pushed timeout`. We build
+    // a refund whose redeem script pushes `kTimeout+1` while the tx
+    // sets `nLockTime = kTimeout` — so CLTV must fail.
+    {
+        const CScript redeem_late = BuildDLHTLCScript(
+            std::span<const unsigned char>(T_G_pub.data(), 33),
+            alice_pub, bob_pub, kTimeout + 1);
+        const CScript spk_late = BuildHTLCScriptPubKey(redeem_late);
+        // Re-fund into the new SPK.
+        CMutableTransaction prev_late = prev;
+        prev_late.vout[0].scriptPubKey = spk_late;
+        const Txid prev_late_txid = CTransaction(prev_late).GetHash();
+        HTLCFunding f_late = f;
+        f_late.prev_txid     = prev_late_txid.ToUint256();
+        f_late.redeem_script = redeem_late;
+
+        auto tx_bytes = BuildRefundTx(f_late, /*timeout=*/kTimeout,
+                                        bob_priv, dest, kFee);
+        // BuildRefundTx sets nLockTime = its `timeout` arg = kTimeout,
+        // but the script's pushed timeout is kTimeout+1 → CLTV fails.
+        CMutableTransaction spend = ParseTxBytes(tx_bytes);
+        PrecomputedTransactionData txdata;
+        const std::vector<CTxOut> spent_late{prev_late.vout[0]};
+        txdata.Init(spend, std::vector<CTxOut>{spent_late}, /*force=*/true);
+        MutableTransactionSignatureChecker checker(
+            &spend, 0, prev_late.vout[0].nValue, txdata,
+            MissingDataBehavior::FAIL);
+        ScriptError serror = SCRIPT_ERR_OK;
+        const bool ok = VerifyScript(
+            CScript{}, spk_late, &spend.vin[0].scriptWitness,
+            STANDARD_SCRIPT_VERIFY_FLAGS, checker, &serror);
+        Check(!ok, "early-refund must fail");
+        // CLTV failure surfaces as SCRIPT_ERR_NEGATIVE_LOCKTIME
+        // or SCRIPT_ERR_UNSATISFIED_LOCKTIME depending on path.
+        Check(serror == SCRIPT_ERR_UNSATISFIED_LOCKTIME
+              || serror == SCRIPT_ERR_NEGATIVE_LOCKTIME,
+              "early-refund must surface CLTV error");
+    }
 }
 
 } // namespace pricoin::swap::btc_htlc

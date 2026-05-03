@@ -163,13 +163,16 @@ void PricoinSwapsPage::buildLayout()
     m_btn_sw_add    = new QPushButton(tr("Add watch…"),    sw_box);
     m_btn_sw_remove = new QPushButton(tr("Remove watch"),  sw_box);
     m_btn_adapt_btc_claim = new QPushButton(
-        tr("Adapt + broadcast BTC claim…"), sw_box);
+        tr("Adapt + broadcast foreign claim… (Alice)"), sw_box);
     m_btn_adapt_pric_claim = new QPushButton(
         tr("Adapt + broadcast PRIC claim… (Bob)"), sw_box);
+    m_btn_ltc_refund = new QPushButton(
+        tr("LTC refund… (Bob)"), sw_box);
     sw_bot->addWidget(m_btn_sw_add);
     sw_bot->addWidget(m_btn_sw_remove);
     sw_bot->addWidget(m_btn_adapt_btc_claim);
     sw_bot->addWidget(m_btn_adapt_pric_claim);
+    sw_bot->addWidget(m_btn_ltc_refund);
     sw_bot->addStretch();
     sw_outer->addLayout(sw_bot);
     outer->addWidget(sw_box);
@@ -186,6 +189,7 @@ void PricoinSwapsPage::buildLayout()
     connect(m_btn_sw_remove,  &QPushButton::clicked, this, &PricoinSwapsPage::onSwapwatchRemoveClicked);
     connect(m_btn_adapt_btc_claim, &QPushButton::clicked, this, &PricoinSwapsPage::onAdaptBtcClaimClicked);
     connect(m_btn_adapt_pric_claim, &QPushButton::clicked, this, &PricoinSwapsPage::onAdaptPricClaimClicked);
+    connect(m_btn_ltc_refund, &QPushButton::clicked, this, &PricoinSwapsPage::onLtcRefundClicked);
 
     if (auto* sm = m_table->selectionModel()) {
         connect(sm, &QItemSelectionModel::selectionChanged,
@@ -579,31 +583,42 @@ void PricoinSwapsPage::onAdvanceClicked()
 
     // ─── BothFunded → PreSigned ───
     if (snap.state == "both_funded") {
+        const bool is_ltc = (snap.foreign_chain == "ltc");
         dlg.setWindowTitle(tr("Set pre-signatures"));
-        form->addRow(new QLabel(tr("Paste the 4 cooperative pre-signatures "
-                                    "(spec §6.2 step 5+6+7) as hex blobs."), &dlg));
-        auto* btc_p   = AddBlobRow(form, tr("BTC claim pre-sig (64 bytes hex):"), &dlg, 50);
-        auto* btc_s   = AddBlobRow(form, tr("BTC claim session (133 bytes hex):"), &dlg, 60);
-        auto* btc_par = AddIntRow (form, tr("BTC claim nonce parity (0/1):"), &dlg, 0, 1, 0);
-        // Launcher for the BTC claim adaptor cooperative-signing
-        // dialog. On dialog close with a final sig, the three BTC-
-        // claim form fields auto-fill — saves the user from manually
-        // copy-pasting blob/session/parity back into this form.
-        auto* btc_claim_helper = new QPushButton(tr("Sign BTC claim adaptor… (cooperative)"), &dlg);
-        QObject::connect(btc_claim_helper, &QPushButton::clicked, &dlg,
-            [this, &dlg, sid, btc_p, btc_s, btc_par]() {
-            CoopSignDialog d(m_model, CoopSignDialog::Mode::BtcAdaptor,
-                             tr("BTC claim adaptor pre-sig"), sid, &dlg);
-            d.exec();
-            if (!d.finalSigHex().isEmpty()) {
-                btc_p->setPlainText(d.finalSigHex());
-                if (!d.sessionDataHex().isEmpty()) {
-                    btc_s->setPlainText(d.sessionDataHex());
+        form->addRow(new QLabel(is_ltc
+            ? tr("LTC swap: only PRIC pre-signatures are required. The LTC HTLC "
+                 "is unilaterally claimable (Alice with t) and refundable (Bob "
+                 "after timelock) — no cooperative MuSig2 step.")
+            : tr("Paste the 4 cooperative pre-signatures "
+                 "(spec §6.2 step 5+6+7) as hex blobs."),
+            &dlg));
+        QPlainTextEdit* btc_p   = nullptr;
+        QPlainTextEdit* btc_s   = nullptr;
+        QSpinBox*       btc_par = nullptr;
+        if (!is_ltc) {
+            btc_p   = AddBlobRow(form, tr("BTC claim pre-sig (64 bytes hex):"), &dlg, 50);
+            btc_s   = AddBlobRow(form, tr("BTC claim session (133 bytes hex):"), &dlg, 60);
+            btc_par = AddIntRow (form, tr("BTC claim nonce parity (0/1):"), &dlg, 0, 1, 0);
+            // Launcher for the BTC claim adaptor cooperative-signing
+            // dialog. On dialog close with a final sig, the three BTC-
+            // claim form fields auto-fill — saves the user from manually
+            // copy-pasting blob/session/parity back into this form.
+            auto* btc_claim_helper = new QPushButton(tr("Sign BTC claim adaptor… (cooperative)"), &dlg);
+            QObject::connect(btc_claim_helper, &QPushButton::clicked, &dlg,
+                [this, &dlg, sid, btc_p, btc_s, btc_par]() {
+                CoopSignDialog d(m_model, CoopSignDialog::Mode::BtcAdaptor,
+                                 tr("BTC claim adaptor pre-sig"), sid, &dlg);
+                d.exec();
+                if (!d.finalSigHex().isEmpty()) {
+                    btc_p->setPlainText(d.finalSigHex());
+                    if (!d.sessionDataHex().isEmpty()) {
+                        btc_s->setPlainText(d.sessionDataHex());
+                    }
+                    btc_par->setValue(d.nonceParity());
                 }
-                btc_par->setValue(d.nonceParity());
-            }
-        });
-        form->addRow(QString(), btc_claim_helper);
+            });
+            form->addRow(QString(), btc_claim_helper);
+        }
         auto* pric_p  = AddBlobRow(form, tr("PRIC claim pre-sig blob (hex):"), &dlg, 80);
         // Launcher for the PRIC claim adaptor-CLSAG cooperative dialog.
         auto* pric_claim_helper = new QPushButton(tr("Sign PRIC claim adaptor… (cooperative)"), &dlg);
@@ -617,20 +632,23 @@ void PricoinSwapsPage::onAdvanceClicked()
             }
         });
         form->addRow(QString(), pric_claim_helper);
-        auto* btc_r   = AddBlobRow(form, tr("BTC refund sig (64 bytes hex):"), &dlg, 50);
-        // Launcher for the BTC refund cooperative-signing dialog
-        // (plain MuSig2, no adaptor).
-        auto* btc_refund_helper = new QPushButton(tr("Sign BTC refund sig… (cooperative)"), &dlg);
-        QObject::connect(btc_refund_helper, &QPushButton::clicked, &dlg,
-            [this, &dlg, sid, btc_r]() {
-            CoopSignDialog d(m_model, CoopSignDialog::Mode::BtcPlain,
-                             tr("BTC refund cooperative sig"), sid, &dlg);
-            d.exec();
-            if (!d.finalSigHex().isEmpty()) {
-                btc_r->setPlainText(d.finalSigHex());
-            }
-        });
-        form->addRow(QString(), btc_refund_helper);
+        QPlainTextEdit* btc_r = nullptr;
+        if (!is_ltc) {
+            btc_r = AddBlobRow(form, tr("BTC refund sig (64 bytes hex):"), &dlg, 50);
+            // Launcher for the BTC refund cooperative-signing dialog
+            // (plain MuSig2, no adaptor).
+            auto* btc_refund_helper = new QPushButton(tr("Sign BTC refund sig… (cooperative)"), &dlg);
+            QObject::connect(btc_refund_helper, &QPushButton::clicked, &dlg,
+                [this, &dlg, sid, btc_r]() {
+                CoopSignDialog d(m_model, CoopSignDialog::Mode::BtcPlain,
+                                 tr("BTC refund cooperative sig"), sid, &dlg);
+                d.exec();
+                if (!d.finalSigHex().isEmpty()) {
+                    btc_r->setPlainText(d.finalSigHex());
+                }
+            });
+            form->addRow(QString(), btc_refund_helper);
+        }
         auto* pric_r  = AddBlobRow(form, tr("PRIC refund sig blob (hex):"), &dlg, 80);
         // Launcher for the PRIC refund cooperative-CLSAG dialog
         // (multi-layer plain — no adaptor).
@@ -648,11 +666,13 @@ void PricoinSwapsPage::onAdvanceClicked()
         AddOkCancel(form, &dlg);
         if (dlg.exec() != QDialog::Accepted) return;
         interfaces::Wallet::PricoinAdaptorSwapPreSigsHex ps;
-        ps.btc_claim_presig_hex       = btc_p->toPlainText().trimmed().toStdString();
-        ps.btc_claim_session_hex      = btc_s->toPlainText().trimmed().toStdString();
-        ps.btc_claim_nonce_parity     = btc_par->value();
+        if (!is_ltc) {
+            ps.btc_claim_presig_hex       = btc_p->toPlainText().trimmed().toStdString();
+            ps.btc_claim_session_hex      = btc_s->toPlainText().trimmed().toStdString();
+            ps.btc_claim_nonce_parity     = btc_par->value();
+            ps.btc_refund_sig_hex         = btc_r->toPlainText().trimmed().toStdString();
+        }
         ps.pric_claim_presig_blob_hex = pric_p->toPlainText().trimmed().toStdString();
-        ps.btc_refund_sig_hex         = btc_r->toPlainText().trimmed().toStdString();
         ps.pric_refund_sig_blob_hex   = pric_r->toPlainText().trimmed().toStdString();
         auto r = m_model->wallet().adaptorSwapSetPreSigned(sid, ps);
         if (!r) { setStatus(tr("Failed: %1")
@@ -947,6 +967,80 @@ void PricoinSwapsPage::onAdaptBtcClaimClicked()
         setStatus(tr("Select a swap row first."), true);
         return;
     }
+    // Chain dispatch: BTC uses MuSig2 + Schnorr-adapted P2TR claim;
+    // LTC uses the discrete-log-bound HTLC claim (sig under T_G +
+    // sig under Alice's swap-identity priv). The user-visible
+    // difference is that LTC also asks for a destination address.
+    std::string chain;
+    for (const auto& s : m_swaps) {
+        if (s.swap_id == sid) { chain = s.foreign_chain; break; }
+    }
+    if (chain.empty()) {
+        setStatus(tr("Selected swap not found."), true);
+        return;
+    }
+
+    if (chain == "ltc") {
+        QDialog dlg(this);
+        dlg.setWindowTitle(tr("Broadcast LTC HTLC claim (Alice)"));
+        auto* form = new QFormLayout(&dlg);
+        form->addRow(new QLabel(tr("Alice's LTC claim path. The 32-byte t scalar "
+                                    "comes from extracting it on-chain after Bob's "
+                                    "PRIC claim confirms — typically via "
+                                    "pricoin_swapwatch_extract_pric_t. The dest "
+                                    "address is where the LTC will be paid."), &dlg));
+        auto* t_in    = new QLineEdit(&dlg);
+        t_in->setEchoMode(QLineEdit::Password);
+        t_in->setPlaceholderText(tr("64-char hex"));
+        form->addRow(tr("t (hex):"), t_in);
+        auto* dest_in = new QLineEdit(&dlg);
+        dest_in->setPlaceholderText(tr("ltc1q… bech32 address"));
+        form->addRow(tr("Destination LTC address:"), dest_in);
+        auto* fee_in  = new QLineEdit(&dlg);
+        fee_in->setText(QStringLiteral("1000"));
+        form->addRow(tr("Fee (sats):"), fee_in);
+        auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        QObject::connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        QObject::connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        form->addRow(bb);
+        if (dlg.exec() != QDialog::Accepted) return;
+
+        const QString t_hex = t_in->text().trimmed();
+        const QString dest  = dest_in->text().trimmed();
+        bool fee_ok = false;
+        const int64_t fee_sat = fee_in->text().toLongLong(&fee_ok);
+        if (t_hex.size() != 64) {
+            setStatus(tr("t must be 32-byte hex (64 chars)."), true);
+            return;
+        }
+        if (dest.isEmpty()) {
+            setStatus(tr("Destination address required."), true);
+            return;
+        }
+        if (!fee_ok || fee_sat < 0) {
+            setStatus(tr("Fee must be non-negative integer sats."), true);
+            return;
+        }
+        UniValue p{UniValue::VARR};
+        p.push_back(sid);
+        p.push_back(t_hex.toStdString());
+        p.push_back(dest.toStdString());
+        p.push_back(fee_sat);
+        std::string err;
+        auto r = CallWalletRpc(m_model, "pricoin_ltc_claim_swap", p, &err);
+        if (!r) {
+            setStatus(tr("LTC claim failed: %1").arg(QString::fromStdString(err)), true);
+            return;
+        }
+        const QString txid = QString::fromStdString((*r)["txid"].get_str());
+        setStatus(tr("LTC claim broadcast — txid %1… (watching for confirmations).")
+            .arg(txid.left(16)));
+        refreshTable();
+        onSwapwatchRefresh();
+        return;
+    }
+
+    // ─── BTC path (existing) ───
     bool ok = false;
     const QString t_hex = QInputDialog::getText(
         this, tr("Adapt + broadcast BTC claim"),
@@ -972,6 +1066,78 @@ void PricoinSwapsPage::onAdaptBtcClaimClicked()
     }
     const QString txid = QString::fromStdString((*r)["txid"].get_str());
     setStatus(tr("BTC claim broadcast — txid %1… (watching for confirmations).")
+        .arg(txid.left(16)));
+    refreshTable();
+    onSwapwatchRefresh();
+}
+
+void PricoinSwapsPage::onLtcRefundClicked()
+{
+    if (!m_model) return;
+    const std::string sid = selectedSwapId();
+    if (sid.empty()) {
+        setStatus(tr("Select a swap row first."), true);
+        return;
+    }
+    std::string chain;
+    std::string role;
+    for (const auto& s : m_swaps) {
+        if (s.swap_id == sid) {
+            chain = s.foreign_chain;
+            role  = s.role;
+            break;
+        }
+    }
+    if (chain != "ltc") {
+        setStatus(tr("LTC refund only applies to LTC swaps."), true);
+        return;
+    }
+    if (role != "bob") {
+        setStatus(tr("LTC HTLC refund is performed by Bob (the LTC seller)."), true);
+        return;
+    }
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Broadcast LTC HTLC refund (Bob)"));
+    auto* form = new QFormLayout(&dlg);
+    form->addRow(new QLabel(tr("Spends the LTC HTLC refund branch. Only valid after "
+                                "the foreign refund timelock expires; the network "
+                                "rejects earlier broadcasts."), &dlg));
+    auto* dest_in = new QLineEdit(&dlg);
+    dest_in->setPlaceholderText(tr("ltc1q… bech32 address (where Bob receives refund)"));
+    form->addRow(tr("Destination LTC address:"), dest_in);
+    auto* fee_in = new QLineEdit(&dlg);
+    fee_in->setText(QStringLiteral("1000"));
+    form->addRow(tr("Fee (sats):"), fee_in);
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(bb);
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    const QString dest = dest_in->text().trimmed();
+    bool fee_ok = false;
+    const int64_t fee_sat = fee_in->text().toLongLong(&fee_ok);
+    if (dest.isEmpty()) {
+        setStatus(tr("Destination address required."), true);
+        return;
+    }
+    if (!fee_ok || fee_sat < 0) {
+        setStatus(tr("Fee must be non-negative integer sats."), true);
+        return;
+    }
+    UniValue p{UniValue::VARR};
+    p.push_back(sid);
+    p.push_back(dest.toStdString());
+    p.push_back(fee_sat);
+    std::string err;
+    auto r = CallWalletRpc(m_model, "pricoin_ltc_refund_swap", p, &err);
+    if (!r) {
+        setStatus(tr("LTC refund failed: %1").arg(QString::fromStdString(err)), true);
+        return;
+    }
+    const QString txid = QString::fromStdString((*r)["txid"].get_str());
+    setStatus(tr("LTC refund broadcast — txid %1… (watching for confirmations).")
         .arg(txid.left(16)));
     refreshTable();
     onSwapwatchRefresh();
