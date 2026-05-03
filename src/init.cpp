@@ -70,6 +70,7 @@
 #include <pricoin/validation.h>
 #ifdef ENABLE_WALLET
 #include <wallet/pricoin_adaptor_swap.h>
+#include <wallet/pricoin_btc_holding.h>
 #include <wallet/pricoin_btc_musig2_nonce_records.h>
 #include <wallet/pricoin_chain_watcher.h>
 #include <wallet/pricoin_clsag_nonce_records.h>
@@ -451,6 +452,7 @@ void Shutdown(NodeContext& node)
     try { wallet::pricoin_btc_musig2_nonce_records::Shutdown(); } catch (...) {}
     try { wallet::pricoin_offer::Shutdown(); } catch (...) {}
     try { wallet::pricoin_chain_watcher::Shutdown(); } catch (...) {}
+    try { wallet::pricoin_btc_holding::Shutdown(); } catch (...) {}
 #endif
     // Drop chain-watch backends (libevent state etc.). Independent of
     // the wallet — backends live at the process level.
@@ -1614,6 +1616,28 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                         // Re-throw as std::runtime_error so the wallet
                         // library doesn't need to link the swap module's
                         // exception type.
+                        throw std::runtime_error(e.what());
+                    }
+                }
+                std::vector<Utxo> GetAddressUtxos(const std::string& address) override {
+                    try {
+                        const auto raw = m_backend->GetAddressUtxos(address);
+                        std::vector<Utxo> out;
+                        out.reserve(raw.size());
+                        for (const auto& u : raw) {
+                            out.push_back({u.txid, u.vout, u.value_sat,
+                                            u.status.confirmed, u.status.block_height});
+                        }
+                        return out;
+                    } catch (const ::pricoin::swap::ChainBackendError& e) {
+                        throw std::runtime_error(e.what());
+                    }
+                }
+                Balance GetAddressBalance(const std::string& address) override {
+                    try {
+                        const auto b = m_backend->GetAddressBalance(address);
+                        return {b.confirmed_sat, b.unconfirmed_sat, b.utxo_count};
+                    } catch (const ::pricoin::swap::ChainBackendError& e) {
                         throw std::runtime_error(e.what());
                     }
                 }

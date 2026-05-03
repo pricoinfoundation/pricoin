@@ -132,6 +132,25 @@ public:
     // backend error in std::runtime_error so the wallet library
     // doesn't need to link the swap module's exception type.
     virtual std::string Broadcast(const std::string& tx_hex) = 0;
+
+    // Holding-wallet support: enumerate the unspent outputs paying
+    // the address, and the aggregate confirmed/unconfirmed balance.
+    // Throws on backend failure.
+    struct Utxo {
+        std::string txid;
+        int32_t     vout{-1};
+        int64_t     value_sat{0};
+        bool        confirmed{false};
+        int         block_height{-1};
+    };
+    virtual std::vector<Utxo> GetAddressUtxos(const std::string& address) = 0;
+
+    struct Balance {
+        int64_t confirmed_sat{0};
+        int64_t unconfirmed_sat{0};
+        int     utxo_count{0};
+    };
+    virtual Balance GetAddressBalance(const std::string& address) = 0;
 };
 
 // Pluggable factory for resolving a foreign-chain client by chain
@@ -158,6 +177,8 @@ public:
     std::optional<ForeignTxStatus> TxStatus(const std::string& txid_hex) override;
 
     std::string Broadcast(const std::string& tx_hex) override;
+    std::vector<Utxo>    GetAddressUtxos(const std::string& address) override;
+    Balance              GetAddressBalance(const std::string& address) override;
 
     // Test config — protected by an internal mutex.
     void SetTipHeight(std::optional<int> h);

@@ -329,6 +329,85 @@ public:
         return out;
     }
 
+    std::vector<AddressUtxo> GetAddressUtxos(const std::string& address) override
+    {
+        ValidateAddress(address);
+        const std::string path = "/address/" + address + "/utxo";
+        auto reply = DoRequest(m_url, m_opts.timeout_seconds, EVHTTP_REQ_GET, path);
+        Require2xx(reply, path);
+        const UniValue v = ParseJSON(reply.body, path);
+        if (!v.isArray()) {
+            throw ChainBackendError(strprintf(
+                "Esplora %s expected JSON array", path));
+        }
+        std::vector<AddressUtxo> out;
+        out.reserve(v.size());
+        for (size_t i = 0; i < v.size(); ++i) {
+            const UniValue& u = v[i];
+            if (!u.isObject()) continue;
+            AddressUtxo aux;
+            if (const auto& tid = u.find_value("txid"); tid.isStr()) {
+                aux.txid = tid.get_str();
+            } else continue;
+            if (const auto& vo = u.find_value("vout"); vo.isNum()) {
+                aux.vout = vo.getInt<int32_t>();
+            }
+            if (const auto& val = u.find_value("value"); val.isNum()) {
+                aux.value_sat = val.getInt<int64_t>();
+            }
+            if (const auto& st = u.find_value("status"); st.isObject()) {
+                if (const auto& c = st.find_value("confirmed"); c.isBool()) {
+                    aux.status.confirmed = c.get_bool();
+                }
+                if (aux.status.confirmed) {
+                    if (const auto& h = st.find_value("block_height"); h.isNum()) {
+                        aux.status.block_height = h.getInt<int>();
+                    }
+                    if (const auto& bh = st.find_value("block_hash"); bh.isStr()) {
+                        aux.status.block_hash = bh.get_str();
+                    }
+                    if (const auto& bt = st.find_value("block_time"); bt.isNum()) {
+                        aux.status.block_time = bt.getInt<int64_t>();
+                    }
+                }
+            }
+            out.push_back(std::move(aux));
+        }
+        return out;
+    }
+
+    AddressBalance GetAddressBalance(const std::string& address) override
+    {
+        ValidateAddress(address);
+        const std::string path = "/address/" + address;
+        auto reply = DoRequest(m_url, m_opts.timeout_seconds, EVHTTP_REQ_GET, path);
+        Require2xx(reply, path);
+        const UniValue v = ParseJSON(reply.body, path);
+        AddressBalance out;
+        // Esplora returns: chain_stats (confirmed) + mempool_stats (unconfirmed).
+        // Each is { funded_txo_count, funded_txo_sum, spent_txo_count, spent_txo_sum, tx_count }.
+        auto extract = [&](const UniValue& stats) -> int64_t {
+            if (!stats.isObject()) return 0;
+            int64_t funded = 0, spent = 0;
+            if (const auto& f = stats.find_value("funded_txo_sum"); f.isNum()) funded = f.getInt<int64_t>();
+            if (const auto& s = stats.find_value("spent_txo_sum");  s.isNum()) spent  = s.getInt<int64_t>();
+            return funded - spent;
+        };
+        if (const auto& cs = v.find_value("chain_stats"); cs.isObject()) {
+            out.confirmed_sat = extract(cs);
+            if (const auto& fc = cs.find_value("funded_txo_count"); fc.isNum()) {
+                out.utxo_count = fc.getInt<int>();
+                if (const auto& sc = cs.find_value("spent_txo_count"); sc.isNum()) {
+                    out.utxo_count -= sc.getInt<int>();
+                }
+            }
+        }
+        if (const auto& ms = v.find_value("mempool_stats"); ms.isObject()) {
+            out.unconfirmed_sat = extract(ms);
+        }
+        return out;
+    }
+
     std::string Broadcast(const std::string& tx_hex) override
     {
         if (tx_hex.empty() || tx_hex.size() % 2 != 0) {

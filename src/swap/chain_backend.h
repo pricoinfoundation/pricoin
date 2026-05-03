@@ -59,6 +59,26 @@ struct AddressTx {
     int64_t     value_received_sat{0};
 };
 
+// One UTXO for the holding-wallet path — Esplora's /address/<addr>/utxo
+// endpoint returns unspent outputs only. The holding wallet uses these
+// as inputs when building funding/sweep txs.
+struct AddressUtxo {
+    std::string txid;
+    int32_t     vout{-1};
+    int64_t     value_sat{0};
+    TxStatus    status;
+};
+
+// Aggregate per-address balance derived from Esplora's
+// /address/<addr> "chain_stats" object. Confirmed = funded_txo_sum
+// minus spent_txo_sum, ignoring mempool. Useful as a one-call
+// "show me the balance" pricey for the holding wallet UI.
+struct AddressBalance {
+    int64_t confirmed_sat{0};
+    int64_t unconfirmed_sat{0};   // mempool-only
+    int     utxo_count{0};
+};
+
 class ChainBackend {
 public:
     virtual ~ChainBackend() = default;
@@ -82,6 +102,15 @@ public:
     // value-received per tx. Returned in the order the backend gives
     // them (Esplora returns most-recent-first).
     virtual std::vector<AddressTx> GetAddressTxs(const std::string& address) = 0;
+
+    // Unspent outputs paying the address. Used by the holding
+    // wallet to pick coins when building a funding/sweep tx.
+    virtual std::vector<AddressUtxo> GetAddressUtxos(const std::string& address) = 0;
+
+    // Aggregate (confirmed + unconfirmed) balance for the address.
+    // Cheaper than walking GetAddressUtxos when only the totals are
+    // needed (e.g. the holding wallet's status display).
+    virtual AddressBalance GetAddressBalance(const std::string& address) = 0;
 
     // Submit a raw tx to the backend's network for relay. Returns
     // the txid the backend assigned (typically the same hash the

@@ -41,6 +41,7 @@
 #include <swap/btc_refund_tx.h>
 #include <crypto/hmac_sha256.h>
 #include <wallet/pricoin_adaptor_swap.h>
+#include <wallet/pricoin_btc_holding.h>
 #include <wallet/pricoin_btc_musig2_nonce_records.h>
 #include <wallet/pricoin_chain_watcher.h>
 #include <wallet/pricoin_clsag_nonce_records.h>
@@ -6588,6 +6589,219 @@ RPCMethod pricoin_swapwatch_broadcast_foreign()
     };
 }
 
+// ─── Phase A — BTC/LTC holding wallet RPCs ─────────────────────
+
+namespace pbh = ::wallet::pricoin_btc_holding;
+
+RPCMethod pricoin_btc_getaddress()
+{
+    return RPCMethod{
+        "pricoin_btc_getaddress",
+        "Holding wallet receive address for the requested foreign chain.\n"
+        "Single address per chain, derived from the wallet's stealth seed\n"
+        "via an HMAC chain — recoverable from the same backup as the rest\n"
+        "of the wallet. Funds at this address are spendable via\n"
+        "pricoin_btc_fund_swap (one-click swap funding) or\n"
+        "pricoin_btc_sweep (move out).\n",
+        {
+            {"chain", RPCArg::Type::STR, RPCArg::Default{"btc"}, "btc | ltc"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR, "address", "Bech32(m) receive address"},
+                {RPCResult::Type::STR_HEX, "xonly", "32-byte x-only pubkey (BTC P2TR program)"},
+                {RPCResult::Type::STR, "chain", "Echo of chain name"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_getaddress", "btc")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const std::string chain = request.params[0].isNull() ? "btc"
+                : request.params[0].get_str();
+            auto id = pbh::GetOrCreateIdentity(*wallet_sp, chain);
+            if (!id) throw JSONRPCError(RPC_WALLET_ERROR,
+                util::ErrorString(id).original);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("address", id->address);
+            out.pushKV("xonly",   HexStr(id->xonly));
+            out.pushKV("chain",   chain);
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_getbalance()
+{
+    return RPCMethod{
+        "pricoin_btc_getbalance",
+        "Confirmed + unconfirmed balance for the holding-wallet address on\n"
+        "the requested chain. Queries the configured ChainBackend\n"
+        "(-btcwatchurl= / -ltcwatchurl=) — fails with a helpful message\n"
+        "if no backend is registered for that chain.\n",
+        {
+            {"chain", RPCArg::Type::STR, RPCArg::Default{"btc"}, "btc | ltc"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM, "confirmed_sat",   "Confirmed balance"},
+                {RPCResult::Type::NUM, "unconfirmed_sat", "Mempool-only delta"},
+                {RPCResult::Type::NUM, "utxo_count",      "Unspent output count"},
+                {RPCResult::Type::STR, "address",         "The address that was queried"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_getbalance", "btc")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const std::string chain = request.params[0].isNull() ? "btc"
+                : request.params[0].get_str();
+            auto bal = pbh::GetBalance(*wallet_sp, chain);
+            if (!bal) throw JSONRPCError(RPC_WALLET_ERROR,
+                util::ErrorString(bal).original);
+            auto id = pbh::GetOrCreateIdentity(*wallet_sp, chain);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("confirmed_sat",   bal->confirmed_sat);
+            out.pushKV("unconfirmed_sat", bal->unconfirmed_sat);
+            out.pushKV("utxo_count",      bal->utxo_count);
+            out.pushKV("address",         id ? id->address : std::string{});
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_fund_swap()
+{
+    return RPCMethod{
+        "pricoin_btc_fund_swap",
+        "One-click BTC funding for an in-flight atomic swap. Reads the\n"
+        "swap record's foreign_chain, resolves the 2-of-2 P2TR target by\n"
+        "MuSig2 keyagg of (alice_pub, bob_pub), picks a single confirmed\n"
+        "UTXO from the holding-wallet address ≥ (foreign_amount + fee),\n"
+        "builds a 1-input, 2-output funding tx (target + change), signs\n"
+        "with BIP341 key-path-spend, broadcasts via the foreign-chain\n"
+        "backend, and auto-registers a foreign_funding swapwatch entry.\n",
+        {
+            {"swap_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"fee_sat", RPCArg::Type::NUM, RPCArg::Default{1000}, "Flat fee in sats"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "txid", "Broadcast funding txid"},
+                {RPCResult::Type::BOOL,    "watch_registered", "Whether swapwatch entry was stored"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_fund_swap", "<swap_id> 1000")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            const uint256 sid = ParseChainWatchSwapId(request.params[0]);
+            const int64_t fee_sat = request.params[1].isNull() ? 1000
+                : request.params[1].getInt<int64_t>();
+
+            ::wallet::pricoin_adaptor_swap::AdaptorSwap snap;
+            if (::wallet::pricoin_adaptor_swap::Get(wallet, sid, snap)
+                != ::wallet::pricoin_adaptor_swap::LookupResult::Ok) {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "swap not found");
+            }
+            // Compute agg_xonly via MuSig2 keyagg(alice_pub, bob_pub).
+            auto holding = pbh::GetOrCreateIdentity(wallet, snap.foreign_chain);
+            if (!holding) throw JSONRPCError(RPC_WALLET_ERROR,
+                util::ErrorString(holding).original);
+
+            std::vector<CPubKey> pubs;
+            // Order: alice_pub, bob_pub. counterparty_pub is the peer's
+            // 33-byte compressed; my swap-identity is via getSwapIdentityXOnlyHex
+            // synthesised as 02|xonly. (Not the holding-wallet xonly — the
+            // SWAP-identity xonly is what was used at adapt-round1 keyagg.)
+            CKey swap_priv;
+            const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+            constexpr const char* kSwapTag = "pricoin/swap/identity-v1";
+            for (uint8_t counter = 0; counter < 16; ++counter) {
+                CHMAC_SHA256 hmac(UCharCast(id.spend.data()), 32);
+                hmac.Write(reinterpret_cast<const unsigned char*>(kSwapTag),
+                            std::strlen(kSwapTag));
+                hmac.Write(&counter, 1);
+                unsigned char raw[32];
+                hmac.Finalize(raw);
+                swap_priv.Set(raw, raw + 32, true);
+                if (swap_priv.IsValid()) break;
+            }
+            if (!swap_priv.IsValid()) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "swap identity unavailable");
+            }
+            const CPubKey my_swap_pub = swap_priv.GetPubKey();
+            const CPubKey peer_pub(snap.counterparty_pub);
+            const bool i_am_alice =
+                (snap.role == ::wallet::pricoin_adaptor_swap::Role::Alice);
+            pubs.push_back(i_am_alice ? my_swap_pub : peer_pub);
+            pubs.push_back(i_am_alice ? peer_pub   : my_swap_pub);
+            bma::KeyAggCache cache;
+            auto agg = bma::AggregatePubkeys(pubs, cache);
+            if (!agg) throw JSONRPCError(RPC_INTERNAL_ERROR, "MuSig2 keyagg failed");
+
+            // Build + broadcast the funding tx.
+            auto txid_or = pbh::BuildAndBroadcastFundingTx(
+                wallet, snap.foreign_chain, *agg,
+                snap.foreign_amount_sat, fee_sat);
+            if (!txid_or) throw JSONRPCError(RPC_WALLET_ERROR,
+                util::ErrorString(txid_or).original);
+            const std::string txid = *txid_or;
+
+            // Auto-register a foreign_funding watch on vout 0 (the
+            // funding output is always at vout 0 in our builder).
+            ::wallet::pricoin_chain_watcher::WatchEntry e;
+            e.swap_id = sid;
+            e.kind    = ::wallet::pricoin_chain_watcher::WatchKind::ForeignFunding;
+            e.txid_hex = txid;
+            e.vout = 0;
+            e.min_confirmations = 1;
+            const auto r = ::wallet::pricoin_chain_watcher::Add(wallet, e);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("txid", txid);
+            out.pushKV("watch_registered",
+                r == ::wallet::pricoin_chain_watcher::StoreResult::Ok);
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_sweep()
+{
+    return RPCMethod{
+        "pricoin_btc_sweep",
+        "Sweep all UTXOs at the holding-wallet address to a single bech32(m)\n"
+        "destination, paying `fee_sat`. One input per UTXO, one output to\n"
+        "the destination. Use this to move BTC out of the holding wallet.\n",
+        {
+            {"chain",      RPCArg::Type::STR,     RPCArg::Default{"btc"}, "btc | ltc"},
+            {"dest",       RPCArg::Type::STR,     RPCArg::Optional::NO, "Destination bech32(m) address"},
+            {"fee_sat",    RPCArg::Type::NUM,     RPCArg::Default{1000}, "Flat fee in sats"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "txid", "Broadcast txid"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_sweep", "btc bc1q... 1000")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const std::string chain = request.params[0].isNull() ? "btc"
+                : request.params[0].get_str();
+            const std::string dest = request.params[1].get_str();
+            const int64_t fee_sat = request.params[2].isNull() ? 1000
+                : request.params[2].getInt<int64_t>();
+            auto txid_or = pbh::BuildAndBroadcastSweepTx(
+                *wallet_sp, chain, dest, fee_sat);
+            if (!txid_or) throw JSONRPCError(RPC_WALLET_ERROR,
+                util::ErrorString(txid_or).original);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("txid", *txid_or);
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_swapwatch_adapt_pric_claim()
 {
     return RPCMethod{
@@ -7338,6 +7552,10 @@ RPCMethod pricoin_swapwatch_broadcast_pric_export()     { return pricoin_swapwat
 RPCMethod pricoin_swapwatch_adapt_btc_claim_export()    { return pricoin_swapwatch_adapt_btc_claim(); }
 RPCMethod pricoin_swapwatch_extract_pric_t_export()     { return pricoin_swapwatch_extract_pric_t(); }
 RPCMethod pricoin_swapwatch_adapt_pric_claim_export()   { return pricoin_swapwatch_adapt_pric_claim(); }
+RPCMethod pricoin_btc_getaddress_export()               { return pricoin_btc_getaddress(); }
+RPCMethod pricoin_btc_getbalance_export()               { return pricoin_btc_getbalance(); }
+RPCMethod pricoin_btc_fund_swap_export()                { return pricoin_btc_fund_swap(); }
+RPCMethod pricoin_btc_sweep_export()                    { return pricoin_btc_sweep(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

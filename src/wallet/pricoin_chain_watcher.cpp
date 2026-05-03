@@ -308,6 +308,18 @@ void MockForeignChainClient::ClearTxStatus(const std::string& txid_hex)
     m_tx_status.erase(txid_hex);
 }
 
+std::vector<IForeignChainClient::Utxo>
+MockForeignChainClient::GetAddressUtxos(const std::string& /*address*/)
+{
+    return {};  // mock has no UTXO state in this commit
+}
+
+IForeignChainClient::Balance
+MockForeignChainClient::GetAddressBalance(const std::string& /*address*/)
+{
+    return {};
+}
+
 std::string MockForeignChainClient::Broadcast(const std::string& tx_hex)
 {
     std::lock_guard<std::mutex> lk(m_mu);
