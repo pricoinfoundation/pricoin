@@ -142,6 +142,68 @@ std::vector<unsigned char> BuildRefundTx(
 // for callers building the redeem script.
 std::array<unsigned char, 32> Sha256Preimage(std::span<const unsigned char> preimage);
 
+// ─── Discrete-log-bound HTLC ─────────────────────────────────────
+//
+// Variant of the HTLC above where the claim path is bound to
+// knowledge of the discrete log of an "adaptor point" T_G = t·G,
+// instead of to a SHA-256 preimage. Used by Pricoin's BTC↔PRIC
+// atomic swap when the foreign chain doesn't have Taproot (i.e. LTC).
+//
+// Why discrete-log binding rather than SHA-256: the swap protocol
+// commits Bob to a specific T_G via the PRIC-side adaptor pre-sig
+// + DLEQ proof. If we use SHA-256 instead (H_t = SHA256(t)), Bob
+// can lie about H_t at setup, claim PRIC to reveal the real t,
+// and Alice cannot satisfy the LTC HTLC because SHA256(t) ≠ H_t —
+// breaking atomicity. Binding directly to T_G eliminates this
+// griefing path because the LTC script verifier cryptographically
+// enforces "knowledge of dlog(T_G)" via OP_CHECKSIG under T_G.
+//
+// Redeem script:
+//   OP_IF
+//     <recipient_pub> OP_CHECKSIGVERIFY
+//     <T_G_compressed> OP_CHECKSIG
+//   OP_ELSE
+//     <timeout> OP_CHECKLOCKTIMEVERIFY OP_DROP <sender_pub> OP_CHECKSIG
+//   OP_ENDIF
+//
+//   recipient claims with: <T_G_sig> <recipient_sig> 1
+//                          (recipient must hold both the dlog of
+//                          recipient_pub AND the dlog of T_G — i.e.
+//                          have extracted t from the foreign chain)
+//   sender refunds with:   <sender_sig> 0  (with nLockTime ≥ timeout)
+//
+// `adaptor_T_G_compressed` MUST be a valid, non-identity 33-byte
+// secp256k1 point. Both x-only forms (BIP340) and full compressed
+// forms work in ECDSA (the y-parity byte just selects which point
+// to verify against). We require the full compressed form so the
+// script unambiguously identifies the point.
+//
+// `BuildDLRefundTx` is intentionally absent: the refund witness
+// shape is identical to the SHA-256 HTLC's refund (`[sig, empty,
+// redeem_script]`), only the redeem_script changes — and that's
+// already plumbed via `HTLCFunding::redeem_script`. Use the
+// existing `BuildRefundTx` with a DL-HTLC `redeem_script`.
+CScript BuildDLHTLCScript(
+    std::span<const unsigned char> adaptor_T_G_compressed, // 33 bytes
+    const CPubKey& recipient_pub,
+    const CPubKey& sender_pub,
+    int64_t timeout);
+
+// Build a DL-HTLC claim tx. `t_scalar` is the 32-byte scalar
+// extracted from the foreign chain's adaptor reveal (= dlog of T_G).
+// We sign the spending tx twice — once under `recipient_priv` and
+// once under `t_scalar` (which is the privkey for T_G).
+//
+// Throws HTLCError on invalid t_scalar (zero, out of range, or
+// doesn't match the redeem-script's T_G — caller is responsible
+// for passing the right scalar).
+std::vector<unsigned char> BuildDLClaimTx(
+    const HTLCFunding& funding,
+    std::span<const unsigned char> t_scalar, // 32 bytes
+    const CKey& recipient_priv,
+    const CScript& dest_script,
+    CAmount fee);
+
 } // namespace pricoin::swap::btc_htlc
 
 #endif // BITCOIN_SWAP_BTC_HTLC_H

@@ -36,6 +36,7 @@
 #include <core_io.h>
 #include <wallet/coincontrol.h>
 #include <wallet/coinselection.h>
+#include <swap/btc_htlc.h>
 #include <swap/btc_musig2_adaptor.h>
 #include <swap/btc_musig2_runtime.h>
 #include <swap/btc_refund_tx.h>
@@ -4423,13 +4424,17 @@ UniValue AdaptorSwapToJSON(const aas::AdaptorSwap& s)
         tl.pushKV("delta_min_blocks",      s.delta_min_blocks);
         out.pushKV("refund_timelocks", std::move(tl));
     }
-    if (s.presigs.IsComplete()) {
+    if (s.presigs.IsComplete(s.foreign_chain)) {
         UniValue ps{UniValue::VOBJ};
-        ps.pushKV("btc_claim_presig",      HexStr(s.presigs.btc_claim_presig));
-        ps.pushKV("btc_claim_session",     HexStr(s.presigs.btc_claim_session));
-        ps.pushKV("btc_claim_nonce_parity", s.presigs.btc_claim_nonce_parity);
+        // BTC-side MuSig2 + Schnorr-adaptor fields only exist for
+        // BTC swaps. LTC HTLC swaps leave them empty.
+        if (!s.presigs.btc_claim_presig.empty()) {
+            ps.pushKV("btc_claim_presig",      HexStr(s.presigs.btc_claim_presig));
+            ps.pushKV("btc_claim_session",     HexStr(s.presigs.btc_claim_session));
+            ps.pushKV("btc_claim_nonce_parity", s.presigs.btc_claim_nonce_parity);
+            ps.pushKV("btc_refund_sig",        HexStr(s.presigs.btc_refund_sig));
+        }
         ps.pushKV("pric_claim_presig_blob", HexStr(s.presigs.pric_claim_presig_blob));
-        ps.pushKV("btc_refund_sig",        HexStr(s.presigs.btc_refund_sig));
         ps.pushKV("pric_refund_sig_blob",  HexStr(s.presigs.pric_refund_sig_blob));
         out.pushKV("presigs", std::move(ps));
     }
@@ -6592,6 +6597,7 @@ RPCMethod pricoin_swapwatch_broadcast_foreign()
 // ─── Phase A — BTC/LTC holding wallet RPCs ─────────────────────
 
 namespace pbh = ::wallet::pricoin_btc_holding;
+namespace bhtlc = ::pricoin::swap::btc_htlc;
 
 RPCMethod pricoin_btc_getaddress()
 {
@@ -6700,26 +6706,19 @@ RPCMethod pricoin_btc_fund_swap()
             const int64_t fee_sat = request.params[1].isNull() ? 1000
                 : request.params[1].getInt<int64_t>();
 
-            ::wallet::pricoin_adaptor_swap::AdaptorSwap snap;
-            if (::wallet::pricoin_adaptor_swap::Get(wallet, sid, snap)
-                != ::wallet::pricoin_adaptor_swap::LookupResult::Ok) {
+            aas::AdaptorSwap snap;
+            if (aas::Get(wallet, sid, snap) != aas::LookupResult::Ok) {
                 throw JSONRPCError(RPC_INVALID_REQUEST, "swap not found");
             }
-            // Compute agg_xonly via MuSig2 keyagg(alice_pub, bob_pub).
-            auto holding = pbh::GetOrCreateIdentity(wallet, snap.foreign_chain);
-            if (!holding) throw JSONRPCError(RPC_WALLET_ERROR,
-                util::ErrorString(holding).original);
 
-            std::vector<CPubKey> pubs;
-            // Order: alice_pub, bob_pub. counterparty_pub is the peer's
-            // 33-byte compressed; my swap-identity is via getSwapIdentityXOnlyHex
-            // synthesised as 02|xonly. (Not the holding-wallet xonly — the
-            // SWAP-identity xonly is what was used at adapt-round1 keyagg.)
+            // Derive my swap-identity priv (used as the cooperative-
+            // signing key for BTC and as the LTC-HTLC role-pubkey for
+            // LTC). The HMAC chain matches pricoin_swap_session.
             CKey swap_priv;
-            const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+            const auto& stealth_id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
             constexpr const char* kSwapTag = "pricoin/swap/identity-v1";
             for (uint8_t counter = 0; counter < 16; ++counter) {
-                CHMAC_SHA256 hmac(UCharCast(id.spend.data()), 32);
+                CHMAC_SHA256 hmac(UCharCast(stealth_id.spend.data()), 32);
                 hmac.Write(reinterpret_cast<const unsigned char*>(kSwapTag),
                             std::strlen(kSwapTag));
                 hmac.Write(&counter, 1);
@@ -6733,35 +6732,78 @@ RPCMethod pricoin_btc_fund_swap()
             }
             const CPubKey my_swap_pub = swap_priv.GetPubKey();
             const CPubKey peer_pub(snap.counterparty_pub);
-            const bool i_am_alice =
-                (snap.role == ::wallet::pricoin_adaptor_swap::Role::Alice);
-            pubs.push_back(i_am_alice ? my_swap_pub : peer_pub);
-            pubs.push_back(i_am_alice ? peer_pub   : my_swap_pub);
-            bma::KeyAggCache cache;
-            auto agg = bma::AggregatePubkeys(pubs, cache);
-            if (!agg) throw JSONRPCError(RPC_INTERNAL_ERROR, "MuSig2 keyagg failed");
+            const bool i_am_alice = (snap.role == aas::Role::Alice);
 
-            // Build + broadcast the funding tx.
-            auto txid_or = pbh::BuildAndBroadcastFundingTx(
-                wallet, snap.foreign_chain, *agg,
-                snap.foreign_amount_sat, fee_sat);
-            if (!txid_or) throw JSONRPCError(RPC_WALLET_ERROR,
-                util::ErrorString(txid_or).original);
-            const std::string txid = *txid_or;
+            std::string txid;
+            if (snap.foreign_chain == "ltc") {
+                // ─── LTC HTLC funding (Bob only) ──────────────────
+                if (i_am_alice) {
+                    throw JSONRPCError(RPC_INVALID_REQUEST,
+                        "LTC HTLC is funded by Bob (the LTC seller); "
+                        "Alice does not fund LTC");
+                }
+                if (!snap.has_t) {
+                    throw JSONRPCError(RPC_INVALID_REQUEST,
+                        "Bob's t_secret not set; complete swap setup first");
+                }
+                if (!snap.adaptor_set) {
+                    throw JSONRPCError(RPC_INVALID_REQUEST,
+                        "adaptor materials (T_G) not set; complete swap setup first");
+                }
+                if (!snap.timelocks_set || snap.foreign_refund_height <= 0) {
+                    throw JSONRPCError(RPC_INVALID_REQUEST,
+                        "foreign refund timelock not set");
+                }
+                // Build the discrete-log-bound HTLC. alice_pub +
+                // bob_pub are the two parties' swap-identity pubkeys
+                // (already exchanged at swap creation via the
+                // counterparty_pub field).
+                const CPubKey alice_pub = peer_pub;       // Bob is local
+                const CPubKey bob_pub   = my_swap_pub;
+                CScript redeem;
+                try {
+                    redeem = bhtlc::BuildDLHTLCScript(
+                        std::span<const unsigned char>(snap.T_G.data(), 33),
+                        alice_pub, bob_pub,
+                        snap.foreign_refund_height);
+                } catch (const bhtlc::HTLCError& e) {
+                    throw JSONRPCError(RPC_WALLET_ERROR,
+                        std::string("HTLC script build failed: ") + e.what());
+                }
+                auto txid_or = pbh::BuildAndBroadcastHtlcFundingTx(
+                    wallet, snap.foreign_chain, redeem,
+                    snap.foreign_amount_sat, fee_sat);
+                if (!txid_or) throw JSONRPCError(RPC_WALLET_ERROR,
+                    util::ErrorString(txid_or).original);
+                txid = *txid_or;
+            } else {
+                // ─── BTC P2TR cooperative funding (existing) ──────
+                std::vector<CPubKey> pubs;
+                pubs.push_back(i_am_alice ? my_swap_pub : peer_pub);
+                pubs.push_back(i_am_alice ? peer_pub   : my_swap_pub);
+                bma::KeyAggCache cache;
+                auto agg = bma::AggregatePubkeys(pubs, cache);
+                if (!agg) throw JSONRPCError(RPC_INTERNAL_ERROR, "MuSig2 keyagg failed");
+                auto txid_or = pbh::BuildAndBroadcastFundingTx(
+                    wallet, snap.foreign_chain, *agg,
+                    snap.foreign_amount_sat, fee_sat);
+                if (!txid_or) throw JSONRPCError(RPC_WALLET_ERROR,
+                    util::ErrorString(txid_or).original);
+                txid = *txid_or;
+            }
 
-            // Auto-register a foreign_funding watch on vout 0 (the
-            // funding output is always at vout 0 in our builder).
-            ::wallet::pricoin_chain_watcher::WatchEntry e;
+            // Auto-register a foreign_funding watch on vout 0 (both
+            // builders place the swap output at index 0).
+            pcw::WatchEntry e;
             e.swap_id = sid;
-            e.kind    = ::wallet::pricoin_chain_watcher::WatchKind::ForeignFunding;
+            e.kind    = pcw::WatchKind::ForeignFunding;
             e.txid_hex = txid;
             e.vout = 0;
             e.min_confirmations = 1;
-            const auto r = ::wallet::pricoin_chain_watcher::Add(wallet, e);
+            const auto r = pcw::Add(wallet, e);
             UniValue out{UniValue::VOBJ};
             out.pushKV("txid", txid);
-            out.pushKV("watch_registered",
-                r == ::wallet::pricoin_chain_watcher::StoreResult::Ok);
+            out.pushKV("watch_registered", r == pcw::StoreResult::Ok);
             return out;
         }
     };
@@ -6797,6 +6839,292 @@ RPCMethod pricoin_btc_sweep()
                 util::ErrorString(txid_or).original);
             UniValue out{UniValue::VOBJ};
             out.pushKV("txid", *txid_or);
+            return out;
+        }
+    };
+}
+
+// ─── LTC HTLC claim / refund ────────────────────────────────────
+//
+// These RPCs spend the LTC HTLC funded by `pricoin_btc_fund_swap`.
+//   * Claim: Alice extracts t from the PRIC chain (set in the swap
+//     record's `t_secret` field by the swapwatch), then signs the
+//     LTC claim tx twice — once under her swap-identity priv and
+//     once with t (acting as the privkey for T_G). Bob's funded
+//     HTLC has been waiting on this exact reveal.
+//   * Refund: Bob waits until current LTC chain height ≥
+//     `foreign_refund_height`, then unilaterally signs the refund
+//     branch (sender_pub OP_CHECKSIG with nLockTime = timeout).
+namespace {
+
+// Common helper — reconstruct the local party's swap-identity priv
+// + the HTLC redeem script for a given swap. Throws JSONRPCError on
+// any inconsistency. Sets `is_alice` to the local role.
+struct LtcSwapContext {
+    aas::AdaptorSwap snap;
+    CKey  swap_priv;
+    CPubKey alice_pub;     // recipient pubkey in HTLC IF branch
+    CPubKey bob_pub;       // sender pubkey in HTLC ELSE branch
+    CScript redeem;
+    bool i_am_alice{false};
+};
+
+LtcSwapContext PrepareLtcSwapContext(::wallet::CWallet& wallet, const uint256& sid)
+{
+    LtcSwapContext ctx;
+    if (aas::Get(wallet, sid, ctx.snap) != aas::LookupResult::Ok) {
+        throw JSONRPCError(RPC_INVALID_REQUEST, "swap not found");
+    }
+    if (ctx.snap.foreign_chain != "ltc") {
+        throw JSONRPCError(RPC_INVALID_REQUEST,
+            "swap.foreign_chain != ltc");
+    }
+    if (!ctx.snap.adaptor_set) {
+        throw JSONRPCError(RPC_INVALID_REQUEST,
+            "adaptor materials (T_G) not set on swap");
+    }
+    if (!ctx.snap.timelocks_set || ctx.snap.foreign_refund_height <= 0) {
+        throw JSONRPCError(RPC_INVALID_REQUEST,
+            "foreign refund timelock not set on swap");
+    }
+    if (ctx.snap.foreign_funding_txid.empty() || ctx.snap.foreign_funding_vout < 0) {
+        throw JSONRPCError(RPC_INVALID_REQUEST,
+            "swap has no recorded LTC HTLC funding outpoint");
+    }
+    // Derive my swap-identity priv. Same HMAC chain as fund_swap.
+    const auto& stealth_id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+    constexpr const char* kSwapTag = "pricoin/swap/identity-v1";
+    for (uint8_t counter = 0; counter < 16; ++counter) {
+        CHMAC_SHA256 hmac(UCharCast(stealth_id.spend.data()), 32);
+        hmac.Write(reinterpret_cast<const unsigned char*>(kSwapTag),
+                    std::strlen(kSwapTag));
+        hmac.Write(&counter, 1);
+        unsigned char raw[32];
+        hmac.Finalize(raw);
+        ctx.swap_priv.Set(raw, raw + 32, true);
+        if (ctx.swap_priv.IsValid()) break;
+    }
+    if (!ctx.swap_priv.IsValid()) {
+        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "swap identity unavailable");
+    }
+    const CPubKey my_pub  = ctx.swap_priv.GetPubKey();
+    const CPubKey peer_pub(ctx.snap.counterparty_pub);
+    ctx.i_am_alice = (ctx.snap.role == aas::Role::Alice);
+    ctx.alice_pub = ctx.i_am_alice ? my_pub  : peer_pub;
+    ctx.bob_pub   = ctx.i_am_alice ? peer_pub : my_pub;
+    try {
+        ctx.redeem = bhtlc::BuildDLHTLCScript(
+            std::span<const unsigned char>(ctx.snap.T_G.data(), 33),
+            ctx.alice_pub, ctx.bob_pub,
+            ctx.snap.foreign_refund_height);
+    } catch (const bhtlc::HTLCError& e) {
+        throw JSONRPCError(RPC_WALLET_ERROR,
+            std::string("HTLC script reconstruct failed: ") + e.what());
+    }
+    return ctx;
+}
+
+CScript ResolveLtcDestSPK(const std::string& dest_addr)
+{
+    int v = -1;
+    std::vector<unsigned char> prog;
+    // LTC mainnet HRP. Testnet/regtest support is straightforward
+    // to add when the chain backend lands.
+    if (!pbh::DecodeWitnessAddress(dest_addr, "ltc", v, prog)) {
+        throw JSONRPCError(RPC_INVALID_REQUEST,
+            "dest is not a valid LTC bech32(m) address");
+    }
+    return pbh::MakeWitnessSPK(v, prog);
+}
+
+} // namespace
+
+RPCMethod pricoin_ltc_claim_swap()
+{
+    return RPCMethod{
+        "pricoin_ltc_claim_swap",
+        "Alice's LTC-claim path: spends the LTC HTLC funded by Bob using\n"
+        "the adaptor scalar t (typically obtained from\n"
+        "pricoin_swapwatch_extract_pric_t after Bob's PRIC claim confirms).\n"
+        "Signs the claim tx twice — once under Alice's swap-identity priv,\n"
+        "and once with t (the privkey for T_G). The HTLC redeem script is\n"
+        "reconstructed from the swap record (T_G + alice_pub + bob_pub +\n"
+        "timelock).\n"
+        "\n"
+        "Requires: swap.role == Alice, swap.foreign_chain == ltc,\n"
+        "swap.foreign_funding_txid populated. The supplied t MUST satisfy\n"
+        "t·G == swap.T_G (we verify before signing).\n",
+        {
+            {"swap_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"t_hex",   RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte adaptor scalar t — typically from pricoin_swapwatch_extract_pric_t. "
+                "If swap.has_t (Bob's wallet on regtest tests), may be empty to use stored t."},
+            {"dest",    RPCArg::Type::STR,     RPCArg::Optional::NO,
+                "LTC bech32 destination address (where Alice receives the LTC)"},
+            {"fee_sat", RPCArg::Type::NUM,     RPCArg::Default{1000}, "Flat fee in sats"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "txid", "Broadcast LTC claim txid"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_ltc_claim_swap", "<swap_id> <t_hex> ltc1q... 1000")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            const uint256 sid = ParseChainWatchSwapId(request.params[0]);
+            const std::string t_hex = request.params[1].isNull() ? std::string{}
+                : request.params[1].get_str();
+            const std::string dest = request.params[2].get_str();
+            const int64_t fee_sat = request.params[3].isNull() ? 1000
+                : request.params[3].getInt<int64_t>();
+
+            auto ctx = PrepareLtcSwapContext(wallet, sid);
+            if (!ctx.i_am_alice) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "LTC HTLC claim is performed by Alice (the LTC buyer)");
+            }
+            // Resolve t: caller-supplied hex first, fallback to stored
+            // t_secret if has_t (only set on Bob's wallet during normal
+            // flow; useful for regtest where one wallet drives both).
+            std::array<unsigned char, 32> t_bytes{};
+            if (!t_hex.empty()) {
+                auto parsed = TryParseHex<unsigned char>(t_hex);
+                if (!parsed || parsed->size() != 32) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        "t_hex must be 32-byte hex");
+                }
+                std::copy(parsed->begin(), parsed->end(), t_bytes.begin());
+            } else if (ctx.snap.has_t) {
+                t_bytes = ctx.snap.t_secret;
+            } else {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "supply t_hex (run pricoin_swapwatch_extract_pric_t first)");
+            }
+            // Sanity: t·G must equal T_G — fail-fast before broadcast.
+            {
+                CKey k;
+                k.Set(t_bytes.begin(), t_bytes.end(), /*fCompressedIn=*/true);
+                if (!k.IsValid()) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        "t is not a valid secp256k1 scalar");
+                }
+                const CPubKey p = k.GetPubKey();
+                if (p.size() != 33
+                    || std::memcmp(p.data(), ctx.snap.T_G.data(), 33) != 0) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        "t·G != swap.T_G — wrong scalar");
+                }
+            }
+
+            const CScript dest_spk = ResolveLtcDestSPK(dest);
+
+            bhtlc::HTLCFunding f;
+            auto ftxid = uint256::FromHex(ctx.snap.foreign_funding_txid);
+            if (!ftxid) throw JSONRPCError(RPC_INTERNAL_ERROR,
+                "swap.foreign_funding_txid unparseable");
+            f.prev_txid     = *ftxid;
+            f.prev_vout     = static_cast<uint32_t>(ctx.snap.foreign_funding_vout);
+            f.prev_value    = ctx.snap.foreign_amount_sat;
+            f.redeem_script = ctx.redeem;
+
+            std::vector<unsigned char> tx_bytes;
+            try {
+                tx_bytes = bhtlc::BuildDLClaimTx(
+                    f,
+                    std::span<const unsigned char>(t_bytes.data(), 32),
+                    ctx.swap_priv, dest_spk, fee_sat);
+            } catch (const bhtlc::HTLCError& e) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                    std::string("HTLC claim build failed: ") + e.what());
+            }
+
+            auto backend = pcw::MakeForeignClientFromRegistry("ltc");
+            if (!backend) throw JSONRPCError(RPC_INTERNAL_ERROR,
+                "no LTC chain backend registered");
+            const std::string tx_hex = HexStr(tx_bytes);
+            std::string txid;
+            try {
+                txid = backend->Broadcast(tx_hex);
+            } catch (const std::exception& e) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                    std::string("LTC broadcast failed: ") + e.what());
+            }
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("txid", txid);
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_ltc_refund_swap()
+{
+    return RPCMethod{
+        "pricoin_ltc_refund_swap",
+        "Bob's LTC-refund path: unilaterally spends the LTC HTLC's refund\n"
+        "branch after the timelock expires. Sets nLockTime = timelock and\n"
+        "nSequence = 0xfffffffd; signs under Bob's swap-identity priv.\n"
+        "Caller is responsible for not broadcasting before the LTC chain\n"
+        "tip reaches `foreign_refund_height` (the network will reject\n"
+        "earlier, so a misbroadcast is harmless but pointless).\n",
+        {
+            {"swap_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"dest",    RPCArg::Type::STR,     RPCArg::Optional::NO,
+                "LTC bech32 destination address (where Bob receives the refunded LTC)"},
+            {"fee_sat", RPCArg::Type::NUM,     RPCArg::Default{1000}, "Flat fee in sats"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "txid", "Broadcast LTC refund txid"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_ltc_refund_swap", "<swap_id> ltc1q... 1000")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            const uint256 sid = ParseChainWatchSwapId(request.params[0]);
+            const std::string dest = request.params[1].get_str();
+            const int64_t fee_sat = request.params[2].isNull() ? 1000
+                : request.params[2].getInt<int64_t>();
+
+            auto ctx = PrepareLtcSwapContext(wallet, sid);
+            if (ctx.i_am_alice) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "LTC HTLC refund is performed by Bob (the LTC seller)");
+            }
+
+            const CScript dest_spk = ResolveLtcDestSPK(dest);
+
+            bhtlc::HTLCFunding f;
+            auto ftxid = uint256::FromHex(ctx.snap.foreign_funding_txid);
+            if (!ftxid) throw JSONRPCError(RPC_INTERNAL_ERROR,
+                "swap.foreign_funding_txid unparseable");
+            f.prev_txid     = *ftxid;
+            f.prev_vout     = static_cast<uint32_t>(ctx.snap.foreign_funding_vout);
+            f.prev_value    = ctx.snap.foreign_amount_sat;
+            f.redeem_script = ctx.redeem;
+
+            std::vector<unsigned char> tx_bytes;
+            try {
+                tx_bytes = bhtlc::BuildRefundTx(
+                    f, ctx.snap.foreign_refund_height,
+                    ctx.swap_priv, dest_spk, fee_sat);
+            } catch (const bhtlc::HTLCError& e) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                    std::string("HTLC refund build failed: ") + e.what());
+            }
+
+            auto backend = pcw::MakeForeignClientFromRegistry("ltc");
+            if (!backend) throw JSONRPCError(RPC_INTERNAL_ERROR,
+                "no LTC chain backend registered");
+            const std::string tx_hex = HexStr(tx_bytes);
+            std::string txid;
+            try {
+                txid = backend->Broadcast(tx_hex);
+            } catch (const std::exception& e) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                    std::string("LTC broadcast failed: ") + e.what());
+            }
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("txid", txid);
             return out;
         }
     };
@@ -7556,6 +7884,8 @@ RPCMethod pricoin_btc_getaddress_export()               { return pricoin_btc_get
 RPCMethod pricoin_btc_getbalance_export()               { return pricoin_btc_getbalance(); }
 RPCMethod pricoin_btc_fund_swap_export()                { return pricoin_btc_fund_swap(); }
 RPCMethod pricoin_btc_sweep_export()                    { return pricoin_btc_sweep(); }
+RPCMethod pricoin_ltc_claim_swap_export()               { return pricoin_ltc_claim_swap(); }
+RPCMethod pricoin_ltc_refund_swap_export()              { return pricoin_ltc_refund_swap(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

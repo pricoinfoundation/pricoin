@@ -141,12 +141,25 @@ struct AdaptorSwapPreSigs {
         READWRITE(obj.pric_refund_sig_blob);
     }
 
-    bool IsComplete() const {
+    // Chain-aware completeness check. The required field set varies
+    // by foreign chain:
+    //   * "btc"  — full cooperative-MuSig2 + Schnorr-adaptor flow:
+    //              all fields below required.
+    //   * "ltc"  — HTLC + same-secret binding flow: BTC-side MuSig2
+    //              + Schnorr-adaptor fields are not used (the LTC
+    //              HTLC is unilaterally claimable/refundable and
+    //              `t` arrives via the PRIC chain). Only the PRIC
+    //              presig + PRIC refund presig are required.
+    bool IsComplete(const std::string& foreign_chain) const {
+        const bool pric_ready = !pric_claim_presig_blob.empty()
+                              && !pric_refund_sig_blob.empty();
+        if (!pric_ready) return false;
+        if (foreign_chain == "ltc") return true;
+        // Default (BTC and any future cooperative-Schnorr chain):
+        // require the full set.
         return !btc_claim_presig.empty()
             && !btc_claim_session.empty()
-            && !pric_claim_presig_blob.empty()
-            && !btc_refund_sig.empty()
-            && !pric_refund_sig_blob.empty();
+            && !btc_refund_sig.empty();
     }
 };
 

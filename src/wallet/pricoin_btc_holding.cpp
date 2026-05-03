@@ -8,6 +8,7 @@
 #include <consensus/amount.h>
 #include <core_io.h>
 #include <crypto/hmac_sha256.h>
+#include <crypto/sha256.h>
 #include <key.h>
 #include <primitives/transaction.h>
 #include <pubkey.h>
@@ -105,8 +106,11 @@ std::string EncodeWitnessAddress(const std::string& hrp,
     return bech32::Encode(encoding, hrp, data);
 }
 
+} // namespace
+
 // Decode a bech32(m) address to (witness_v, program). Returns false
-// on hrp/encoding/format mismatch.
+// on hrp/encoding/format mismatch. Public — used by RPC layer to
+// resolve LTC HTLC claim/refund destinations.
 bool DecodeWitnessAddress(const std::string& addr,
                             const std::string& expected_hrp,
                             int& witness_v_out,
@@ -154,8 +158,6 @@ CScript MakeWitnessSPK(int witness_v, std::span<const unsigned char> program)
     return CScript() << CScript::EncodeOP_N(witness_v)
         << std::vector<unsigned char>(program.begin(), program.end());
 }
-
-} // namespace
 
 const ChainParams* GetChainParams(const std::string& chain)
 {
@@ -515,6 +517,132 @@ util::Result<std::string> BuildAndBroadcastSweepTx(
     } else {
         return util::Error{Untranslated("unsupported witness version for chain")};
     }
+
+    DataStream ds;
+    ds << TX_WITH_WITNESS(CTransaction{mtx});
+    const std::string tx_hex = HexStr(std::span<const unsigned char>{
+        UCharCast(ds.data()), ds.size()});
+    try {
+        return backend->Broadcast(tx_hex);
+    } catch (const std::exception& e) {
+        return util::Error{Untranslated(std::string("broadcast failed: ") + e.what())};
+    }
+}
+
+util::Result<std::string> BuildAndBroadcastHtlcFundingTx(
+    ::wallet::CWallet& wallet,
+    const std::string& chain,
+    const CScript& htlc_redeem_script,
+    int64_t amount_sat,
+    int64_t fee_sat)
+{
+    if (chain != "ltc") {
+        // BTC swaps don't use HTLCs (they go through MuSig2 +
+        // Schnorr-adaptor over P2TR). Other non-Taproot chains
+        // (DOGE, BCH) could reuse this path in the future.
+        return util::Error{Untranslated(
+            "HTLC funding builder is for LTC; BTC funding goes through "
+            "BuildAndBroadcastFundingTx (MuSig2 P2TR)")};
+    }
+    if (amount_sat <= 0 || fee_sat < 0) {
+        return util::Error{Untranslated("amount must be positive, fee non-negative")};
+    }
+    if (htlc_redeem_script.empty()) {
+        return util::Error{Untranslated("htlc_redeem_script empty")};
+    }
+    auto id = GetOrCreateIdentity(wallet, chain);
+    if (!id) return util::Error{util::ErrorString(id)};
+    auto backend = ::wallet::pricoin_chain_watcher::MakeForeignClientFromRegistry(chain);
+    if (!backend) {
+        return util::Error{Untranslated("no chain backend registered for " + chain)};
+    }
+    std::vector<::wallet::pricoin_chain_watcher::IForeignChainClient::Utxo> utxos;
+    try {
+        utxos = backend->GetAddressUtxos(id->address);
+    } catch (const std::exception& e) {
+        return util::Error{Untranslated(std::string("UTXO query failed: ") + e.what())};
+    }
+    // Pick the smallest confirmed UTXO ≥ amount + fee (greedy, mirrors
+    // the BTC builder).
+    const int64_t target = amount_sat + fee_sat;
+    const ::wallet::pricoin_chain_watcher::IForeignChainClient::Utxo* picked = nullptr;
+    for (const auto& u : utxos) {
+        if (!u.confirmed) continue;
+        if (u.value_sat < target) continue;
+        if (!picked || u.value_sat < picked->value_sat) picked = &u;
+    }
+    if (!picked) {
+        return util::Error{Untranslated(strprintf(
+            "no confirmed LTC UTXO ≥ amount+fee (%d sat); deposit LTC at %s first",
+            target, id->address))};
+    }
+    auto picked_txid = uint256::FromHex(picked->txid);
+    if (!picked_txid) {
+        return util::Error{Untranslated("backend returned unparseable UTXO txid")};
+    }
+    const int64_t change_sat = picked->value_sat - target;
+
+    // ─── Build tx skeleton ───────────────────────────────
+    CMutableTransaction mtx;
+    mtx.version = 2;
+    mtx.nLockTime = 0;
+    {
+        CTxIn in;
+        in.prevout = COutPoint{Txid::FromUint256(*picked_txid),
+                                static_cast<uint32_t>(picked->vout)};
+        in.nSequence = 0xfffffffe;
+        mtx.vin.push_back(std::move(in));
+    }
+    // vout[0]: HTLC P2WSH = OP_0 <SHA256(redeem_script)>.
+    {
+        CSHA256 h;
+        h.Write(htlc_redeem_script.data(), htlc_redeem_script.size());
+        std::array<unsigned char, 32> redeem_hash{};
+        h.Finalize(redeem_hash.data());
+        CTxOut o;
+        o.nValue = amount_sat;
+        o.scriptPubKey = CScript() << OP_0
+            << std::vector<unsigned char>(redeem_hash.begin(), redeem_hash.end());
+        mtx.vout.push_back(std::move(o));
+    }
+    // vout[1]: change to self P2WPKH (OP_0 <HASH160(pub)>) — only if non-dust.
+    const CKeyID my_keyid = id->pub.GetID();
+    if (change_sat > 546) {
+        CTxOut o;
+        o.nValue = change_sat;
+        o.scriptPubKey = CScript() << OP_0
+            << std::vector<unsigned char>(my_keyid.begin(), my_keyid.end());
+        mtx.vout.push_back(std::move(o));
+    }
+
+    // ─── BIP143 sighash + ECDSA sign ─────────────────────
+    // P2WPKH spending: scriptCode is the P2PKH equivalent.
+    const CScript scriptCode = CScript()
+        << OP_DUP << OP_HASH160
+        << std::vector<unsigned char>(my_keyid.begin(), my_keyid.end())
+        << OP_EQUALVERIFY << OP_CHECKSIG;
+    std::vector<CTxOut> spent_outputs;
+    {
+        CTxOut s;
+        s.nValue = picked->value_sat;
+        s.scriptPubKey = CScript() << OP_0
+            << std::vector<unsigned char>(my_keyid.begin(), my_keyid.end());
+        spent_outputs.push_back(std::move(s));
+    }
+    PrecomputedTransactionData txdata;
+    txdata.Init(mtx, std::move(spent_outputs), /*force=*/true);
+
+    const uint256 sighash = SignatureHash(
+        scriptCode, mtx, /*nIn=*/0, SIGHASH_ALL,
+        /*amount=*/picked->value_sat, SigVersion::WITNESS_V0, &txdata);
+    std::vector<unsigned char> ecdsa_sig;
+    if (!id->priv.Sign(sighash, ecdsa_sig)) {
+        return util::Error{Untranslated("ECDSA sign failed")};
+    }
+    ecdsa_sig.push_back(static_cast<unsigned char>(SIGHASH_ALL));
+    mtx.vin[0].scriptWitness.stack.clear();
+    mtx.vin[0].scriptWitness.stack.emplace_back(ecdsa_sig.begin(), ecdsa_sig.end());
+    mtx.vin[0].scriptWitness.stack.emplace_back(id->pub.begin(), id->pub.end());
 
     DataStream ds;
     ds << TX_WITH_WITNESS(CTransaction{mtx});

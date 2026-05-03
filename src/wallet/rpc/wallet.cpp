@@ -993,6 +993,8 @@ RPCMethod pricoin_btc_getaddress_export();
 RPCMethod pricoin_btc_getbalance_export();
 RPCMethod pricoin_btc_fund_swap_export();
 RPCMethod pricoin_btc_sweep_export();
+RPCMethod pricoin_ltc_claim_swap_export();
+RPCMethod pricoin_ltc_refund_swap_export();
 RPCMethod pricoin_listownct_export();
 RPCMethod walletsendct_from_ct_export();
 RPCMethod walletsendct_ring_export();
@@ -1094,6 +1096,8 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &pricoin_btc_getbalance_export},
         {"wallet", &pricoin_btc_fund_swap_export},
         {"wallet", &pricoin_btc_sweep_export},
+        {"wallet", &pricoin_ltc_claim_swap_export},
+        {"wallet", &pricoin_ltc_refund_swap_export},
         {"wallet", &pricoin_listownct_export},
         {"wallet", &walletsendct_from_ct_export},
         {"wallet", &walletsendct_ring_export},

@@ -272,6 +272,117 @@ std::vector<unsigned char> BuildClaimTx(
     return SerializeTxWithWitness(mtx);
 }
 
+CScript BuildDLHTLCScript(
+    std::span<const unsigned char> adaptor_T_G_compressed,
+    const CPubKey& recipient_pub,
+    const CPubKey& sender_pub,
+    int64_t timeout)
+{
+    if (adaptor_T_G_compressed.size() != 33) {
+        throw HTLCError("adaptor_T_G must be 33 bytes (compressed pubkey)");
+    }
+    if (adaptor_T_G_compressed[0] != 0x02 && adaptor_T_G_compressed[0] != 0x03) {
+        throw HTLCError("adaptor_T_G must start with 0x02 or 0x03");
+    }
+    {
+        // Reject the identity (0x02 + 32 zero bytes is not a valid
+        // curve point, but cheap to filter out cases where the
+        // caller forgot to populate T_G).
+        bool all_zero = true;
+        for (size_t i = 1; i < 33; ++i) {
+            if (adaptor_T_G_compressed[i] != 0) { all_zero = false; break; }
+        }
+        if (all_zero) throw HTLCError("adaptor_T_G must not be the zero point");
+    }
+    // Don't enforce CPubKey::IsFullyValid here — the validator runs
+    // libsecp256k1 in script execution. We do enforce the byte-shape
+    // checks above to catch obvious mistakes.
+    if (!recipient_pub.IsValid() || !recipient_pub.IsCompressed()) {
+        throw HTLCError("recipient_pub must be a valid compressed pubkey");
+    }
+    if (!sender_pub.IsValid() || !sender_pub.IsCompressed()) {
+        throw HTLCError("sender_pub must be a valid compressed pubkey");
+    }
+    if (timeout < 0) {
+        throw HTLCError("timeout must be non-negative (block height or unix time)");
+    }
+
+    CScript s;
+    s << OP_IF;
+    s << std::vector<unsigned char>(recipient_pub.begin(), recipient_pub.end());
+    s << OP_CHECKSIGVERIFY;
+    s << std::vector<unsigned char>(
+            adaptor_T_G_compressed.begin(), adaptor_T_G_compressed.end());
+    s << OP_CHECKSIG;
+    s << OP_ELSE;
+    PushTimeout(s, timeout);
+    s << OP_CHECKLOCKTIMEVERIFY;
+    s << OP_DROP;
+    s << std::vector<unsigned char>(sender_pub.begin(), sender_pub.end());
+    s << OP_CHECKSIG;
+    s << OP_ENDIF;
+    return s;
+}
+
+std::vector<unsigned char> BuildDLClaimTx(
+    const HTLCFunding& funding,
+    std::span<const unsigned char> t_scalar,
+    const CKey& recipient_priv,
+    const CScript& dest_script,
+    CAmount fee)
+{
+    if (!recipient_priv.IsValid()) {
+        throw HTLCError("recipient_priv invalid");
+    }
+    if (t_scalar.size() != 32) {
+        throw HTLCError("t_scalar must be 32 bytes");
+    }
+    CKey t_priv;
+    t_priv.Set(t_scalar.begin(), t_scalar.end(), /*fCompressedIn=*/true);
+    if (!t_priv.IsValid()) {
+        throw HTLCError("t_scalar not a valid secp256k1 scalar");
+    }
+
+    auto mtx = BuildHTLCSpendTxBase(
+        funding, dest_script, fee,
+        /*nSequence=*/0xfffffffd, /*nLockTime=*/0);
+
+    // Both signatures sign the same P2WSH sighash. Witness elements
+    // are pushed bottom→top onto the script-execution stack; the
+    // script pops from the top. Walking through the IF branch:
+    //   Push <recipient_pub>; CHECKSIGVERIFY pops next-deepest sig.
+    //   Push <T_G>; CHECKSIG pops top-of-stack sig.
+    // → witness order must be [<T_G_sig>, <recipient_sig>, 0x01,
+    //   <redeem_script>] (deeper element listed first below).
+
+    // sighash for P2WSH spend.
+    const uint256 sighash = SignatureHash(
+        funding.redeem_script, mtx, /*nIn=*/0,
+        SIGHASH_ALL, funding.prev_value,
+        SigVersion::WITNESS_V0);
+
+    std::vector<unsigned char> sig_recipient;
+    if (!recipient_priv.Sign(sighash, sig_recipient)) {
+        throw HTLCError("ECDSA sign (recipient) failed");
+    }
+    sig_recipient.push_back(SIGHASH_ALL);
+
+    std::vector<unsigned char> sig_T_G;
+    if (!t_priv.Sign(sighash, sig_T_G)) {
+        throw HTLCError("ECDSA sign (T_G) failed");
+    }
+    sig_T_G.push_back(SIGHASH_ALL);
+
+    auto& w = mtx.vin[0].scriptWitness.stack;
+    w.clear();
+    w.push_back(std::move(sig_T_G));        // bottom of stack
+    w.push_back(std::move(sig_recipient));  // middle
+    w.push_back({0x01});                    // top: select IF branch
+    w.emplace_back(funding.redeem_script.begin(), funding.redeem_script.end());
+
+    return SerializeTxWithWitness(mtx);
+}
+
 std::vector<unsigned char> BuildRefundTx(
     const HTLCFunding& funding,
     int64_t timeout,

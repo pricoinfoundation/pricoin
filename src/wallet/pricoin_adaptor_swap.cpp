@@ -321,12 +321,17 @@ TransitionResult SetPreSigned(
     const uint256& swap_id,
     const AdaptorSwapPreSigs& presigs)
 {
-    if (!presigs.IsComplete()) return TransitionResult::InvalidInput;
-    if (presigs.btc_claim_presig.size() != 64) return TransitionResult::InvalidInput;
-    if (presigs.btc_claim_session.size() != 133) return TransitionResult::InvalidInput;
-    if (presigs.btc_refund_sig.size() != 64) return TransitionResult::InvalidInput;
     return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
         if (s.state != State::BothFunded) return TransitionResult::InvalidState;
+        if (!presigs.IsComplete(s.foreign_chain)) return TransitionResult::InvalidInput;
+        // Chain-specific size invariants. LTC HTLC swaps don't use
+        // the BTC-side MuSig2 / Schnorr-adaptor fields at all, so
+        // we skip those size checks for LTC.
+        if (s.foreign_chain != "ltc") {
+            if (presigs.btc_claim_presig.size() != 64) return TransitionResult::InvalidInput;
+            if (presigs.btc_claim_session.size() != 133) return TransitionResult::InvalidInput;
+            if (presigs.btc_refund_sig.size() != 64) return TransitionResult::InvalidInput;
+        }
         s.presigs = presigs;
         s.state = State::PreSigned;
         return TransitionResult::Ok;

@@ -30,6 +30,7 @@
 
 #include <pubkey.h>
 #include <key.h>
+#include <script/script.h>
 #include <util/result.h>
 #include <swap/chain_backend.h>
 
@@ -109,6 +110,38 @@ util::Result<std::string> BuildAndBroadcastSweepTx(
     const std::string& chain,
     const std::string& dest_address,
     int64_t fee_sat);
+
+// HTLC funding tx for LTC swaps (P2WPKH input → P2WSH output).
+//
+//   vin[0]  = smallest confirmed P2WPKH UTXO ≥ amount + fee (held by
+//             the LTC holding-wallet identity)
+//   vout[0] = P2WSH wrapping `htlc_redeem_script`, value = amount_sat
+//   vout[1] = self P2WPKH change (only if non-dust)
+//
+// Signs with BIP143 SegWit-v0 ECDSA + low-R grind. Broadcasts via the
+// configured ChainBackend.
+//
+// `chain` MUST currently be "ltc" — we gate the function to LTC because
+// the BTC swap protocol uses cooperative MuSig2 + Schnorr-adaptor and
+// has its own funding builder (`BuildAndBroadcastFundingTx`).
+util::Result<std::string> BuildAndBroadcastHtlcFundingTx(
+    ::wallet::CWallet& wallet,
+    const std::string& chain,
+    const CScript& htlc_redeem_script,
+    int64_t amount_sat,
+    int64_t fee_sat);
+
+// Decode a bech32(m) address against an expected HRP. Returns true on
+// success, populating `witness_v_out` (0–16) and `program_out` (raw
+// 8-bit witness program bytes). Enforces BIP350: v=0 must be bech32,
+// v≥1 must be bech32m.
+bool DecodeWitnessAddress(const std::string& addr,
+                            const std::string& expected_hrp,
+                            int& witness_v_out,
+                            std::vector<unsigned char>& program_out);
+
+// Build the scriptPubKey for a witness-v output: OP_<v> <program>.
+CScript MakeWitnessSPK(int witness_v, std::span<const unsigned char> program);
 
 // Idempotent shutdown — clears in-memory state. Mirrors other Pricoin
 // modules' shutdown hook.
