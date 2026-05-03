@@ -248,6 +248,13 @@ public:
         std::string btc_bob_recipient_xonly_hex;
         std::string pric_alice_recipient_stealth;
         std::string pric_bob_recipient_stealth;
+        // Adaptor scalar t — present once the holder's wallet has it.
+        // For Bob, populated at SetAdaptorMaterials. For Alice,
+        // populated by SetTSecret (typically called from the extract
+        // RPC after Bob's PRIC claim hits the chain). Empty until then;
+        // Qt LTC-claim dialog uses this to skip the t_hex prompt.
+        bool        has_t{false};
+        std::string t_secret_hex;       // 64 hex chars when has_t
     };
 
     struct PricoinAdaptorSwapCreateParams {

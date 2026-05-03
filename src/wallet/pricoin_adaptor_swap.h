@@ -421,6 +421,19 @@ TransitionResult SetPricClaimed(
     const uint256& swap_id,
     const uint256& pric_claim_txid);
 
+// Persist the adaptor scalar t into the swap record. Used by Alice's
+// flow after she extracts t from Bob's on-chain PRIC claim
+// (`pricoin_swapwatch_extract_pric_t` runs the math; SetTSecret
+// stores it). State-machine-neutral — does NOT advance state. Idempotent
+// if `t` matches the already-stored value; rejects with InvalidInput if
+// has_t already and the supplied t differs (defensive against caller
+// bugs). For Bob (t known at setup), this is a no-op when called with
+// the same t — but normal Bob flow uses SetAdaptorMaterials.
+TransitionResult SetTSecret(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::array<unsigned char, 32>& t);
+
 // Record Alice's foreign claim tx confirmed. Swap is done.
 // Transitions PricClaimed → Complete.
 TransitionResult SetComplete(

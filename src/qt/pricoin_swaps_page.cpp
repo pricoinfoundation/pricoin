@@ -168,11 +168,14 @@ void PricoinSwapsPage::buildLayout()
         tr("Adapt + broadcast PRIC claim… (Bob)"), sw_box);
     m_btn_ltc_refund = new QPushButton(
         tr("LTC refund… (Bob)"), sw_box);
+    m_btn_extract_t = new QPushButton(
+        tr("Extract t… (Alice)"), sw_box);
     sw_bot->addWidget(m_btn_sw_add);
     sw_bot->addWidget(m_btn_sw_remove);
     sw_bot->addWidget(m_btn_adapt_btc_claim);
     sw_bot->addWidget(m_btn_adapt_pric_claim);
     sw_bot->addWidget(m_btn_ltc_refund);
+    sw_bot->addWidget(m_btn_extract_t);
     sw_bot->addStretch();
     sw_outer->addLayout(sw_bot);
     outer->addWidget(sw_box);
@@ -190,6 +193,7 @@ void PricoinSwapsPage::buildLayout()
     connect(m_btn_adapt_btc_claim, &QPushButton::clicked, this, &PricoinSwapsPage::onAdaptBtcClaimClicked);
     connect(m_btn_adapt_pric_claim, &QPushButton::clicked, this, &PricoinSwapsPage::onAdaptPricClaimClicked);
     connect(m_btn_ltc_refund, &QPushButton::clicked, this, &PricoinSwapsPage::onLtcRefundClicked);
+    connect(m_btn_extract_t,  &QPushButton::clicked, this, &PricoinSwapsPage::onExtractTClicked);
 
     if (auto* sm = m_table->selectionModel()) {
         connect(sm, &QItemSelectionModel::selectionChanged,
@@ -972,8 +976,15 @@ void PricoinSwapsPage::onAdaptBtcClaimClicked()
     // sig under Alice's swap-identity priv). The user-visible
     // difference is that LTC also asks for a destination address.
     std::string chain;
+    bool has_t_snap = false;
+    std::string t_snap_hex;
     for (const auto& s : m_swaps) {
-        if (s.swap_id == sid) { chain = s.foreign_chain; break; }
+        if (s.swap_id == sid) {
+            chain = s.foreign_chain;
+            has_t_snap = s.has_t;
+            t_snap_hex = s.t_secret_hex;
+            break;
+        }
     }
     if (chain.empty()) {
         setStatus(tr("Selected swap not found."), true);
@@ -984,14 +995,22 @@ void PricoinSwapsPage::onAdaptBtcClaimClicked()
         QDialog dlg(this);
         dlg.setWindowTitle(tr("Broadcast LTC HTLC claim (Alice)"));
         auto* form = new QFormLayout(&dlg);
-        form->addRow(new QLabel(tr("Alice's LTC claim path. The 32-byte t scalar "
-                                    "comes from extracting it on-chain after Bob's "
-                                    "PRIC claim confirms — typically via "
-                                    "pricoin_swapwatch_extract_pric_t. The dest "
-                                    "address is where the LTC will be paid."), &dlg));
+        form->addRow(new QLabel(has_t_snap
+            ? tr("Alice's LTC claim path. t is auto-filled from the swap "
+                 "record (extracted earlier from Bob's on-chain PRIC claim). "
+                 "Specify a destination address for the LTC.")
+            : tr("Alice's LTC claim path. The 32-byte t scalar comes from "
+                 "extracting it on-chain after Bob's PRIC claim confirms — "
+                 "use the \"Extract t…\" button on the swap row, or run "
+                 "pricoin_swapwatch_extract_pric_t. The dest address is "
+                 "where the LTC will be paid."),
+            &dlg));
         auto* t_in    = new QLineEdit(&dlg);
         t_in->setEchoMode(QLineEdit::Password);
         t_in->setPlaceholderText(tr("64-char hex"));
+        if (has_t_snap) {
+            t_in->setText(QString::fromStdString(t_snap_hex));
+        }
         form->addRow(tr("t (hex):"), t_in);
         auto* dest_in = new QLineEdit(&dlg);
         dest_in->setPlaceholderText(tr("ltc1q… bech32 address"));
@@ -1069,6 +1088,79 @@ void PricoinSwapsPage::onAdaptBtcClaimClicked()
         .arg(txid.left(16)));
     refreshTable();
     onSwapwatchRefresh();
+}
+
+void PricoinSwapsPage::onExtractTClicked()
+{
+    if (!m_model) return;
+    const std::string sid = selectedSwapId();
+    if (sid.empty()) {
+        setStatus(tr("Select a swap row first."), true);
+        return;
+    }
+    bool already_has_t = false;
+    std::string role;
+    for (const auto& s : m_swaps) {
+        if (s.swap_id == sid) {
+            already_has_t = s.has_t;
+            role = s.role;
+            break;
+        }
+    }
+    if (role != "alice") {
+        setStatus(tr("Extract is for Alice — Bob already holds t from setup."), true);
+        return;
+    }
+    if (already_has_t) {
+        setStatus(tr("This swap already has t stored — re-extract isn't needed."));
+        return;
+    }
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Extract t from Bob's PRIC claim"));
+    auto* form = new QFormLayout(&dlg);
+    form->addRow(new QLabel(tr("Recovers the adaptor scalar t from Bob's "
+                                "on-chain PRIC claim CLSAG signature. The ring "
+                                "+ sig hex come from Bob's Nostr DM (he sent "
+                                "them when he broadcast). On success t is "
+                                "persisted into the swap record so the LTC "
+                                "claim dialog auto-fills it."), &dlg));
+    auto* ring_in = new QPlainTextEdit(&dlg);
+    ring_in->setPlaceholderText(tr("JSON array of 33-byte compressed pubkey hex strings"));
+    ring_in->setMaximumHeight(80);
+    form->addRow(tr("ring (JSON):"), ring_in);
+    auto* sig_in = new QPlainTextEdit(&dlg);
+    sig_in->setPlaceholderText(tr("hex of pricoin::ringsig::Signature blob from Bob's PRIC claim tx"));
+    sig_in->setMaximumHeight(80);
+    form->addRow(tr("sig (hex):"), sig_in);
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(bb);
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    UniValue ring_v;
+    if (!ring_v.read(ring_in->toPlainText().toStdString()) || !ring_v.isArray()) {
+        setStatus(tr("ring must be a JSON array of pubkey hex strings"), true);
+        return;
+    }
+    UniValue p{UniValue::VARR};
+    p.push_back(sid);
+    p.push_back(ring_v);
+    p.push_back(sig_in->toPlainText().trimmed().toStdString());
+    std::string err;
+    auto r = CallWalletRpc(m_model, "pricoin_swapwatch_extract_pric_t", p, &err);
+    if (!r) {
+        setStatus(tr("Extract failed: %1").arg(QString::fromStdString(err)), true);
+        return;
+    }
+    const QString t_hex = QString::fromStdString((*r)["t"].get_str());
+    const bool persisted = (*r)["persisted_to_swap_record"].get_bool();
+    setStatus(persisted
+        ? tr("Extracted t and saved into swap record — open LTC claim to broadcast.")
+        : tr("Extracted t (%1) but couldn't persist; copy it manually for the claim.")
+            .arg(t_hex.left(12)));
+    refreshTable();
 }
 
 void PricoinSwapsPage::onLtcRefundClicked()

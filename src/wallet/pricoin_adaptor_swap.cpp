@@ -359,6 +359,24 @@ TransitionResult SetPricClaimed(
     });
 }
 
+TransitionResult SetTSecret(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::array<unsigned char, 32>& t)
+{
+    return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
+        if (s.has_t) {
+            // Idempotent if same t; reject if caller is trying to
+            // overwrite with a different scalar (programmer error).
+            if (s.t_secret == t) return TransitionResult::Ok;
+            return TransitionResult::InvalidInput;
+        }
+        s.t_secret = t;
+        s.has_t = true;
+        return TransitionResult::Ok;
+    });
+}
+
 TransitionResult SetComplete(
     CWallet& wallet,
     const uint256& swap_id,

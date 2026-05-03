@@ -441,6 +441,10 @@ public:
         o.btc_bob_recipient_xonly_hex    = s.btc_bob_recipient_xonly_hex;
         o.pric_alice_recipient_stealth   = s.pric_alice_recipient_stealth;
         o.pric_bob_recipient_stealth     = s.pric_bob_recipient_stealth;
+        o.has_t = s.has_t;
+        if (s.has_t) {
+            o.t_secret_hex = HexStr(s.t_secret);
+        }
         return o;
     }
 

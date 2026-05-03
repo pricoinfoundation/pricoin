@@ -7408,8 +7408,20 @@ RPCMethod pricoin_swapwatch_extract_pric_t()
             if (!t) throw JSONRPCError(RPC_INVALID_PARAMETER,
                 "Extract failed — check t·G == T_G and t·H_p(P_pi) == T_H");
 
+            // Persist t into the swap record so the LTC claim path
+            // (and any other Alice-side claim flow) can consume it
+            // without the user re-pasting hex. SetTSecret is
+            // idempotent if Bob (the t holder) already had it stored.
+            std::array<unsigned char, 32> t_arr{};
+            std::copy(t->begin(), t->end(), t_arr.begin());
+            const auto sr = ::wallet::pricoin_adaptor_swap::SetTSecret(
+                *wallet_sp, sid, t_arr);
+            const bool persisted =
+                (sr == ::wallet::pricoin_adaptor_swap::TransitionResult::Ok);
+
             UniValue out{UniValue::VOBJ};
             out.pushKV("t", HexStr(*t));
+            out.pushKV("persisted_to_swap_record", persisted);
             return out;
         }
     };
