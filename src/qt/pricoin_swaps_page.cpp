@@ -76,7 +76,19 @@ PricoinSwapsPage::PricoinSwapsPage(const PlatformStyle* platformStyle, QWidget* 
     buildLayout();
 }
 
-PricoinSwapsPage::~PricoinSwapsPage() = default;
+PricoinSwapsPage::~PricoinSwapsPage()
+{
+    // Stop the auto-refresh timer before destruction so a tick can't
+    // fire after our slot's captured state (m_model, sub-widgets) has
+    // been torn down. Without this, a 5s timer that fires while Qt is
+    // mid-shutdown crashes the main thread on a dangling m_model —
+    // which in turn aborts pricoind's shutoff sequence and leaves
+    // leveldb writes mid-flight (= corrupted chain db on next launch).
+    if (m_auto_refresh_timer) {
+        m_auto_refresh_timer->stop();
+        m_auto_refresh_timer->disconnect();
+    }
+}
 
 void PricoinSwapsPage::buildLayout()
 {
@@ -210,6 +222,20 @@ void PricoinSwapsPage::buildLayout()
 void PricoinSwapsPage::setModel(WalletModel* model)
 {
     m_model = model;
+    // Subscribe to the model's destruction so a teardown that happens
+    // BEFORE this page is destroyed (e.g. wallet close while the page
+    // is still parented somewhere) doesn't leave us with a dangling
+    // m_model that the auto-refresh timer would dereference.
+    if (m_model) {
+        connect(m_model, &QObject::destroyed, this, [this]() {
+            m_model = nullptr;
+            if (m_auto_refresh_timer) m_auto_refresh_timer->stop();
+        });
+    } else {
+        // Explicit setModel(nullptr) — stop the timer; nothing to
+        // refresh against.
+        if (m_auto_refresh_timer) m_auto_refresh_timer->stop();
+    }
     if (auto* sm = m_table->selectionModel()) {
         connect(sm, &QItemSelectionModel::selectionChanged,
                 this, &PricoinSwapsPage::onSelectionChanged);
