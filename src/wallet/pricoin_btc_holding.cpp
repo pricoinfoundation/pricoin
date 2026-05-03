@@ -244,9 +244,22 @@ util::Result<std::string> BuildAndBroadcastFundingTx(
     int64_t fee_sat)
 {
     if (chain != "btc") {
+        // LTC mainnet/testnet has no Taproot, so there is no P2TR
+        // output to fund. The atomic-swap protocol (MuSig2 + adaptor)
+        // is BIP340/BIP341-only — for LTC we'd need a parallel
+        // protocol over P2WSH 2-of-2 with cooperative ECDSA + ECDSA
+        // adaptor signatures. That protocol isn't implemented yet,
+        // so funding a swap on a non-Taproot chain has no meaning.
+        // The LTC holding wallet still supports receive + balance +
+        // sweep — see pricoin_btc_getaddress / _getbalance / _sweep.
         return util::Error{Untranslated(
-            "BTC funding-tx builder supports BTC P2TR only in this commit; "
-            "LTC P2WSH 2-of-2 funding is a follow-on")};
+            "swap funding is BTC-only: the swap protocol uses MuSig2 "
+            "+ Schnorr adaptor signatures over BIP341 P2TR, which "
+            "non-Taproot chains (LTC) cannot host. LTC swap support "
+            "needs a follow-on protocol (P2WSH 2-of-2 + ECDSA "
+            "cooperative signing + ECDSA adaptor signatures). "
+            "For now: pricoin_btc_sweep still works for LTC, so the "
+            "holding wallet is usable for receive + send.")};
     }
     if (amount_sat <= 0 || fee_sat < 0) {
         return util::Error{Untranslated("amount must be positive, fee non-negative")};
@@ -364,20 +377,19 @@ util::Result<std::string> BuildAndBroadcastSweepTx(
     const std::string& dest_address,
     int64_t fee_sat)
 {
-    if (chain != "btc") {
-        return util::Error{Untranslated(
-            "sweep currently supports BTC only in this commit")};
-    }
     if (fee_sat < 0) return util::Error{Untranslated("fee must be non-negative")};
+    const ChainParams* cp = GetChainParams(chain);
+    if (!cp) return util::Error{Untranslated("unknown chain")};
     auto id = GetOrCreateIdentity(wallet, chain);
     if (!id) return util::Error{util::ErrorString(id)};
     auto backend = ::wallet::pricoin_chain_watcher::MakeForeignClientFromRegistry(chain);
     if (!backend) {
         return util::Error{Untranslated("no chain backend registered for " + chain)};
     }
-    const ChainParams* cp = GetChainParams(chain);
-    if (!cp) return util::Error{Untranslated("unknown chain")};
 
+    // Destination must be a bech32(m) of the same chain. We build
+    // its scriptPubKey from the decoded (witness_v, program). Both
+    // P2TR (v1) and P2WPKH (v0) destinations work.
     int dest_v = -1;
     std::vector<unsigned char> dest_program;
     if (!DecodeWitnessAddress(dest_address, cp->hrp, dest_v, dest_program)) {
@@ -421,43 +433,87 @@ util::Result<std::string> BuildAndBroadcastSweepTx(
         mtx.vout.push_back(std::move(o));
     }
 
-    // Per-input BIP341 sighash + sign. spent_outputs must mirror vin
-    // index order.
-    std::vector<CTxOut> spent_outputs;
-    spent_outputs.reserve(utxos.size());
-    for (const auto& u : utxos) {
-        CTxOut s;
-        s.nValue = u.value_sat;
-        s.scriptPubKey = CScript() << OP_1
-            << std::vector<unsigned char>(id->xonly.begin(), id->xonly.end());
-        spent_outputs.push_back(std::move(s));
-    }
-    PrecomputedTransactionData txdata;
-    txdata.Init(mtx, std::move(spent_outputs), /*force=*/true);
-    if (!txdata.m_bip341_taproot_ready) {
-        return util::Error{Untranslated("BIP341 sighash precompute failed")};
-    }
-    for (size_t i = 0; i < mtx.vin.size(); ++i) {
-        ScriptExecutionData execdata;
-        execdata.m_annex_init = true;
-        execdata.m_annex_present = false;
-        uint256 sighash;
-        if (!SignatureHashSchnorr(sighash, execdata, mtx,
-                static_cast<uint32_t>(i), SIGHASH_DEFAULT,
-                SigVersion::TAPROOT, txdata, MissingDataBehavior::FAIL)) {
-            return util::Error{Untranslated(strprintf(
-                "SignatureHashSchnorr failed at input %u", i))};
+    // ─── Per-input signing — chain-specific ──────────────────
+    if (cp->witness_v == 1) {
+        // BTC P2TR: BIP341 + Schnorr key-path-spend.
+        std::vector<CTxOut> spent_outputs;
+        spent_outputs.reserve(utxos.size());
+        for (const auto& u : utxos) {
+            CTxOut s;
+            s.nValue = u.value_sat;
+            s.scriptPubKey = CScript() << OP_1
+                << std::vector<unsigned char>(id->xonly.begin(), id->xonly.end());
+            spent_outputs.push_back(std::move(s));
         }
-        std::vector<unsigned char> sig(64);
-        uint256 aux_rand;
-        GetStrongRandBytes(aux_rand);
-        if (!id->priv.SignSchnorr(sighash,
-                std::span<unsigned char>{sig.data(), sig.size()},
-                /*merkle_root=*/nullptr, aux_rand)) {
-            return util::Error{Untranslated("SignSchnorr failed")};
+        PrecomputedTransactionData txdata;
+        txdata.Init(mtx, std::move(spent_outputs), /*force=*/true);
+        if (!txdata.m_bip341_taproot_ready) {
+            return util::Error{Untranslated("BIP341 sighash precompute failed")};
         }
-        mtx.vin[i].scriptWitness.stack.clear();
-        mtx.vin[i].scriptWitness.stack.emplace_back(sig.begin(), sig.end());
+        for (size_t i = 0; i < mtx.vin.size(); ++i) {
+            ScriptExecutionData execdata;
+            execdata.m_annex_init = true;
+            execdata.m_annex_present = false;
+            uint256 sighash;
+            if (!SignatureHashSchnorr(sighash, execdata, mtx,
+                    static_cast<uint32_t>(i), SIGHASH_DEFAULT,
+                    SigVersion::TAPROOT, txdata, MissingDataBehavior::FAIL)) {
+                return util::Error{Untranslated(strprintf(
+                    "SignatureHashSchnorr failed at input %u", i))};
+            }
+            std::vector<unsigned char> sig(64);
+            uint256 aux_rand;
+            GetStrongRandBytes(aux_rand);
+            if (!id->priv.SignSchnorr(sighash,
+                    std::span<unsigned char>{sig.data(), sig.size()},
+                    /*merkle_root=*/nullptr, aux_rand)) {
+                return util::Error{Untranslated("SignSchnorr failed")};
+            }
+            mtx.vin[i].scriptWitness.stack.clear();
+            mtx.vin[i].scriptWitness.stack.emplace_back(sig.begin(), sig.end());
+        }
+    } else if (cp->witness_v == 0) {
+        // LTC P2WPKH: BIP143 + ECDSA. The scriptCode for sighash is
+        // the P2PKH equivalent — `OP_DUP OP_HASH160 <20B> OP_EQUALVERIFY
+        // OP_CHECKSIG` — per BIP143's "P2WPKH compatibility" rule.
+        // Witness stack is [sig+sighash_byte, compressed_pubkey].
+        const CKeyID my_keyid = id->pub.GetID();
+        const CScript scriptCode = CScript()
+            << OP_DUP << OP_HASH160
+            << std::vector<unsigned char>(my_keyid.begin(), my_keyid.end())
+            << OP_EQUALVERIFY << OP_CHECKSIG;
+        // BIP143 sighash needs a precompute (hashes of prevouts /
+        // sequences / outputs).
+        std::vector<CTxOut> spent_outputs;
+        spent_outputs.reserve(utxos.size());
+        for (const auto& u : utxos) {
+            CTxOut s;
+            s.nValue = u.value_sat;
+            s.scriptPubKey = CScript() << OP_0
+                << std::vector<unsigned char>(my_keyid.begin(), my_keyid.end());
+            spent_outputs.push_back(std::move(s));
+        }
+        PrecomputedTransactionData txdata;
+        txdata.Init(mtx, std::move(spent_outputs), /*force=*/true);
+
+        for (size_t i = 0; i < mtx.vin.size(); ++i) {
+            const uint256 sighash = SignatureHash(
+                scriptCode, mtx, static_cast<unsigned int>(i),
+                SIGHASH_ALL, utxos[i].value_sat,
+                SigVersion::WITNESS_V0, &txdata);
+            std::vector<unsigned char> ecdsa_sig;
+            if (!id->priv.Sign(sighash, ecdsa_sig)) {
+                return util::Error{Untranslated("ECDSA sign failed")};
+            }
+            ecdsa_sig.push_back(static_cast<unsigned char>(SIGHASH_ALL));
+            mtx.vin[i].scriptWitness.stack.clear();
+            mtx.vin[i].scriptWitness.stack.emplace_back(
+                ecdsa_sig.begin(), ecdsa_sig.end());
+            mtx.vin[i].scriptWitness.stack.emplace_back(
+                id->pub.begin(), id->pub.end());
+        }
+    } else {
+        return util::Error{Untranslated("unsupported witness version for chain")};
     }
 
     DataStream ds;
