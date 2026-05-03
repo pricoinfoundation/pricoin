@@ -4688,7 +4688,14 @@ BlockValidationState TestBlockValidity(
     }
 
     // For signets CheckBlock() verifies the challenge iff fCheckPow is set.
-    if (!CheckBlock(block, state, chainstate.m_chainman.GetConsensus(), /*fCheckPow=*/check_pow, /*fCheckMerkleRoot=*/check_merkle_root)) {
+    // Pricoin: tip+1 is the height we're testing; pass it (with chain)
+    // so RandomX seed resolution at heights past the epoch boundary
+    // uses the right seed-block.
+    const int test_height = tip->nHeight + 1;
+    if (!CheckBlock(block, state, chainstate.m_chainman.GetConsensus(),
+                     /*fCheckPow=*/check_pow,
+                     /*fCheckMerkleRoot=*/check_merkle_root,
+                     test_height, &chainstate.m_chain)) {
         // This should never happen, but belt-and-suspenders don't approve the
         // block if it does.
         if (state.IsValid()) NONFATAL_UNREACHABLE();
@@ -4871,7 +4878,15 @@ VerifyDBResult CVerifyDB::VerifyDB(
             return VerifyDBResult::CORRUPTED_BLOCK_DB;
         }
         // check level 1: verify block validity
-        if (nCheckLevel >= 1 && !CheckBlock(block, state, consensus_params)) {
+        // Pricoin: thread height + chain so RandomX seed resolution
+        // matches the seed used at mining/acceptance time. Without
+        // this, blocks past the first epoch boundary (height ≥ 2112)
+        // get verified against the bootstrap seed and the PoW recheck
+        // fails — flagging an honest db as "corrupted".
+        if (nCheckLevel >= 1 && !CheckBlock(block, state, consensus_params,
+                                            /*fCheckPOW=*/true,
+                                            /*fCheckMerkleRoot=*/true,
+                                            pindex->nHeight, &chainstate.m_chain)) {
             LogError("Verification error: found bad block at %d, hash=%s (%s)",
                       pindex->nHeight, pindex->GetBlockHash().ToString(), state.ToString());
             return VerifyDBResult::CORRUPTED_BLOCK_DB;
