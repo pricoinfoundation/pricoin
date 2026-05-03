@@ -7,8 +7,10 @@ $(package)_sha256_hash=$(qt_details_qtbase_sha256_hash)
 ifneq ($(host),$(build))
 $(package)_dependencies := native_$(package)
 endif
-$(package)_linux_dependencies := freetype fontconfig libxcb libxkbcommon libxcb_util libxcb_util_cursor libxcb_util_render libxcb_util_keysyms libxcb_util_image libxcb_util_wm
+$(package)_linux_dependencies := openssl freetype fontconfig libxcb libxkbcommon libxcb_util libxcb_util_cursor libxcb_util_render libxcb_util_keysyms libxcb_util_image libxcb_util_wm
 $(package)_freebsd_dependencies := $($(package)_linux_dependencies)
+$(package)_darwin_dependencies := openssl
+$(package)_mingw32_dependencies := openssl
 $(package)_patches_path := $(qt_details_patches_path)
 $(package)_patches := cocoa_compat.patch
 $(package)_patches += dont_hardcode_pwd.patch
@@ -73,7 +75,16 @@ $(package)_config_opts += -no-libproxy
 $(package)_config_opts += -no-libudev
 $(package)_config_opts += -no-mtdev
 $(package)_config_opts += -no-opengl
-$(package)_config_opts += -no-openssl
+# Pricoin: link OpenSSL statically (depends/packages/openssl) so Qt's
+# QSslSocket has a working backend. Without this, the orderbook
+# Nostr wss:// connections silently fail at runtime with "SSL Sockets
+# are not supported on this platform." The Qt build picks up
+# openssl headers/libs from $(host_prefix), and the resulting
+# libqopensslbackend.so/.dll lives in the Qt tls/ plugin directory
+# (which we already allow-list in macdeployqtplus and which works
+# similarly under Linux since the binary loads it from its
+# QT_PLUGIN_PATH).
+$(package)_config_opts += -openssl-linked
 $(package)_config_opts += -no-openvg
 $(package)_config_opts += -no-reduce-relocations
 $(package)_config_opts += -no-schannel
@@ -176,6 +187,10 @@ $(package)_config_env_darwin += OBJCXX="$$($(package)_cxx)"
 $(package)_cmake_opts := -DCMAKE_PREFIX_PATH=$(host_prefix)
 $(package)_cmake_opts += -DQT_FEATURE_cxx20=ON
 $(package)_cmake_opts += -DQT_GENERATE_SBOM=OFF
+# Force the static libssl/libcrypto we built — without this Qt's
+# find_package(OpenSSL) may pick up the host's shared system libs.
+$(package)_cmake_opts += -DOPENSSL_USE_STATIC_LIBS=TRUE
+$(package)_cmake_opts += -DOPENSSL_ROOT_DIR=$(host_prefix)
 ifneq ($(V),)
 $(package)_cmake_opts += --log-level=STATUS
 endif

@@ -24,6 +24,17 @@ class CWallet;
 struct PricoinCTRecipient {
     std::string address;  // stealth (H6...) or transparent bech32
     CAmount amount;       // in satoshis; must be > 0
+
+    // Optional: 32-byte raw secp256k1 priv to use as the per-output
+    // ephemeral `r` for stealth derivation, instead of a fresh
+    // random one. Required for atomic-swap funding where the
+    // adaptor binding committed to a specific `r` (P_pi = h_s·G+B
+    // with h_s = SHA(r·A_joint || index)) — funding with a different
+    // ephemeral makes the on-chain P_pi diverge from the adaptor and
+    // the swap becomes unsignable.
+    //
+    // Empty for normal sends. Ignored for transparent destinations.
+    std::vector<unsigned char> ephemeral_priv;
 };
 
 // Build, sign, and broadcast a Pricoin v4 confidential transaction with

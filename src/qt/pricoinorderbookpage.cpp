@@ -4,6 +4,7 @@
 
 #include <qt/pricoinorderbookpage.h>
 
+#include <qt/pricoin_joint_stealth_dialog.h>
 #include <qt/pricoin_match_dialog.h>
 #include <qt/pricoin_nostr_client.h>
 #include <qt/pricoin_relay_settings_dialog.h>
@@ -584,7 +585,21 @@ void PricoinOrderbookPage::onStartSwapClicked()
 
     auto* joint_edit = new QLineEdit(&dlg);
     joint_edit->setPlaceholderText(tr("output of pricoin_buildjointstealthaddress"));
-    form->addRow(tr("Joint stealth address:"), joint_edit);
+    auto* joint_row = new QHBoxLayout();
+    joint_row->addWidget(joint_edit, /*stretch=*/1);
+    auto* btn_joint_wizard = new QPushButton(tr("Build…"), &dlg);
+    joint_row->addWidget(btn_joint_wizard);
+    form->addRow(tr("Joint stealth address:"), joint_row);
+    QObject::connect(btn_joint_wizard, &QPushButton::clicked, &dlg,
+        [this, &dlg, joint_edit, peer]() {
+        const QString peer_xonly = peer
+            ? QString::fromStdString(peer->maker_pubkey_hex.substr(2))
+            : QString{};
+        PricoinJointStealthDialog d(m_model, peer_xonly, &dlg);
+        if (d.exec() == QDialog::Accepted && !d.chosenJointAddress().isEmpty()) {
+            joint_edit->setText(d.chosenJointAddress());
+        }
+    });
 
     // Per-leg destination addresses. Stored on the swap record so
     // the cooperative-sign dialogs can pre-fill recipient/dest based

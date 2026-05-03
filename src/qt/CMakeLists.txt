@@ -192,6 +192,8 @@ if(ENABLE_WALLET)
       recentrequeststablemodel.h
       pricoin_coopsign_dialog.cpp
       pricoin_coopsign_dialog.h
+      pricoin_joint_stealth_dialog.cpp
+      pricoin_joint_stealth_dialog.h
       pricoin_match_dialog.cpp
       pricoin_match_dialog.h
       pricoin_pric_coopsign_dialog.cpp

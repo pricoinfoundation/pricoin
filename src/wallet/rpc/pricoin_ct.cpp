@@ -12,6 +12,7 @@
 #include <pricoin/joint_ringsig.h>
 #include <pricoin/ringsig.h>
 #include <pricoin/ct.h>
+#include <pricoin/adaptor_ringsig.h>
 #include <pricoin/cttx.h>
 #include <pricoin/joint_stealth.h>
 #include <pricoin/stealth.h>
@@ -140,7 +141,7 @@ util::Result<uint256> SendConfidentialTx(
     if (dest_amount <= 0) {
         return util::Error{Untranslated("non-positive amount")};
     }
-    PricoinCTRecipient one{dest_addr_str, dest_amount};
+    PricoinCTRecipient one{dest_addr_str, dest_amount, /*ephemeral_priv=*/{}};
     return SendConfidentialTxMulti(wallet,
         std::span<const PricoinCTRecipient>{&one, 1}, fee);
 }
@@ -156,11 +157,20 @@ RPCMethod walletsendct()
         "dest_amount + fee, signs with the wallet's keystore, generates a change address\n"
         "from the wallet, and submits the resulting v4 transaction. dest_address may be\n"
         "either a stealth address (preferred — recipient can recover) or a regular bech32\n"
-        "(recipient cannot scan).\n",
+        "(recipient cannot scan).\n"
+        "\n"
+        "Optional `ephemeral_priv` pins the per-output stealth ephemeral `r` to a\n"
+        "known scalar instead of using a fresh random one. Required for atomic-swap\n"
+        "PRIC funding — Bob's adaptor binding committed to a specific `r`, so the\n"
+        "joint funding tx must use the same `r` or the on-chain P_pi will diverge\n"
+        "from the adaptor and the swap becomes unsignable. Ignored for transparent\n"
+        "destinations (no stealth ephemeral) and for change outputs.\n",
         {
             {"dest_address", RPCArg::Type::STR, RPCArg::Optional::NO, "Destination Pricoin stealth or bech32 address"},
             {"dest_amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Amount to send in PRIC"},
             {"fee", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Transparent fee in PRIC"},
+            {"ephemeral_priv", RPCArg::Type::STR_HEX, RPCArg::Default{""},
+                "Optional 32-byte priv to pin as the stealth ephemeral. Empty = fresh random."},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -180,8 +190,23 @@ RPCMethod walletsendct()
             const std::string dest_addr_str = request.params[0].get_str();
             const CAmount dest_amount = AmountFromValue(request.params[1]);
             const CAmount fee = AmountFromValue(request.params[2]);
+            const std::string eph_hex = request.params[3].isNull() ? "" : request.params[3].get_str();
 
-            auto res = SendConfidentialTx(wallet, dest_addr_str, dest_amount, fee);
+            std::vector<unsigned char> eph_priv;
+            if (!eph_hex.empty()) {
+                auto bytes = TryParseHex<unsigned char>(eph_hex);
+                if (!bytes || bytes->size() != 32) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        "ephemeral_priv must be 32-byte hex (or empty for fresh random)");
+                }
+                eph_priv = *bytes;
+            }
+
+            // Build a single recipient with the optional pinned ephemeral
+            // and dispatch to the multi-impl.
+            PricoinCTRecipient one{dest_addr_str, dest_amount, eph_priv};
+            auto res = SendConfidentialTxMulti(wallet,
+                std::span<const PricoinCTRecipient>{&one, 1}, fee);
             if (!res) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(res).original);
 
             UniValue out{UniValue::VOBJ};
@@ -343,7 +368,7 @@ RPCMethod walletsendct_locked()
                               kLockTimeHeightMax));
             }
             std::vector<PricoinCTRecipient> recipients{
-                PricoinCTRecipient{.address = dest, .amount = amount}};
+                PricoinCTRecipient{.address = dest, .amount = amount, .ephemeral_priv = {}}};
             std::string hex;
             auto res = detail::SendConfidentialTxMultiImpl(
                 wallet, std::span<const PricoinCTRecipient>{recipients}, fee,
@@ -372,13 +397,35 @@ struct ResolvedDest {
 
 // Resolve a single recipient address (stealth H6... or transparent bech32)
 // into the script + per-output stealth material at the given output index.
-util::Result<ResolvedDest> ResolveDest(const std::string& addr, uint32_t output_index)
+//
+// `pinned_ephemeral_priv` (optional): if non-empty, use this 32-byte priv
+// as the stealth-output ephemeral `r` instead of generating a fresh one.
+// This is required for the atomic-swap flow where Bob's adaptor binding
+// commits to a specific `r` (via P_pi = h_s·G + B with h_s = SHA(r·A_joint
+// || index)). Funding the joint stealth with a different ephemeral makes
+// the on-chain P_pi diverge from the adaptor binding and the swap becomes
+// unsignable.
+util::Result<ResolvedDest> ResolveDest(
+    const std::string& addr,
+    uint32_t output_index,
+    const std::vector<unsigned char>& pinned_ephemeral_priv = {})
 {
     ResolvedDest d;
     const auto stealth = ::pricoin::stealth::Decode(addr);
     if (stealth) {
         CKey r;
-        r.MakeNewKey(/*fCompressed=*/true);
+        if (!pinned_ephemeral_priv.empty()) {
+            if (pinned_ephemeral_priv.size() != 32) {
+                return util::Error{Untranslated("pinned ephemeral_priv must be 32 bytes")};
+            }
+            r.Set(pinned_ephemeral_priv.begin(), pinned_ephemeral_priv.end(),
+                   /*fCompressed=*/true);
+            if (!r.IsValid()) {
+                return util::Error{Untranslated("pinned ephemeral_priv is not a valid secp256k1 scalar")};
+            }
+        } else {
+            r.MakeNewKey(/*fCompressed=*/true);
+        }
         CPubKey R = r.GetPubKey();
         std::memcpy(d.R.data(), R.data(), 33);
         auto S = ::pricoin::stealth::ECDHPoint(r, stealth->view);
@@ -455,13 +502,19 @@ util::Result<uint256> SendConfidentialTxMultiImpl(
     // the change is at a random position. Otherwise an external observer can
     // identify change as "always last", linking the sender's outputs across
     // their transaction history.
-    struct PendingOut { std::string address; CAmount amount; };
+    struct PendingOut {
+        std::string address;
+        CAmount amount;
+        std::vector<unsigned char> ephemeral_priv;
+    };
     std::vector<PendingOut> pending;
     pending.reserve(recipients.size() + 2);
-    for (const auto& r : recipients) pending.push_back({r.address, r.amount});
+    for (const auto& r : recipients) {
+        pending.push_back({r.address, r.amount, r.ephemeral_priv});
+    }
     const auto& self_id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
     const std::string self_addr = ::pricoin::stealth::Encode(self_id.public_address);
-    pending.push_back({self_addr, change_value});
+    pending.push_back({self_addr, change_value, {}});
 
     // PRIVACY: pad to at least 3 outputs so the change isn't 1/2 observable.
     // The 1-recipient case was emitting (recipient, change) — two outputs of
@@ -473,7 +526,7 @@ util::Result<uint256> SendConfidentialTxMultiImpl(
     // entry that ConfidentialBalance and walletsendct_from_ct ignore).
     // Multi-recipient sends already have ≥3 outputs and need no padding.
     while (pending.size() < 3) {
-        pending.push_back({self_addr, 0});
+        pending.push_back({self_addr, 0, {}});
     }
 
     FastRandomContext rng;
@@ -485,7 +538,8 @@ util::Result<uint256> SendConfidentialTxMultiImpl(
     std::vector<ResolvedDest> dests;
     dests.reserve(pending.size());
     for (size_t i = 0; i < pending.size(); ++i) {
-        auto rd = ResolveDest(pending[i].address, static_cast<uint32_t>(i));
+        auto rd = ResolveDest(pending[i].address, static_cast<uint32_t>(i),
+                                pending[i].ephemeral_priv);
         if (!rd) return util::Error{Untranslated(strprintf("output %u: %s", i, util::ErrorString(rd).original))};
         dests.push_back(std::move(*rd));
     }
@@ -6534,6 +6588,271 @@ RPCMethod pricoin_swapwatch_broadcast_foreign()
     };
 }
 
+RPCMethod pricoin_swapwatch_adapt_pric_claim()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_adapt_pric_claim",
+        "Bob's PRIC-claim path: adapt the PRIC adaptor pre-signature with the\n"
+        "wallet's stored t_secret, inject the resulting CLSAG signature into a\n"
+        "pre-built v4 spend tx skeleton, broadcast it via the local pricoin\n"
+        "mempool, and register a swapwatch entry that auto-advances the swap\n"
+        "to PricClaimed when confirmed.\n"
+        "\n"
+        "Caller supplies `tx_hex` — the unsigned skeleton from\n"
+        "pricoin_jointspend_buildtx that was used at adapt-round-1 time. The\n"
+        "ring decoys and z_self/z_other are baked into that skeleton's\n"
+        "ct_bundle.ring_inputs[0].ring_outpoints, so a fresh buildtx call\n"
+        "would produce a different ring and the pre-sig wouldn't apply. The\n"
+        "wallet's coopsign dialog stashes this hex; Bob copies it for this\n"
+        "RPC.\n"
+        "\n"
+        "Requires: swap.role == Bob, swap.has_t == true (Bob's t_secret on\n"
+        "record), swap.presigs.pric_claim_presig_blob populated.\n",
+        {
+            {"swap_id",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"tx_hex",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Skeleton tx hex from pricoin_jointspend_buildtx (Bob's coopsign session)"},
+            {"ring",               RPCArg::Type::ARR,     RPCArg::Optional::NO,
+                "Single-layer ring of joint pubkeys used at adapt-round-1 time. "
+                "Bob's coopsign dialog displayed these alongside z_self/z_other.",
+                {{"P", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+            {"msg_hex",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "32-byte sighash from pricoin_jointspend_buildtx — must match what was signed"},
+            {"min_confirmations",  RPCArg::Type::NUM,     RPCArg::Default{1}, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "txid", "Broadcast txid"},
+                {RPCResult::Type::NUM,     "size", "Final tx size with witness/sig"},
+                {RPCResult::Type::STR_HEX, "sig",  "Final CLSAG signature blob produced by Adapt"},
+                {RPCResult::Type::BOOL,    "watch_registered", "True iff swapwatch entry was stored"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_adapt_pric_claim",
+            "<swap_id> <tx_hex> '[\"<P0>\",\"<P1>\"]' <msg_hex>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+
+            const uint256 sid = ParseChainWatchSwapId(request.params[0]);
+            const std::string tx_hex = request.params[1].get_str();
+            const UniValue& ring_arr = request.params[2];
+            const std::string msg_hex = request.params[3].get_str();
+            const int32_t min_conf = request.params[4].isNull() ? 1
+                : request.params[4].getInt<int32_t>();
+
+            // Parse ring + msg.
+            if (!ring_arr.isArray() || ring_arr.empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "ring must be a non-empty array of pubkey hex");
+            }
+            std::vector<::pricoin::ringsig::Point> ring;
+            ring.reserve(ring_arr.size());
+            for (size_t i = 0; i < ring_arr.size(); ++i) {
+                auto pb = TryParseHex<unsigned char>(ring_arr[i].get_str());
+                if (!pb || pb->size() != 33) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        strprintf("ring[%u] must be 33-byte compressed pubkey hex",
+                            static_cast<unsigned>(i)));
+                }
+                ::pricoin::ringsig::Point P{};
+                std::copy(pb->begin(), pb->end(), P.begin());
+                ring.push_back(P);
+            }
+            auto msg_opt = uint256::FromHex(msg_hex);
+            if (!msg_opt) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "msg_hex must be 32-byte hex");
+            const uint256 msg = *msg_opt;
+
+            // Load + validate.
+            ::wallet::pricoin_adaptor_swap::AdaptorSwap snap;
+            if (::wallet::pricoin_adaptor_swap::Get(wallet, sid, snap)
+                != ::wallet::pricoin_adaptor_swap::LookupResult::Ok) {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "swap not found");
+            }
+            if (snap.role != ::wallet::pricoin_adaptor_swap::Role::Bob) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "adapt_pric_claim requires Bob role (only Bob holds t_secret)");
+            }
+            if (!snap.has_t) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "swap has no t_secret on record (already wiped or never set)");
+            }
+            if (snap.presigs.pric_claim_presig_blob.empty()) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "swap has no pric_claim_presig_blob — set_pre_signed not run?");
+            }
+
+            // Parse the pre-sig blob from the swap record.
+            DataStream presig_ds{std::span<const unsigned char>{
+                snap.presigs.pric_claim_presig_blob}};
+            ::pricoin::adaptor_ringsig::AdaptorPreSignature presig;
+            try { presig_ds >> presig; }
+            catch (const std::exception&) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "stored pric_claim_presig_blob did not parse as AdaptorPreSignature");
+            }
+
+            // Adapt: presig + t + ring + msg → final CLSAG signature.
+            ::pricoin::ringsig::Scalar t_scalar;
+            std::copy(snap.t_secret.begin(), snap.t_secret.end(), t_scalar.begin());
+            auto final_sig_opt = ::pricoin::adaptor_ringsig::Adapt(presig, t_scalar,
+                std::span<const ::pricoin::ringsig::Point>{ring}, msg);
+            if (!final_sig_opt) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "Adapt failed (t did not match T_G/T_H or pre-sig malformed or ring/msg mismatch)");
+            }
+
+            // Decode the skeleton, inject the sig.
+            CMutableTransaction mtx;
+            if (!DecodeHexTx(mtx, tx_hex, /*try_no_witness=*/true, /*try_witness=*/true)) {
+                throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "tx hex failed to decode");
+            }
+            if (mtx.version != PRICOIN_CT_VERSION) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "tx is not a v4 confidential tx");
+            }
+            if (mtx.ct_bundle.ring_inputs.size() != 1) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "expected exactly one ring input (joint-spend convention)");
+            }
+            mtx.ct_bundle.ring_inputs[0].sig = *final_sig_opt;
+
+            // Broadcast.
+            CTransactionRef tx_ref = MakeTransactionRef(std::move(mtx));
+            std::string err_str;
+            if (!wallet.chain().broadcastTransaction(
+                    tx_ref, MAX_MONEY,
+                    node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL,
+                    err_str)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "broadcast failed: " + err_str);
+            }
+            const std::string txid_hex = tx_ref->GetHash().ToString();
+
+            // Register watch.
+            pcw::WatchEntry e;
+            e.swap_id = sid;
+            e.kind    = pcw::WatchKind::PricClaim;
+            e.txid_hex = txid_hex;
+            e.min_confirmations = min_conf;
+            const auto r = pcw::Add(wallet, e);
+
+            // Serialize the final sig for the result so the caller can
+            // share it / inspect it.
+            DataStream sig_ds;
+            sig_ds << *final_sig_opt;
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("txid", txid_hex);
+            out.pushKV("size", (int)::GetSerializeSize(TX_WITH_WITNESS(*tx_ref)));
+            out.pushKV("sig",  HexStr(std::span<const unsigned char>{
+                UCharCast(sig_ds.data()), sig_ds.size()}));
+            out.pushKV("watch_registered", r == pcw::StoreResult::Ok);
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_swapwatch_extract_pric_t()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_extract_pric_t",
+        "Alice's BTC-claim path step 1: extract the adaptor secret t from\n"
+        "the on-chain CLSAG signature of Bob's PRIC claim tx, given the\n"
+        "single-layer ring used for the cooperative adaptor pre-sig and\n"
+        "the deserialized on-chain CLSAG signature blob.\n"
+        "\n"
+        "Wraps pricoin_jointspend_adaptor_extract with the swap record's\n"
+        "pric_claim_presig_blob auto-loaded — caller doesn't have to\n"
+        "remember which presig goes with which swap.\n"
+        "\n"
+        "Verifies t·G == swap.adaptor.T_G AND t·H_p(P_pi) == swap.adaptor.T_H\n"
+        "via the existing extract math; returns nullopt on any failure.\n",
+        {
+            {"swap_id",      RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"ring",         RPCArg::Type::ARR,     RPCArg::Optional::NO,
+                "Single-layer ring of joint pubkeys Bob used at adapt-round-1 time. "
+                "Must be supplied by Bob (e.g. via Nostr DM with the on-chain sig).",
+                {{"P", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+            {"sig_hex",      RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Serialized pricoin::ringsig::Signature from Bob's on-chain PRIC claim tx"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "t", "32-byte recovered scalar — feed to pricoin_swapwatch_adapt_btc_claim"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_extract_pric_t",
+            "<swap_id> '[\"<P0>\",\"<P1>\",\"<P2>\",\"<P3>\"]' <onchain_sig>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseChainWatchSwapId(request.params[0]);
+
+            ::wallet::pricoin_adaptor_swap::AdaptorSwap snap;
+            if (::wallet::pricoin_adaptor_swap::Get(*wallet_sp, sid, snap)
+                != ::wallet::pricoin_adaptor_swap::LookupResult::Ok) {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "swap not found");
+            }
+            if (snap.presigs.pric_claim_presig_blob.empty()) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "swap has no pric_claim_presig_blob — set_pre_signed not run?");
+            }
+            // Dispatch to the existing daemon-level extract RPC. We
+            // already have ring + sig_hex from the caller and the
+            // presig from the record. The daemon RPC handles parsing
+            // + the secp256k1 math.
+            UniValue p{UniValue::VARR};
+            p.push_back(request.params[1]);  // ring
+            p.push_back(HexStr(snap.presigs.pric_claim_presig_blob));
+            p.push_back(request.params[2].get_str());
+            // We can't call RPCs from inside another RPC handler
+            // cleanly via tableRPC.execute — instead, replicate the
+            // tiny extract path inline. (The math is in
+            // pricoin::adaptor_ringsig::Extract.)
+            using namespace ::pricoin::ringsig;
+            std::vector<Point> ring;
+            const UniValue& ring_arr = request.params[1];
+            if (!ring_arr.isArray() || ring_arr.empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "ring must be a non-empty array of pubkey hex");
+            }
+            ring.reserve(ring_arr.size());
+            for (size_t i = 0; i < ring_arr.size(); ++i) {
+                auto pb = TryParseHex<unsigned char>(ring_arr[i].get_str());
+                if (!pb || pb->size() != 33) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        strprintf("ring[%u] must be 33-byte compressed pubkey hex", static_cast<unsigned>(i)));
+                }
+                Point P{};
+                std::copy(pb->begin(), pb->end(), P.begin());
+                ring.push_back(P);
+            }
+            auto presig_bytes = snap.presigs.pric_claim_presig_blob;
+            DataStream presig_ds{std::span<const unsigned char>{presig_bytes}};
+            ::pricoin::adaptor_ringsig::AdaptorPreSignature presig;
+            try { presig_ds >> presig; }
+            catch (const std::exception&) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "stored pric_claim_presig_blob did not parse as AdaptorPreSignature");
+            }
+            auto sig_bytes = TryParseHex<unsigned char>(request.params[2].get_str());
+            if (!sig_bytes) throw JSONRPCError(RPC_INVALID_PARAMETER, "sig_hex invalid");
+            DataStream sig_ds{std::span<const unsigned char>{*sig_bytes}};
+            Signature sig;
+            try { sig_ds >> sig; }
+            catch (const std::exception& e) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    std::string("on-chain sig deserialize failed: ") + e.what());
+            }
+            auto t = ::pricoin::adaptor_ringsig::Extract(
+                std::span<const Point>{ring}, presig, sig);
+            if (!t) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "Extract failed — check t·G == T_G and t·H_p(P_pi) == T_H");
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("t", HexStr(*t));
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_swapwatch_adapt_btc_claim()
 {
     return RPCMethod{
@@ -7017,6 +7336,8 @@ RPCMethod pricoin_swapwatch_notify_export()             { return pricoin_swapwat
 RPCMethod pricoin_swapwatch_broadcast_foreign_export()  { return pricoin_swapwatch_broadcast_foreign(); }
 RPCMethod pricoin_swapwatch_broadcast_pric_export()     { return pricoin_swapwatch_broadcast_pric(); }
 RPCMethod pricoin_swapwatch_adapt_btc_claim_export()    { return pricoin_swapwatch_adapt_btc_claim(); }
+RPCMethod pricoin_swapwatch_extract_pric_t_export()     { return pricoin_swapwatch_extract_pric_t(); }
+RPCMethod pricoin_swapwatch_adapt_pric_claim_export()   { return pricoin_swapwatch_adapt_pric_claim(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }

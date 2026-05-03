@@ -101,9 +101,19 @@ BASE_SCRIPTS = [
     # Pricoin-specific tests.
     'feature_pricoin_ct.py',
     'feature_pricoin_jointspend.py',
+    'feature_pricoin_jointspend_refund.py',
+    'feature_pricoin_jointspend_adaptor.py',
     'feature_pricoin_chainwatch.py',
     'feature_pricoin_btc_htlc.py',
+    'feature_pricoin_btc_swap_tx.py',
+    'feature_pricoin_btc_musig2_nonce_records.py',
+    'feature_pricoin_btc_musig2_wire.py',
+    'feature_pricoin_clsag_nonce_records.py',
     'feature_pricoin_swap_ceremony.py',
+    'feature_pricoin_adaptor_swap.py',
+    'feature_pricoin_offer.py',
+    'feature_pricoin_swapwatch.py',
+    'feature_pricoin_swapwatch_e2e.py',
     # Scripts that are run by default.
     # Longest test should go first, to favor running tests in parallel
     # vv Tests less than 5m vv

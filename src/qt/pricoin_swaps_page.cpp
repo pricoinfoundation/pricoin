@@ -164,9 +164,12 @@ void PricoinSwapsPage::buildLayout()
     m_btn_sw_remove = new QPushButton(tr("Remove watch"),  sw_box);
     m_btn_adapt_btc_claim = new QPushButton(
         tr("Adapt + broadcast BTC claim…"), sw_box);
+    m_btn_adapt_pric_claim = new QPushButton(
+        tr("Adapt + broadcast PRIC claim… (Bob)"), sw_box);
     sw_bot->addWidget(m_btn_sw_add);
     sw_bot->addWidget(m_btn_sw_remove);
     sw_bot->addWidget(m_btn_adapt_btc_claim);
+    sw_bot->addWidget(m_btn_adapt_pric_claim);
     sw_bot->addStretch();
     sw_outer->addLayout(sw_bot);
     outer->addWidget(sw_box);
@@ -182,6 +185,7 @@ void PricoinSwapsPage::buildLayout()
     connect(m_btn_sw_add,     &QPushButton::clicked, this, &PricoinSwapsPage::onSwapwatchAddClicked);
     connect(m_btn_sw_remove,  &QPushButton::clicked, this, &PricoinSwapsPage::onSwapwatchRemoveClicked);
     connect(m_btn_adapt_btc_claim, &QPushButton::clicked, this, &PricoinSwapsPage::onAdaptBtcClaimClicked);
+    connect(m_btn_adapt_pric_claim, &QPushButton::clicked, this, &PricoinSwapsPage::onAdaptPricClaimClicked);
 
     if (auto* sm = m_table->selectionModel()) {
         connect(sm, &QItemSelectionModel::selectionChanged,
@@ -968,6 +972,63 @@ void PricoinSwapsPage::onAdaptBtcClaimClicked()
     }
     const QString txid = QString::fromStdString((*r)["txid"].get_str());
     setStatus(tr("BTC claim broadcast — txid %1… (watching for confirmations).")
+        .arg(txid.left(16)));
+    refreshTable();
+    onSwapwatchRefresh();
+}
+
+void PricoinSwapsPage::onAdaptPricClaimClicked()
+{
+    if (!m_model) return;
+    const std::string sid = selectedSwapId();
+    if (sid.empty()) {
+        setStatus(tr("Select a swap row first."), true);
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Adapt + broadcast PRIC claim (Bob)"));
+    auto* form = new QFormLayout(&dlg);
+    form->addRow(new QLabel(tr("Bob-only: uses the wallet's stored t_secret to "
+        "adapt the PRIC adaptor pre-sig and broadcast the claim. The 3 inputs "
+        "below come from Bob's cooperative-sign dialog session — paste tx_hex "
+        "(buildtx output), the single-layer ring of joint pubkeys, and the "
+        "32-byte sighash."), &dlg));
+    auto* tx_hex = new QPlainTextEdit(&dlg);
+    tx_hex->setPlaceholderText(tr("Skeleton tx hex from pricoin_jointspend_buildtx"));
+    tx_hex->setMaximumHeight(80);
+    form->addRow(tr("tx_hex:"), tx_hex);
+    auto* ring = new QPlainTextEdit(&dlg);
+    ring->setPlaceholderText(tr("JSON array of 33-byte compressed pubkey hex strings"));
+    ring->setMaximumHeight(80);
+    form->addRow(tr("ring (JSON):"), ring);
+    auto* msg = new QLineEdit(&dlg);
+    msg->setPlaceholderText(tr("32-byte sighash hex"));
+    form->addRow(tr("msg (sighash):"), msg);
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(bb);
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    UniValue ring_v;
+    if (!ring_v.read(ring->toPlainText().toStdString()) || !ring_v.isArray()) {
+        setStatus(tr("ring must be a JSON array of pubkey hex strings"), true);
+        return;
+    }
+    UniValue p{UniValue::VARR};
+    p.push_back(sid);
+    p.push_back(tx_hex->toPlainText().trimmed().toStdString());
+    p.push_back(ring_v);
+    p.push_back(msg->text().trimmed().toStdString());
+    p.push_back(1);  // min_confirmations
+    std::string err;
+    auto r = CallWalletRpc(m_model, "pricoin_swapwatch_adapt_pric_claim", p, &err);
+    if (!r) {
+        setStatus(tr("Adapt+broadcast PRIC failed: %1").arg(QString::fromStdString(err)), true);
+        return;
+    }
+    const QString txid = QString::fromStdString((*r)["txid"].get_str());
+    setStatus(tr("PRIC claim broadcast — txid %1… (watching for confirmations).")
         .arg(txid.left(16)));
     refreshTable();
     onSwapwatchRefresh();
