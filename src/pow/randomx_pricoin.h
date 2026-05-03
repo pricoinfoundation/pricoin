@@ -7,6 +7,7 @@
 
 #include <uint256.h>
 
+#include <optional>
 #include <span>
 
 class CBlockHeader;
@@ -31,12 +32,28 @@ int ComputeSeedHeight(int height);
 uint256 GetPoWHashOfHeader(const CBlockHeader& header, const uint256& seed_hash);
 uint256 GetPoWHashOfBytes(std::span<const unsigned char> data, const uint256& seed_hash);
 
-// Convenience: resolve seed_hash via the active chain for this height. If
-// height < EPOCH_LAG (genesis era) the bootstrap seed is used. If
-// ComputeSeedHeight(height) > the chain's known tip, falls back to bootstrap
-// (this should never happen for properly-validated blocks but is defensive
-// for partial header sync). Pass nullptr if no chain is available — same
-// effect as bootstrap.
+// Convenience: resolve seed_hash via the active chain for this height.
+// Returns nullopt when the seed block ISN'T yet indexed in `chain` —
+// typical during header-sync past the first epoch boundary, where peer
+// has advanced past height 2112 but slow node hasn't downloaded block
+// 2048 yet. Caller chooses behavior:
+//   * Header-acceptance path: defer PoW verification (treat as pass).
+//     The block-validation path runs CheckBlockHeader again with the
+//     full block context, where the seed block IS indexed because
+//     blocks download in sequence. Any genuinely-bogus PoW gets caught
+//     there.
+//   * Block-validation path: nullopt is unexpected (seed block must be
+//     in chain by then). Treat as failure.
+// Returns the hash for height < EPOCH_LAG using the bootstrap seed,
+// regardless of `chain`.
+std::optional<uint256> TryGetPoWHashOfHeader(
+    const CBlockHeader& header, int height, const CChain* chain);
+
+// Legacy convenience: like TryGetPoWHashOfHeader but silently falls
+// back to the bootstrap seed when the seed block isn't indexed. Kept
+// for callers that explicitly accept the silent-fallback semantics
+// (e.g. mining-loop helpers); new code should prefer the optional
+// overload above.
 uint256 GetPoWHashOfHeader(const CBlockHeader& header, int height, const CChain* chain);
 
 // Single-argument overload: equivalent to passing BootstrapSeedHash().

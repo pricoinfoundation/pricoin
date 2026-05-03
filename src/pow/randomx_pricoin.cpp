@@ -110,15 +110,24 @@ uint256 GetPoWHashOfHeader(const CBlockHeader& header, const uint256& seed_hash)
         reinterpret_cast<const unsigned char*>(ds.data()), ds.size()}, seed_hash);
 }
 
-uint256 GetPoWHashOfHeader(const CBlockHeader& header, int height, const CChain* chain)
+std::optional<uint256> TryGetPoWHashOfHeader(
+    const CBlockHeader& header, int height, const CChain* chain)
 {
     const int seed_height = ComputeSeedHeight(height);
-    uint256 seed = BootstrapSeedHash();
-    if (seed_height > 0 && chain) {
-        const CBlockIndex* idx = (*chain)[seed_height];
-        if (idx) seed = idx->GetBlockHash();
+    if (seed_height == 0) {
+        // Genesis era: seed is the bootstrap; chain irrelevant.
+        return GetPoWHashOfHeader(header, BootstrapSeedHash());
     }
-    return GetPoWHashOfHeader(header, seed);
+    if (!chain) return std::nullopt;
+    const CBlockIndex* idx = (*chain)[seed_height];
+    if (!idx) return std::nullopt;
+    return GetPoWHashOfHeader(header, idx->GetBlockHash());
+}
+
+uint256 GetPoWHashOfHeader(const CBlockHeader& header, int height, const CChain* chain)
+{
+    auto result = TryGetPoWHashOfHeader(header, height, chain);
+    return result ? *result : GetPoWHashOfHeader(header, BootstrapSeedHash());
 }
 
 uint256 GetPoWHashOfHeader(const CBlockHeader& header)

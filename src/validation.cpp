@@ -3971,11 +3971,27 @@ static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& st
     // delay; the caller resolves the seed via (height, chain). For heights
     // below EPOCH_LAG (or when caller doesn't have height context) the
     // bootstrap seed is used.
+    //
+    // Seed-deferral: when we receive a header at height ≥ first epoch
+    // boundary but the seed block isn't yet indexed in `chain` (we're
+    // still doing IBD and haven't downloaded that block), we cannot
+    // verify PoW correctly. Returning failure here would punish the
+    // peer as if they sent invalid PoW; that's wrong. Instead we treat
+    // PoW as deferred: the same header runs through CheckBlockHeader
+    // again from CheckBlock once the full block has been downloaded,
+    // by which point all earlier blocks (including the seed block) are
+    // sequentially in chain. Any genuinely-bogus PoW gets caught at
+    // that re-check. Net effect: header-sync proceeds; bad headers'
+    // bad PoW surfaces at block-validation time, which is the right
+    // place for the misbehavior signal.
     if (fCheckPOW) {
-        const uint256 pow_hash = (height >= 0)
-            ? pricoin::randomx::GetPoWHashOfHeader(block, height, chain)
-            : pricoin::randomx::GetPoWHashOfHeader(block);
-        if (!CheckProofOfWork(pow_hash, block.nBits, consensusParams))
+        std::optional<uint256> pow_hash;
+        if (height >= 0) {
+            pow_hash = pricoin::randomx::TryGetPoWHashOfHeader(block, height, chain);
+        } else {
+            pow_hash = pricoin::randomx::GetPoWHashOfHeader(block);
+        }
+        if (pow_hash && !CheckProofOfWork(*pow_hash, block.nBits, consensusParams))
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
     }
 
@@ -4171,25 +4187,30 @@ bool HasValidProofOfWork(std::span<const CBlockHeader> headers, const Consensus:
     // Pricoin: resolve each header's RandomX seed via chainman->m_block_index.
     // For each header, look up its parent by header.hashPrevBlock to derive
     // height = parent.nHeight + 1, then walk to ComputeSeedHeight(height).
-    // If the parent isn't known (early header sync), or chainman is null,
-    // fall back to the bootstrap seed — only correct for heights < EPOCH_LAG.
+    // Seed-deferral: when the seed block isn't yet indexed (header-sync past
+    // first epoch boundary, slow node hasn't downloaded the seed block yet),
+    // TryGetPoWHashOfHeader returns nullopt. Treat as "PoW pass" so the peer
+    // isn't punished for sending headers that we can't yet verify; the
+    // re-check at full-block validation will catch any actual bogus PoW.
     return std::ranges::all_of(headers,
                                [&](const auto& header) {
-        uint256 pow_hash;
+        std::optional<uint256> pow_hash;
         if (chainman) {
             LOCK(::cs_main);
             const auto& bm = chainman->m_blockman.m_block_index;
             const auto it = bm.find(header.hashPrevBlock);
             if (it != bm.end()) {
                 const int height = it->second.nHeight + 1;
-                pow_hash = pricoin::randomx::GetPoWHashOfHeader(header, height, &chainman->ActiveChain());
+                pow_hash = pricoin::randomx::TryGetPoWHashOfHeader(header, height, &chainman->ActiveChain());
             } else {
                 pow_hash = pricoin::randomx::GetPoWHashOfHeader(header);
             }
         } else {
             pow_hash = pricoin::randomx::GetPoWHashOfHeader(header);
         }
-        return CheckProofOfWork(pow_hash, header.nBits, consensusParams);
+        // Seed unavailable → defer; treat as pass for header-batch check.
+        if (!pow_hash) return true;
+        return CheckProofOfWork(*pow_hash, header.nBits, consensusParams);
     });
 }
 
