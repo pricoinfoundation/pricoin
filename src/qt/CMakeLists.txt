@@ -24,6 +24,17 @@ function(import_plugins target)
     elseif(APPLE)
       list(APPEND plugins Qt6::QCocoaIntegrationPlugin Qt6::QMacStylePlugin)
     endif()
+    # Pricoin: explicitly include the OpenSSL TLS backend plugin so
+    # QtWebSockets' wss:// connections (Nostr relays for the
+    # orderbook + DM transport) work in static Qt builds. Without
+    # this, QtNetwork logs "No functional TLS backend was found"
+    # at runtime and every wss connection fails. Use TARGET_NAME_IF_EXISTS
+    # since Qt may also expose a Schannel/SecureTransport backend
+    # depending on the host platform — we want OpenSSL on every host
+    # because depends builds it consistently.
+    if(TARGET Qt6::QTlsBackendOpenSSLPlugin)
+      list(APPEND plugins Qt6::QTlsBackendOpenSSLPlugin)
+    endif()
     qt6_import_plugins(${target}
       INCLUDE ${plugins}
       EXCLUDE_BY_TYPE
@@ -40,7 +51,6 @@ function(import_plugins target)
         styles
         networkaccess
         networkinformation
-        tls
     )
   endif()
 endfunction()
