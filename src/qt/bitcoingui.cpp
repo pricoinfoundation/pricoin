@@ -300,6 +300,14 @@ void BitcoinGUI::createActions()
     pricoinSwapsAction->setShortcut(QKeySequence(QStringLiteral("Alt+6")));
     tabGroup->addAction(pricoinSwapsAction);
 
+    pricoinHoldingAction = new QAction(platformStyle->SingleColorIcon(":/icons/receiving_addresses"),
+        tr("&Holding"), this);
+    pricoinHoldingAction->setStatusTip(tr("BTC + LTC holding-wallet addresses, balances, and sweep"));
+    pricoinHoldingAction->setToolTip(pricoinHoldingAction->statusTip());
+    pricoinHoldingAction->setCheckable(true);
+    pricoinHoldingAction->setShortcut(QKeySequence(QStringLiteral("Alt+7")));
+    tabGroup->addAction(pricoinHoldingAction);
+
 #ifdef ENABLE_WALLET
     // These showNormalIfMinimized are needed because Send Coins and Receive Coins
     // can be triggered from the tray menu, and need to show the GUI to be useful.
@@ -315,6 +323,8 @@ void BitcoinGUI::createActions()
     connect(pricoinOrderbookAction, &QAction::triggered, this, &BitcoinGUI::gotoPricoinOrderbookPage);
     connect(pricoinSwapsAction, &QAction::triggered, [this]{ showNormalIfMinimized(); });
     connect(pricoinSwapsAction, &QAction::triggered, this, &BitcoinGUI::gotoPricoinSwapsPage);
+    connect(pricoinHoldingAction, &QAction::triggered, [this]{ showNormalIfMinimized(); });
+    connect(pricoinHoldingAction, &QAction::triggered, this, &BitcoinGUI::gotoPricoinHoldingPage);
 #endif // ENABLE_WALLET
 
     quitAction = new QAction(tr("E&xit"), this);
@@ -660,6 +670,7 @@ void BitcoinGUI::createToolBars()
         toolbar->addAction(historyAction);
         toolbar->addAction(pricoinOrderbookAction);
         toolbar->addAction(pricoinSwapsAction);
+        toolbar->addAction(pricoinHoldingAction);
         overviewAction->setChecked(true);
 
 #ifdef ENABLE_WALLET
@@ -881,6 +892,7 @@ void BitcoinGUI::setWalletActionsEnabled(bool enabled)
     historyAction->setEnabled(enabled && !isPrivacyModeActivated());
     pricoinOrderbookAction->setEnabled(enabled);
     pricoinSwapsAction->setEnabled(enabled);
+    pricoinHoldingAction->setEnabled(enabled);
     encryptWalletAction->setEnabled(enabled);
     backupWalletAction->setEnabled(enabled);
     changePassphraseAction->setEnabled(enabled);
@@ -1064,6 +1076,12 @@ void BitcoinGUI::gotoPricoinSwapsPage()
 {
     pricoinSwapsAction->setChecked(true);
     if (walletFrame) walletFrame->gotoPricoinSwapsPage();
+}
+
+void BitcoinGUI::gotoPricoinHoldingPage()
+{
+    pricoinHoldingAction->setChecked(true);
+    if (walletFrame) walletFrame->gotoPricoinHoldingPage();
 }
 
 void BitcoinGUI::gotoSignMessageTab(QString addr)

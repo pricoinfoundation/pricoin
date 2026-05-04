@@ -13,6 +13,7 @@
 class ClientModel;
 class OverviewPage;
 class PlatformStyle;
+class PricoinHoldingPage;
 class PricoinOrderbookPage;
 class PricoinSwapsPage;
 class ReceiveCoinsDialog;
@@ -66,6 +67,7 @@ private:
     SendCoinsDialog *sendCoinsPage;
     PricoinOrderbookPage *pricoinOrderbookPage{nullptr};
     PricoinSwapsPage *pricoinSwapsPage{nullptr};
+    PricoinHoldingPage *pricoinHoldingPage{nullptr};
     AddressBookPage *usedSendingAddressesPage;
     AddressBookPage *usedReceivingAddressesPage;
 
@@ -87,6 +89,8 @@ public Q_SLOTS:
     void gotoPricoinOrderbookPage();
     /** Switch to Pricoin swaps page */
     void gotoPricoinSwapsPage();
+    /** Switch to Pricoin BTC/LTC holding-wallets page */
+    void gotoPricoinHoldingPage();
 
     /** Show Sign/Verify Message dialog and switch to sign message tab */
     void gotoSignMessageTab(QString addr = "");

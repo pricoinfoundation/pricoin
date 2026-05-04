@@ -190,6 +190,13 @@ void WalletFrame::gotoPricoinSwapsPage()
         i.value()->gotoPricoinSwapsPage();
 }
 
+void WalletFrame::gotoPricoinHoldingPage()
+{
+    QMap<WalletModel*, WalletView*>::const_iterator i;
+    for (i = mapWalletViews.constBegin(); i != mapWalletViews.constEnd(); ++i)
+        i.value()->gotoPricoinHoldingPage();
+}
+
 void WalletFrame::gotoSignMessageTab(QString addr)
 {
     WalletView *walletView = currentWalletView();

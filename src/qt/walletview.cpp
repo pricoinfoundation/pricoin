@@ -11,6 +11,7 @@
 #include <qt/optionsmodel.h>
 #include <qt/overviewpage.h>
 #include <qt/platformstyle.h>
+#include <qt/pricoin_holding_page.h>
 #include <qt/pricoin_swaps_page.h>
 #include <qt/pricoinorderbookpage.h>
 #include <qt/receivecoinsdialog.h>
@@ -71,6 +72,9 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
     pricoinSwapsPage = new PricoinSwapsPage(platformStyle);
     pricoinSwapsPage->setModel(walletModel);
 
+    pricoinHoldingPage = new PricoinHoldingPage(platformStyle);
+    pricoinHoldingPage->setModel(walletModel);
+
     usedSendingAddressesPage = new AddressBookPage(platformStyle, AddressBookPage::ForEditing, AddressBookPage::SendingTab, this);
     usedSendingAddressesPage->setModel(walletModel->getAddressTableModel());
 
@@ -83,6 +87,7 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
     addWidget(sendCoinsPage);
     addWidget(pricoinOrderbookPage);
     addWidget(pricoinSwapsPage);
+    addWidget(pricoinHoldingPage);
 
     connect(overviewPage, &OverviewPage::transactionClicked, this, &WalletView::transactionClicked);
     // Clicking on a transaction on the overview pre-selects the transaction on the transaction history page
@@ -184,6 +189,11 @@ void WalletView::gotoPricoinOrderbookPage()
 void WalletView::gotoPricoinSwapsPage()
 {
     if (pricoinSwapsPage) setCurrentWidget(pricoinSwapsPage);
+}
+
+void WalletView::gotoPricoinHoldingPage()
+{
+    if (pricoinHoldingPage) setCurrentWidget(pricoinHoldingPage);
 }
 
 void WalletView::gotoSignMessageTab(QString addr)

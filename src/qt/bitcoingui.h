@@ -138,6 +138,7 @@ private:
     QAction* sendCoinsAction = nullptr;
     QAction* pricoinOrderbookAction = nullptr;
     QAction* pricoinSwapsAction = nullptr;
+    QAction* pricoinHoldingAction = nullptr;
     QAction* usedSendingAddressesAction = nullptr;
     QAction* usedReceivingAddressesAction = nullptr;
     QAction* signMessageAction = nullptr;
@@ -287,6 +288,8 @@ public Q_SLOTS:
     void gotoSendCoinsPage(QString addr = "");
     /** Switch to Pricoin orderbook page */
     void gotoPricoinOrderbookPage();
+    /** Switch to Pricoin BTC/LTC holding-wallet page */
+    void gotoPricoinHoldingPage();
     /** Switch to Pricoin swaps page */
     void gotoPricoinSwapsPage();
 

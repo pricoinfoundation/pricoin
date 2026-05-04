@@ -79,6 +79,8 @@ public Q_SLOTS:
     void gotoPricoinOrderbookPage();
     /** Switch to Pricoin swaps page */
     void gotoPricoinSwapsPage();
+    /** Switch to Pricoin BTC/LTC holding-wallet page */
+    void gotoPricoinHoldingPage();
 
     /** Show Sign/Verify Message dialog and switch to sign message tab */
     void gotoSignMessageTab(QString addr = "");
