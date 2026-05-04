@@ -4636,6 +4636,56 @@ RPCMethod pricoin_adaptor_swap_set_timelocks()
     };
 }
 
+RPCMethod pricoin_adaptor_swap_set_pric_claim_ring()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_set_pric_claim_ring",
+        "Persist the cooperative single-layer CLSAG ring used at PRIC adapt-\n"
+        "round-1 time. Called by Alice's coopsign dialog after a successful\n"
+        "adaptor combine, so the watcher can run extract automatically when\n"
+        "Bob's claim hits chain (no need for Alice to re-paste the ring).\n"
+        "Idempotent if the supplied ring matches the stored one.\n",
+        {
+            {"swap_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"ring",    RPCArg::Type::ARR,     RPCArg::Optional::NO,
+                "Array of 33-byte compressed pubkey hex strings (single-layer ring)",
+                {{"P", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::BOOL, "ok", "true on success"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_set_pric_claim_ring",
+            "<swap_id> '[\"<P0>\",\"<P1>\",\"<P2>\",\"<P3>\"]'")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseSwapId(request.params[0].get_str());
+            const UniValue& ring_arr = request.params[1];
+            if (!ring_arr.isArray() || ring_arr.empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "ring must be a non-empty JSON array");
+            }
+            std::vector<std::array<unsigned char, 33>> ring;
+            ring.reserve(ring_arr.size());
+            for (size_t i = 0; i < ring_arr.size(); ++i) {
+                auto pb = TryParseHex<unsigned char>(ring_arr[i].get_str());
+                if (!pb || pb->size() != 33) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        strprintf("ring[%u] must be 33-byte compressed pubkey hex",
+                                  static_cast<unsigned>(i)));
+                }
+                std::array<unsigned char, 33> p{};
+                std::copy(pb->begin(), pb->end(), p.begin());
+                ring.push_back(p);
+            }
+            auto r = aas::SetPricClaimRing(*wallet_sp, sid, ring);
+            if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("ok", true);
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_adaptor_swap_set_btc_funded()
 {
     return RPCMethod{
@@ -7865,6 +7915,7 @@ RPCMethod pricoin_adaptor_swap_create_export()           { return pricoin_adapto
 RPCMethod pricoin_adaptor_swap_set_adaptor_export()      { return pricoin_adaptor_swap_set_adaptor(); }
 RPCMethod pricoin_adaptor_swap_set_timelocks_export()    { return pricoin_adaptor_swap_set_timelocks(); }
 RPCMethod pricoin_adaptor_swap_set_btc_funded_export()   { return pricoin_adaptor_swap_set_btc_funded(); }
+RPCMethod pricoin_adaptor_swap_set_pric_claim_ring_export() { return pricoin_adaptor_swap_set_pric_claim_ring(); }
 RPCMethod pricoin_adaptor_swap_set_pric_funded_export()  { return pricoin_adaptor_swap_set_pric_funded(); }
 RPCMethod pricoin_adaptor_swap_set_pre_signed_export()   { return pricoin_adaptor_swap_set_pre_signed(); }
 RPCMethod pricoin_adaptor_swap_set_pric_claimed_export() { return pricoin_adaptor_swap_set_pric_claimed(); }
@@ -7937,6 +7988,77 @@ std::vector<PricoinCTRecovery> ScanTxForCTReceives(
         r.value = rec->value;
         std::memcpy(r.one_time_priv.data(), rec->one_time_priv.begin(), 32);
         out.push_back(r);
+    }
+    return out;
+}
+
+std::vector<PricoinSwapClaimRecovery> ScanTxForSwapClaim(
+    CWallet& wallet,
+    const CTransaction& tx)
+{
+    using namespace ::wallet::pricoin_adaptor_swap;
+    namespace par = ::pricoin::adaptor_ringsig;
+    std::vector<PricoinSwapClaimRecovery> out;
+    if (tx.version != PRICOIN_CT_VERSION) return out;
+    if (tx.ct_bundle.ring_inputs.empty()) return out;
+
+    // Pull the snapshot of all swaps once. List is small (per-user,
+    // toy/regtest scope); cheap to iterate per tx.
+    std::vector<AdaptorSwap> swaps;
+    if (List(wallet, swaps) != LookupResult::Ok) return out;
+
+    for (const auto& s : swaps) {
+        if (s.role != Role::Alice) continue;
+        if (s.has_t) continue;
+        if (s.state != State::PreSigned && s.state != State::PricClaimed) continue;
+        if (s.pric_claim_ring.empty()) continue;
+        if (s.presigs.pric_claim_presig_blob.empty()) continue;
+        if (s.pric_funding_txid.IsNull() || s.pric_funding_vout < 0) continue;
+
+        // Look for the swap's joint funding outpoint in any of the
+        // tx's ring_inputs. If found, this tx is a candidate spend.
+        for (const auto& ri : tx.ct_bundle.ring_inputs) {
+            bool match = false;
+            for (const auto& po : ri.ring) {
+                if (po.hash == s.pric_funding_txid
+                    && static_cast<int32_t>(po.n) == s.pric_funding_vout) {
+                    match = true;
+                    break;
+                }
+            }
+            if (!match) continue;
+
+            // Reconstruct the ring as Points (33-byte arrays).
+            std::vector<::pricoin::ringsig::Point> ring_pts;
+            ring_pts.reserve(s.pric_claim_ring.size());
+            for (const auto& p : s.pric_claim_ring) {
+                ::pricoin::ringsig::Point P{};
+                std::copy(p.begin(), p.end(), P.begin());
+                ring_pts.push_back(P);
+            }
+
+            // Parse the persisted adaptor pre-sig blob.
+            par::AdaptorPreSignature presig;
+            try {
+                DataStream ds{std::span<const unsigned char>{
+                    s.presigs.pric_claim_presig_blob}};
+                ds >> presig;
+            } catch (const std::exception&) {
+                continue;
+            }
+
+            // Extract t from (ring, presig, on-chain sig).
+            auto t_or = par::Extract(
+                std::span<const ::pricoin::ringsig::Point>{ring_pts},
+                presig, ri.sig);
+            if (!t_or) continue;
+
+            PricoinSwapClaimRecovery rec;
+            rec.swap_id = s.swap_id;
+            rec.t_recovered = *t_or;
+            out.push_back(rec);
+            break; // one match per swap is enough
+        }
     }
     return out;
 }

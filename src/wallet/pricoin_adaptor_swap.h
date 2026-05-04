@@ -237,6 +237,14 @@ struct AdaptorSwap {
     std::string pric_alice_recipient_stealth;
     std::string pric_bob_recipient_stealth;
 
+    // Cooperative ring used at adapt-round-1 time (single-layer CLSAG
+    // ring of joint pubkeys). Persisted on Alice's wallet so that
+    // when Bob's claim hits the chain, t can be extracted without
+    // requiring Alice to paste the ring back in. Each entry is a
+    // 33-byte compressed pubkey (Pricoin one-time pubkey, except
+    // the signer-index entry which is the joint stealth pub).
+    std::vector<std::array<unsigned char, 33>> pric_claim_ring;
+
     SERIALIZE_METHODS(AdaptorSwap, obj) {
         READWRITE(obj.swap_id);
         uint8_t role_byte = static_cast<uint8_t>(obj.role);
@@ -303,6 +311,10 @@ struct AdaptorSwap {
         READWRITE(obj.btc_bob_recipient_xonly_hex);
         READWRITE(obj.pric_alice_recipient_stealth);
         READWRITE(obj.pric_bob_recipient_stealth);
+
+        // Cooperative ring (appended 2026-05-04). Same toy/regtest
+        // scope caveat — old records will fail to deserialize.
+        READWRITE(obj.pric_claim_ring);
     }
 };
 
@@ -433,6 +445,17 @@ TransitionResult SetTSecret(
     CWallet& wallet,
     const uint256& swap_id,
     const std::array<unsigned char, 32>& t);
+
+// Persist the cooperative ring used at PRIC adapt-round-1 time. Called
+// by Alice's coopsign dialog after a successful adaptor combine, so
+// that when Bob's claim later hits chain the watcher can run extract
+// without Alice re-pasting the ring. State-machine-neutral. Idempotent
+// if the supplied ring matches the stored one. Rejects with
+// InvalidInput if `ring` is empty.
+TransitionResult SetPricClaimRing(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::vector<std::array<unsigned char, 33>>& ring);
 
 // Record Alice's foreign claim tx confirmed. Swap is done.
 // Transitions PricClaimed → Complete.

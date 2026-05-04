@@ -377,6 +377,22 @@ TransitionResult SetTSecret(
     });
 }
 
+TransitionResult SetPricClaimRing(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::vector<std::array<unsigned char, 33>>& ring)
+{
+    if (ring.empty()) return TransitionResult::InvalidInput;
+    return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
+        if (!s.pric_claim_ring.empty()) {
+            if (s.pric_claim_ring == ring) return TransitionResult::Ok;
+            return TransitionResult::InvalidInput;
+        }
+        s.pric_claim_ring = ring;
+        return TransitionResult::Ok;
+    });
+}
+
 TransitionResult SetComplete(
     CWallet& wallet,
     const uint256& swap_id,

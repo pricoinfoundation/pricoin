@@ -1126,10 +1126,12 @@ void PricoinSwapsPage::onExtractTClicked()
     }
     bool already_has_t = false;
     std::string role;
+    std::vector<std::string> persisted_ring;
     for (const auto& s : m_swaps) {
         if (s.swap_id == sid) {
             already_has_t = s.has_t;
             role = s.role;
+            persisted_ring = s.pric_claim_ring_hex;
             break;
         }
     }
@@ -1145,15 +1147,38 @@ void PricoinSwapsPage::onExtractTClicked()
     QDialog dlg(this);
     dlg.setWindowTitle(tr("Extract t from Bob's PRIC claim"));
     auto* form = new QFormLayout(&dlg);
-    form->addRow(new QLabel(tr("Recovers the adaptor scalar t from Bob's "
-                                "on-chain PRIC claim CLSAG signature. The ring "
-                                "+ sig hex come from Bob's Nostr DM (he sent "
-                                "them when he broadcast). On success t is "
-                                "persisted into the swap record so the LTC "
-                                "claim dialog auto-fills it."), &dlg));
+    form->addRow(new QLabel(persisted_ring.empty()
+        ? tr("Recovers the adaptor scalar t from Bob's on-chain PRIC "
+             "claim CLSAG signature. The ring + sig hex come from "
+             "Bob's Nostr DM (he sent them when he broadcast). On "
+             "success t is persisted into the swap record so the LTC "
+             "claim dialog auto-fills it.\n\n"
+             "Note: under the watcher auto-extract path, this dialog "
+             "is rarely needed — Alice's wallet picks up the spend "
+             "directly from chain. Use this only if the wallet was "
+             "offline when Bob's claim hit chain.")
+        : tr("Recovers the adaptor scalar t from Bob's on-chain PRIC "
+             "claim CLSAG signature. The ring is auto-filled from "
+             "the swap record — only paste the on-chain sig hex (Bob "
+             "sends it via Nostr DM).\n\n"
+             "Note: under the watcher auto-extract path, this dialog "
+             "is rarely needed — Alice's wallet picks up the spend "
+             "directly from chain. Use this only if the wallet was "
+             "offline when Bob's claim hit chain."),
+        &dlg));
     auto* ring_in = new QPlainTextEdit(&dlg);
     ring_in->setPlaceholderText(tr("JSON array of 33-byte compressed pubkey hex strings"));
     ring_in->setMaximumHeight(80);
+    if (!persisted_ring.empty()) {
+        // Render as JSON array.
+        QString json = QStringLiteral("[");
+        for (size_t i = 0; i < persisted_ring.size(); ++i) {
+            if (i) json += QStringLiteral(",");
+            json += QStringLiteral("\"") + QString::fromStdString(persisted_ring[i]) + QStringLiteral("\"");
+        }
+        json += QStringLiteral("]");
+        ring_in->setPlainText(json);
+    }
     form->addRow(tr("ring (JSON):"), ring_in);
     auto* sig_in = new QPlainTextEdit(&dlg);
     sig_in->setPlaceholderText(tr("hex of pricoin::ringsig::Signature blob from Bob's PRIC claim tx"));

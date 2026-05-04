@@ -84,6 +84,26 @@ std::vector<PricoinCTRecovery> ScanTxForCTReceives(
     CWallet& wallet,
     const CTransaction& tx);
 
+// One per-swap result from scanning a v4 tx for cooperative-claim spends.
+// `t_recovered` is the 32-byte adaptor scalar produced by Extract — the
+// caller persists this via aas::SetTSecret so subsequent steps (LTC
+// claim, BTC claim) can use it without manual re-paste.
+struct PricoinSwapClaimRecovery {
+    uint256                          swap_id;
+    std::array<unsigned char, 32>    t_recovered;
+};
+
+// Scan a v4 transaction for cooperative-CLSAG spends of any tracked
+// swap's joint funding output. Matches when a ring_input.ring contains
+// (swap.pric_funding_txid, swap.pric_funding_vout) for an active swap
+// with role=Alice + !has_t + pric_claim_ring populated. On match, runs
+// adaptor_ringsig::Extract over the on-chain CLSAG sig + the persisted
+// ring + the persisted PRIC pre-sig blob. Returns the recovered t per
+// matched swap (empty if none / not a v4 tx).
+std::vector<PricoinSwapClaimRecovery> ScanTxForSwapClaim(
+    CWallet& wallet,
+    const CTransaction& tx);
+
 // Drop the wallet's per-call recovery-scan cache. Idempotent / no-op
 // for wallets that haven't scanned yet. Defined in
 // wallet/rpc/pricoin_ct.cpp next to the cache.

@@ -81,8 +81,8 @@ public:
         auto* form = new QFormLayout(this);
 
         m_side = new QComboBox(this);
-        m_side->addItem(tr("Buy PRIC (pay foreign, receive PRIC)"), QStringLiteral("buy_pric"));
         m_side->addItem(tr("Sell PRIC (pay PRIC, receive foreign)"), QStringLiteral("sell_pric"));
+        m_side->addItem(tr("Buy PRIC (pay foreign, receive PRIC)"), QStringLiteral("buy_pric"));
         form->addRow(tr("Side:"), m_side);
 
         m_chain = new QComboBox(this);
@@ -90,13 +90,22 @@ public:
         m_chain->addItem(QStringLiteral("LTC"), QStringLiteral("ltc"));
         form->addRow(tr("Foreign chain:"), m_chain);
 
-        m_pric = new QLineEdit(this);
-        m_pric->setPlaceholderText(tr("e.g. 1.00000000"));
-        form->addRow(tr("Max PRIC amount:"), m_pric);
+        // Quantity field: PRIC for sellers, foreign for buyers.
+        // Label updates from `RefreshLabels()` when side or chain
+        // changes.
+        m_qty = new QLineEdit(this);
+        m_qty_label = new QLabel(this);
+        form->addRow(m_qty_label, m_qty);
 
-        m_foreign = new QLineEdit(this);
-        m_foreign->setPlaceholderText(tr("e.g. 0.50000000 (foreign at max)"));
-        form->addRow(tr("Foreign at max:"), m_foreign);
+        // Price field: always foreign per PRIC.
+        m_price = new QLineEdit(this);
+        m_price_label = new QLabel(this);
+        form->addRow(m_price_label, m_price);
+
+        // Live preview line so the user sees the resulting bundle.
+        m_preview = new QLabel(this);
+        m_preview->setStyleSheet(QStringLiteral("QLabel { color: #555; }"));
+        form->addRow(QString(), m_preview);
 
         m_expiry_hours = new QSpinBox(this);
         m_expiry_hours->setRange(1, 168);          // 1 hour … 1 week
@@ -111,18 +120,44 @@ public:
         connect(bb, &QDialogButtonBox::accepted, this, &QDialog::accept);
         connect(bb, &QDialogButtonBox::rejected, this, &QDialog::reject);
         form->addRow(bb);
+
+        // Wire reactive label/preview updates.
+        connect(m_side, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, &CreateOfferDialog::RefreshLabels);
+        connect(m_chain, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, &CreateOfferDialog::RefreshLabels);
+        connect(m_qty,   &QLineEdit::textChanged, this, &CreateOfferDialog::RefreshPreview);
+        connect(m_price, &QLineEdit::textChanged, this, &CreateOfferDialog::RefreshPreview);
+        RefreshLabels();
     }
 
     bool getParams(interfaces::Wallet::PricoinOfferCreateParams& out, QString& err) const {
-        bool ok_pric = false, ok_for = false;
-        const double pric_d = m_pric->text().trimmed().toDouble(&ok_pric);
-        const double for_d  = m_foreign->text().trimmed().toDouble(&ok_for);
-        if (!ok_pric || pric_d <= 0) { err = tr("max PRIC must be a positive number"); return false; }
-        if (!ok_for  || for_d  <= 0) { err = tr("foreign at max must be a positive number"); return false; }
+        bool ok_qty = false, ok_price = false;
+        const double qty   = m_qty->text().trimmed().toDouble(&ok_qty);
+        const double price = m_price->text().trimmed().toDouble(&ok_price);
+        if (!ok_qty   || qty   <= 0) { err = tr("quantity must be a positive number"); return false; }
+        if (!ok_price || price <= 0) { err = tr("price must be a positive number"); return false; }
+
         out.side = m_side->currentData().toString().toStdString();
         out.foreign_chain = m_chain->currentData().toString().toStdString();
-        out.max_pric_amount_sat = static_cast<int64_t>(pric_d * 100'000'000.0);
-        out.foreign_amount_at_max_sat = static_cast<int64_t>(for_d * 100'000'000.0);
+        // Qty interpretation:
+        //   sell_pric — qty is in PRIC; foreign side = qty * price.
+        //   buy_pric  — qty is in foreign; PRIC side = qty / price.
+        // Both forms collapse to the same on-wire fields:
+        //   max_pric_amount_sat       = the order's max PRIC quantity
+        //   foreign_amount_at_max_sat = foreign paid at full fill
+        // — i.e. the rate is foreign / pric.
+        if (out.side == "sell_pric") {
+            out.max_pric_amount_sat       = static_cast<int64_t>(qty * 100'000'000.0);
+            out.foreign_amount_at_max_sat = static_cast<int64_t>(qty * price * 100'000'000.0);
+        } else {
+            out.max_pric_amount_sat       = static_cast<int64_t>((qty / price) * 100'000'000.0);
+            out.foreign_amount_at_max_sat = static_cast<int64_t>(qty * 100'000'000.0);
+        }
+        if (out.max_pric_amount_sat <= 0 || out.foreign_amount_at_max_sat <= 0) {
+            err = tr("computed amount underflowed to zero — increase qty or price");
+            return false;
+        }
         out.expiry_unix_sec = QDateTime::currentSecsSinceEpoch()
                               + static_cast<int64_t>(m_expiry_hours->value()) * 3600;
         out.notes = m_notes->text().toStdString();
@@ -130,10 +165,49 @@ public:
     }
 
 private:
+    void RefreshLabels() {
+        const QString chain = m_chain->currentData().toString().toUpper();
+        const QString side  = m_side->currentData().toString();
+        if (side == "sell_pric") {
+            m_qty_label->setText(tr("Max PRIC quantity:"));
+            m_qty->setPlaceholderText(tr("e.g. 1.00000000  (PRIC you'll sell)"));
+        } else {
+            m_qty_label->setText(tr("Max %1 quantity:").arg(chain));
+            m_qty->setPlaceholderText(tr("e.g. 0.50000000  (%1 you'll spend)").arg(chain));
+        }
+        m_price_label->setText(tr("Price (%1 per PRIC):").arg(chain));
+        m_price->setPlaceholderText(tr("e.g. 0.50000000"));
+        RefreshPreview();
+    }
+
+    void RefreshPreview() {
+        bool ok_qty = false, ok_price = false;
+        const double qty   = m_qty->text().trimmed().toDouble(&ok_qty);
+        const double price = m_price->text().trimmed().toDouble(&ok_price);
+        if (!ok_qty || qty <= 0 || !ok_price || price <= 0) {
+            m_preview->setText(QString());
+            return;
+        }
+        const QString chain = m_chain->currentData().toString().toUpper();
+        const QString side  = m_side->currentData().toString();
+        const double pric_amt    = (side == "sell_pric") ? qty : qty / price;
+        const double foreign_amt = (side == "sell_pric") ? qty * price : qty;
+        const QString verb = (side == "sell_pric") ? tr("Sell") : tr("Buy");
+        m_preview->setText(tr("→ %1 up to %2 PRIC for %3 %4 (rate %5 %4/PRIC)")
+            .arg(verb)
+            .arg(QString::number(pric_amt,    'f', 8))
+            .arg(QString::number(foreign_amt, 'f', 8))
+            .arg(chain)
+            .arg(QString::number(price,       'f', 8)));
+    }
+
     QComboBox* m_side;
     QComboBox* m_chain;
-    QLineEdit* m_pric;
-    QLineEdit* m_foreign;
+    QLabel*    m_qty_label;
+    QLineEdit* m_qty;
+    QLabel*    m_price_label;
+    QLineEdit* m_price;
+    QLabel*    m_preview;
     QSpinBox*  m_expiry_hours;
     QLineEdit* m_notes;
 };

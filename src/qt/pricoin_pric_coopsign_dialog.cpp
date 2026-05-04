@@ -1068,6 +1068,24 @@ void PricCoopSignDialog::onStep2Compute()
         // Echo s_others verbatim — needed at assemble.
         m_s_others_json = QString::fromStdString(v["s_others"].write(0));
         m_out_step2->setPlainText(QString::fromStdString(r.json));
+
+        // Persist the cooperative ring into the swap record so the
+        // watcher can run extract automatically when Bob's claim hits
+        // chain. Best-effort — failure here doesn't break the
+        // cooperative ceremony, just falls back to manual ring entry
+        // in the Qt extract dialog.
+        if (!m_swap_id.isEmpty()) {
+            UniValue ring_params{UniValue::VARR};
+            ring_params.push_back(m_swap_id.toStdString());
+            ring_params.push_back(ring_v);
+            auto rr = callRpc("pricoin_adaptor_swap_set_pric_claim_ring",
+                                ring_params.write(0));
+            if (!rr.ok) {
+                setStatus(tr("ring persisted via adaptor_combine but "
+                              "set_pric_claim_ring failed: %1")
+                    .arg(QString::fromStdString(rr.error_msg)), false);
+            }
+        }
     } else {
         // Plain combine.
         UniValue ring_ml_v;

@@ -44,6 +44,7 @@
 #include <script/solver.h>
 #include <serialize.h>
 #include <util/strencodings.h>
+#include <wallet/pricoin_adaptor_swap.h>
 #include <wallet/pricoin_ct_send.h>
 #include <span.h>
 #include <streams.h>
@@ -1257,6 +1258,44 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
         } catch (...) {}
         const bool has_ct_receive = !ct_receives.empty();
 
+        // Pricoin (Phase B+): scan v4 txs for cooperative-CLSAG spends of
+        // any tracked swap's joint funding output. When matched, run
+        // adaptor_ringsig::Extract using the persisted ring + pre-sig and
+        // immediately persist the recovered t into the swap record so
+        // downstream claim flows (LTC HTLC, BTC) can consume it without
+        // a manual extract round-trip. We also fold this match into the
+        // tx-acceptance predicate below so Bob's claim tx (which Alice's
+        // wallet doesn't otherwise see — it pays Bob's stealth, not hers)
+        // enters mapWallet, letting the existing PricClaim watcher entry
+        // observe its confirmation.
+        std::vector<PricoinSwapClaimRecovery> swap_claims;
+        try {
+            swap_claims = ScanTxForSwapClaim(*this, tx);
+        } catch (...) {}
+        const bool has_swap_claim = !swap_claims.empty();
+        for (const auto& sc : swap_claims) {
+            const auto r = ::wallet::pricoin_adaptor_swap::SetTSecret(
+                *this, sc.swap_id, sc.t_recovered);
+            if (r != ::wallet::pricoin_adaptor_swap::TransitionResult::Ok) {
+                WalletLogPrintf(
+                    "Pricoin swap %s: extracted t but SetTSecret rejected "
+                    "(prior t already stored?)\n",
+                    sc.swap_id.ToString().substr(0, 12));
+            } else {
+                WalletLogPrintf(
+                    "Pricoin swap %s: t auto-extracted from on-chain claim "
+                    "(tx %s), persisted to swap record\n",
+                    sc.swap_id.ToString().substr(0, 12),
+                    tx.GetHash().ToString().substr(0, 12));
+            }
+            // Advance state PreSigned → PricClaimed so the subsequent
+            // LTC claim path can SetComplete on its own confirmation.
+            // Soft-fail (InvalidState) is fine — if state is already
+            // past PreSigned, another path got there first.
+            (void)::wallet::pricoin_adaptor_swap::SetPricClaimed(
+                *this, sc.swap_id, tx.GetHash().ToUint256());
+        }
+
         // For self-send v4 txs (sender == recipient via own stealth address),
         // CommitTransaction has already added the tx to mapWallet with empty
         // mapValue before the mempool callback fires. The early-return on
@@ -1264,9 +1303,9 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
         // pct_v<i>/pct_p<i> unset and ConfidentialBalance reading 0. So
         // continue past the early-return whenever we recovered CT outputs,
         // and let the update_fn below merge the new entries into mapValue.
-        if (fExisted && !fUpdate && !has_ct_receive) return false;
+        if (fExisted && !fUpdate && !has_ct_receive && !has_swap_claim) return false;
 
-        if (fExisted || IsMine(tx) || IsFromMe(tx) || has_ct_receive)
+        if (fExisted || IsMine(tx) || IsFromMe(tx) || has_ct_receive || has_swap_claim)
         {
             /* Check if any keys in the wallet keypool that were supposed to be unused
              * have appeared in a new transaction. If so, remove those keys from the keypool.

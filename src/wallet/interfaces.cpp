@@ -445,6 +445,10 @@ public:
         if (s.has_t) {
             o.t_secret_hex = HexStr(s.t_secret);
         }
+        o.pric_claim_ring_hex.reserve(s.pric_claim_ring.size());
+        for (const auto& p : s.pric_claim_ring) {
+            o.pric_claim_ring_hex.push_back(HexStr(p));
+        }
         return o;
     }
 

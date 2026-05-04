@@ -255,6 +255,12 @@ public:
         // Qt LTC-claim dialog uses this to skip the t_hex prompt.
         bool        has_t{false};
         std::string t_secret_hex;       // 64 hex chars when has_t
+
+        // Cooperative ring used at adapt-round-1 (33-byte compressed
+        // pubkey hex per element, ordered as the round-1 ceremony
+        // ordered them). Empty before the ceremony stores it. The
+        // Qt extract dialog auto-fills its ring field from this.
+        std::vector<std::string> pric_claim_ring_hex;
     };
 
     struct PricoinAdaptorSwapCreateParams {
