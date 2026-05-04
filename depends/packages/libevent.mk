@@ -12,13 +12,18 @@ $(package)_build_subdir=build
 # version as we do in releases. Due to quirks in libevents build system, this
 # is also required to enable support for ipv6. See #19375.
 define $(package)_set_vars
-  $(package)_config_opts=-DCMAKE_BUILD_TYPE=None -DEVENT__DISABLE_BENCHMARK=ON -DEVENT__DISABLE_OPENSSL=ON
+  # Pricoin: keep OPENSSL ENABLED so the chainwatch backend can talk to
+  # public Esplora endpoints (blockstream.info / litecoinspace.org are
+  # HTTPS-only). Static-link openssl from the depends openssl package.
+  $(package)_config_opts=-DCMAKE_BUILD_TYPE=None -DEVENT__DISABLE_BENCHMARK=ON
   $(package)_config_opts+=-DEVENT__DISABLE_SAMPLES=ON -DEVENT__DISABLE_REGRESS=ON
   $(package)_config_opts+=-DEVENT__DISABLE_TESTS=ON -DEVENT__LIBRARY_TYPE=STATIC
   $(package)_cflags += -fdebug-prefix-map=$($(package)_extract_dir)=/usr -fmacro-prefix-map=$($(package)_extract_dir)=/usr
   $(package)_cppflags += -D_GNU_SOURCE -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3
   $(package)_cppflags_mingw32=-D_WIN32_WINNT=0x0A00
 endef
+
+$(package)_dependencies = openssl
 
 define $(package)_preprocess_cmds
   patch -p1 < $($(package)_patch_dir)/cmake_fixups.patch && \

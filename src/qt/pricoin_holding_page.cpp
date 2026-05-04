@@ -14,6 +14,7 @@
 #include <QClipboard>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QFontMetrics>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -113,6 +114,15 @@ void PricoinHoldingPage::buildLayout()
         panel.address = new QLineEdit(box);
         panel.address->setReadOnly(true);
         panel.address->setPlaceholderText(tr("(loading…)"));
+        // Bech32 BTC/LTC addresses are up to ~62 chars (P2WSH = 62,
+        // P2TR/P2WPKH ≈ 42-62). Compute a minimum width from the
+        // current font so the full address is visible without
+        // horizontal scrolling.
+        {
+            QFontMetrics fm(panel.address->font());
+            const int char_w = fm.horizontalAdvance(QLatin1Char('M'));
+            panel.address->setMinimumWidth(char_w * 70);
+        }
         auto* addr_row = new QHBoxLayout();
         addr_row->addWidget(panel.address, /*stretch=*/1);
         panel.btn_copy = new QPushButton(tr("Copy"), box);

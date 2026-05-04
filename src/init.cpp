@@ -723,11 +723,14 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     // (HTTPS deferred). Self-host an Esplora instance, or run a local
     // HTTP-only relay in front of mempool.space / blockstream.info.
     argsman.AddArg("-btcwatchurl=<url>",
-        "Esplora-style HTTP base URL for the BTC chain (e.g. http://localhost:3002/api). "
-        "Used by atomic-swap RPCs. Plain HTTP only; HTTPS support deferred.",
+        "Esplora-style HTTP(S) base URL for the BTC chain. Default: "
+        "https://blockstream.info/api. Set to a self-hosted Esplora "
+        "(e.g. http://localhost:3002/api) for stronger privacy / no "
+        "third-party trust. Use the empty string to disable.",
         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-ltcwatchurl=<url>",
-        "Esplora-style HTTP base URL for the LTC chain.",
+        "Esplora-style HTTP(S) base URL for the LTC chain. Default: "
+        "https://litecoinspace.org/api. Empty string disables.",
         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-chainwatchurl=<chain>=<url>",
         "Generic chainwatch backend registration: -chainwatchurl=doge=http://... "
@@ -1529,7 +1532,17 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     // -ltcwatchurl / -chainwatchurl=<chain>=<url> args. Backends are
     // optional — atomic-swap RPCs that need a backend will fail-with-
     // helpful-message if none is registered for the requested chain.
+    //
+    // Defaults point at well-known public Esplora endpoints so the
+    // holding-wallet and orderbook flows work out of the box. Users
+    // who want stronger privacy / no third-party trust can override
+    // with a self-hosted Esplora; the empty string disables a chain.
     {
+        // Public-Esplora defaults. HTTPS — requires a build with
+        // libevent_openssl (auto-detected; see FindLibevent.cmake).
+        constexpr const char* kDefaultBtcWatchURL = "https://blockstream.info/api";
+        constexpr const char* kDefaultLtcWatchURL = "https://litecoinspace.org/api";
+
         auto register_url = [&](const std::string& chain, const std::string& url) {
             if (url.empty()) return true;
             try {
@@ -1544,10 +1557,10 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             }
             return true;
         };
-        if (!register_url("btc", args.GetArg("-btcwatchurl", ""))) {
+        if (!register_url("btc", args.GetArg("-btcwatchurl", kDefaultBtcWatchURL))) {
             return InitError(_("Failed to register -btcwatchurl backend (see debug.log)"));
         }
-        if (!register_url("ltc", args.GetArg("-ltcwatchurl", ""))) {
+        if (!register_url("ltc", args.GetArg("-ltcwatchurl", kDefaultLtcWatchURL))) {
             return InitError(_("Failed to register -ltcwatchurl backend"));
         }
         for (const auto& spec : args.GetArgs("-chainwatchurl")) {

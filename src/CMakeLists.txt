@@ -320,8 +320,14 @@ target_link_libraries(bitcoin_node
     $<TARGET_NAME_IF_EXISTS:libevent::core>
     $<TARGET_NAME_IF_EXISTS:libevent::extra>
     $<TARGET_NAME_IF_EXISTS:libevent::pthreads>
+    $<TARGET_NAME_IF_EXISTS:libevent::openssl>
+    $<TARGET_NAME_IF_EXISTS:OpenSSL::SSL>
+    $<TARGET_NAME_IF_EXISTS:OpenSSL::Crypto>
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
 )
+if(HAVE_LIBEVENT_OPENSSL)
+  target_compile_definitions(bitcoin_node PRIVATE HAVE_LIBEVENT_OPENSSL=1)
+endif()
 if(WITH_EMBEDDED_ASMAP)
   target_compile_definitions(bitcoin_node PRIVATE ENABLE_EMBEDDED_ASMAP=1)
   include(TargetDataSources)

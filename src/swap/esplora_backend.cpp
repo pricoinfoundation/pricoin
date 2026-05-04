@@ -14,6 +14,16 @@
 #include <event2/http.h>
 #include <event2/keyvalq_struct.h>
 
+#ifdef HAVE_LIBEVENT_OPENSSL
+#include <event2/bufferevent.h>
+#include <event2/bufferevent_ssl.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#endif
+
+#include <mutex>
+
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -71,23 +81,33 @@ std::string http_errorstring(int code)
     }
 }
 
-// Parse "http://host[:port][/prefix]" into (host, port, path_prefix).
-// Throws std::invalid_argument if the URL isn't http://.
+// Parse "http(s)://host[:port][/prefix]" into (scheme, host, port, path).
 struct ParsedURL {
+    bool        https{false};
     std::string host;
-    uint16_t port{80};
+    uint16_t    port{80};
     std::string path_prefix; // "" or "/api" etc.; empty or starts with '/'
 };
 
 ParsedURL ParseHttpURL(const std::string& url)
 {
-    static const std::string kPrefix = "http://";
-    if (url.compare(0, kPrefix.size(), kPrefix) != 0) {
-        throw std::invalid_argument("EsploraBackend URL must start with http:// — HTTPS support deferred");
-    }
-    std::string rest = url.substr(kPrefix.size());
-
+    static const std::string kHttp  = "http://";
+    static const std::string kHttps = "https://";
     ParsedURL out;
+    std::string rest;
+    if (url.compare(0, kHttps.size(), kHttps) == 0) {
+        out.https = true;
+        out.port  = 443;
+        rest = url.substr(kHttps.size());
+    } else if (url.compare(0, kHttp.size(), kHttp) == 0) {
+        out.https = false;
+        out.port  = 80;
+        rest = url.substr(kHttp.size());
+    } else {
+        throw std::invalid_argument(
+            "EsploraBackend URL must start with http:// or https://");
+    }
+
     auto slash = rest.find('/');
     std::string host_port;
     if (slash == std::string::npos) {
@@ -119,6 +139,39 @@ ParsedURL ParseHttpURL(const std::string& url)
     return out;
 }
 
+// ─────────────────────────────────────────────────────────────────
+// HTTPS support — process-wide SSL_CTX with the system's default CA
+// store loaded once. Each request creates a fresh SSL object + an
+// OpenSSL-backed libevent bufferevent. SNI + hostname verification
+// are enabled (libcrypto's X509_VERIFY_PARAM_set1_host).
+// Compiled in only when libevent was built with --enable-openssl.
+// ─────────────────────────────────────────────────────────────────
+
+#ifdef HAVE_LIBEVENT_OPENSSL
+SSL_CTX* GetSSLContext()
+{
+    static std::once_flag once;
+    static SSL_CTX* ctx{nullptr};
+    std::call_once(once, [] {
+        // OpenSSL 1.1+ initializes itself on first use; explicit
+        // SSL_library_init() / OpenSSL_add_ssl_algorithms() are no-ops
+        // there. We still call them defensively for older builds.
+        SSL_library_init();
+        SSL_load_error_strings();
+        OpenSSL_add_ssl_algorithms();
+        ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx) return;
+        // Refuse pre-TLS-1.2.
+        SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+        // Use the system's default CA bundle. SSL_CTX_set_default_verify_paths
+        // honors SSL_CERT_FILE / SSL_CERT_DIR env vars for testing.
+        SSL_CTX_set_default_verify_paths(ctx);
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+    });
+    return ctx;
+}
+#endif // HAVE_LIBEVENT_OPENSSL
+
 // One-shot HTTP request. Method is EVHTTP_REQ_GET / EVHTTP_REQ_POST.
 // `path` should start with '/' and be relative to the URL prefix
 // (the prefix is prepended internally).
@@ -131,11 +184,62 @@ HTTPReply DoRequest(
     const char* content_type = "text/plain")
 {
     raii_event_base base = obtain_event_base();
-    raii_evhttp_connection evcon = obtain_evhttp_connection_base(
-        base.get(), url.host, url.port);
-    if (!evcon) {
+
+    // HTTPS path: build an OpenSSL bufferevent and hand it to libevent's
+    // evhttp_connection_base_bufferevent_new. Plain HTTP path uses the
+    // existing evhttp_connection_base_new helper.
+    raii_evhttp_connection evcon{nullptr};
+    if (url.https) {
+#ifdef HAVE_LIBEVENT_OPENSSL
+        SSL_CTX* ctx = GetSSLContext();
+        if (!ctx) {
+            throw ChainBackendError("OpenSSL context init failed");
+        }
+        SSL* ssl = SSL_new(ctx);
+        if (!ssl) {
+            throw ChainBackendError("SSL_new failed");
+        }
+        // SNI — required by virtually every modern HTTPS host (incl.
+        // blockstream.info, mempool.space, litecoinspace.org).
+        SSL_set_tlsext_host_name(ssl, url.host.c_str());
+        // Hostname verification via libcrypto's X509_VERIFY_PARAM_set1_host.
+        if (auto* param = SSL_get0_param(ssl)) {
+            X509_VERIFY_PARAM_set_hostflags(param, 0);
+            X509_VERIFY_PARAM_set1_host(param, url.host.c_str(), url.host.size());
+        }
+        bufferevent* bev = bufferevent_openssl_socket_new(
+            base.get(), -1, ssl, BUFFEREVENT_SSL_CONNECTING,
+            BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+        if (!bev) {
+            SSL_free(ssl);
+            throw ChainBackendError("bufferevent_openssl_socket_new failed");
+        }
+        // Allow dirty shutdown — many servers don't send close_notify
+        // before TCP close, especially when Connection: close.
+        bufferevent_openssl_set_allow_dirty_shutdown(bev, 1);
+
+        evhttp_connection* raw = evhttp_connection_base_bufferevent_new(
+            base.get(), nullptr, bev, url.host.c_str(), url.port);
+        if (!raw) {
+            bufferevent_free(bev);
+            throw ChainBackendError(strprintf(
+                "evhttp_connection_base_bufferevent_new failed for %s:%u",
+                url.host, url.port));
+        }
+        evcon.reset(raw);
+#else
         throw ChainBackendError(
-            strprintf("evhttp_connection_base_new failed for %s:%u", url.host, url.port));
+            "HTTPS Esplora URLs require a build with libevent_openssl. "
+            "Rebuild with libevent_openssl-dev installed, or use a "
+            "plain-HTTP self-hosted Esplora.");
+#endif
+    } else {
+        evcon = obtain_evhttp_connection_base(base.get(), url.host, url.port);
+        if (!evcon) {
+            throw ChainBackendError(strprintf(
+                "evhttp_connection_base_new failed for %s:%u",
+                url.host, url.port));
+        }
     }
     evhttp_connection_set_timeout(evcon.get(),
         timeout_seconds > 0 ? timeout_seconds : 30);
@@ -170,7 +274,8 @@ HTTPReply DoRequest(
         const std::string err_str = (reply.error >= 0)
             ? http_errorstring(reply.error)
             : "no response";
-        throw ChainBackendError(strprintf("HTTP error talking to %s:%u%s — %s",
+        throw ChainBackendError(strprintf("%s error talking to %s:%u%s — %s",
+            url.https ? "HTTPS" : "HTTP",
             url.host, url.port, full_path, err_str));
     }
     return reply;

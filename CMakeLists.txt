@@ -30,7 +30,7 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 set(CLIENT_NAME "Pricoin")
 set(CLIENT_VERSION_MAJOR 0)
 set(CLIENT_VERSION_MINOR 1)
-set(CLIENT_VERSION_BUILD 21)
+set(CLIENT_VERSION_BUILD 22)
 set(CLIENT_VERSION_RC 0)
 set(CLIENT_VERSION_IS_RELEASE "false")
 set(COPYRIGHT_YEAR "2026")
@@ -430,6 +430,12 @@ add_boost_if_needed()
 
 if(BUILD_DAEMON OR BUILD_GUI OR BUILD_CLI OR BUILD_TESTS OR BUILD_BENCH OR BUILD_FUZZ_BINARY)
   find_package(Libevent 2.1.8 MODULE REQUIRED)
+  # OpenSSL is required iff libevent_openssl was found — used by
+  # Pricoin's chainwatch backend to talk to HTTPS Esplora endpoints.
+  # FindLibevent.cmake sets HAVE_LIBEVENT_OPENSSL when present.
+  if(HAVE_LIBEVENT_OPENSSL)
+    find_package(OpenSSL REQUIRED)
+  endif()
 endif()
 
 include(cmake/introspection.cmake)

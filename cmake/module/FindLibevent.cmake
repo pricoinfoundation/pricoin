@@ -55,6 +55,13 @@ if(Libevent_FOUND)
     REQUIRED COMPONENTS ${_libevent_components}
     NO_MODULE
   )
+  # Optional: libevent_openssl. When present, Pricoin's chainwatch
+  # backend can talk to HTTPS Esplora endpoints; otherwise HTTPS URLs
+  # fail with a helpful error at runtime.
+  find_package(Libevent ${Libevent_FIND_VERSION} QUIET
+    OPTIONAL_COMPONENTS openssl
+    NO_MODULE
+  )
   find_package_handle_standard_args(Libevent
     REQUIRED_VARS Libevent_DIR
     VERSION_VAR Libevent_VERSION
@@ -72,11 +79,28 @@ else()
       add_library(libevent::${component} ALIAS PkgConfig::libevent_${component})
     endif()
   endforeach()
+  # Optional: libevent_openssl (HTTPS Esplora support).
+  pkg_check_modules(libevent_openssl
+    QUIET
+    IMPORTED_TARGET GLOBAL
+    libevent_openssl>=${Libevent_FIND_VERSION}
+  )
+  if(TARGET PkgConfig::libevent_openssl AND NOT TARGET libevent::openssl)
+    add_library(libevent::openssl ALIAS PkgConfig::libevent_openssl)
+  endif()
   find_package_handle_standard_args(Libevent
     REQUIRED_VARS libevent_core_LIBRARY_DIRS
     VERSION_VAR libevent_core_VERSION
   )
   check_evhttp_connection_get_peer(PkgConfig::libevent_extra)
+endif()
+
+if(TARGET libevent::openssl)
+  set(HAVE_LIBEVENT_OPENSSL TRUE)
+  message(STATUS "libevent_openssl found — HTTPS Esplora support enabled")
+else()
+  set(HAVE_LIBEVENT_OPENSSL FALSE)
+  message(STATUS "libevent_openssl NOT found — HTTPS Esplora support disabled")
 endif()
 
 unset(_libevent_components)
