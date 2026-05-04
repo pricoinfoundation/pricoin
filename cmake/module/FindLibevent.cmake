@@ -86,7 +86,37 @@ else()
     libevent_openssl>=${Libevent_FIND_VERSION}
   )
   if(TARGET PkgConfig::libevent_openssl AND NOT TARGET libevent::openssl)
+    # On Homebrew/macOS the libevent_openssl .pc file frequently bakes
+    # in a Cellar path to a specific openssl@3 version; after a `brew
+    # upgrade` that path no longer exists and CMake's generate step
+    # fails on the imported target's INTERFACE_INCLUDE_DIRECTORIES.
+    # Filter to only existing dirs before aliasing. When the .pc file
+    # declares NO include dirs (typical on Linux where /usr/include is
+    # implicit), we leave the target untouched and trust the compiler's
+    # default search path.
+    get_target_property(_evopenssl_inc PkgConfig::libevent_openssl
+      INTERFACE_INCLUDE_DIRECTORIES)
+    if(_evopenssl_inc)
+      set(_evopenssl_inc_keep "")
+      set(_evopenssl_dropped FALSE)
+      foreach(_dir IN LISTS _evopenssl_inc)
+        if(EXISTS "${_dir}")
+          list(APPEND _evopenssl_inc_keep "${_dir}")
+        else()
+          set(_evopenssl_dropped TRUE)
+        endif()
+      endforeach()
+      if(_evopenssl_dropped)
+        message(STATUS "Stale include path in libevent_openssl.pc dropped (probably a moved Homebrew Cellar). "
+                       "Kept: ${_evopenssl_inc_keep}")
+        set_target_properties(PkgConfig::libevent_openssl PROPERTIES
+          INTERFACE_INCLUDE_DIRECTORIES "${_evopenssl_inc_keep}")
+      endif()
+      unset(_evopenssl_inc_keep)
+      unset(_evopenssl_dropped)
+    endif()
     add_library(libevent::openssl ALIAS PkgConfig::libevent_openssl)
+    unset(_evopenssl_inc)
   endif()
   find_package_handle_standard_args(Libevent
     REQUIRED_VARS libevent_core_LIBRARY_DIRS
