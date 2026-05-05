@@ -6,6 +6,7 @@
 #define BITCOIN_SWAP_CHAIN_BACKEND_H
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -116,6 +117,14 @@ public:
     // the txid the backend assigned (typically the same hash the
     // caller computed locally; we surface what the backend says).
     virtual std::string Broadcast(const std::string& tx_hex) = 0;
+
+    // Fee-rate estimates from the backend, in sat/vB, keyed by the
+    // confirmation target in blocks. Esplora's `/fee-estimates`
+    // returns roughly { "1": rate_for_next_block, "2": ..., "3": ...,
+    // "6": ..., "10": ..., "20": ..., "144": ... }. Callers pick a
+    // target appropriate for their use case (~6 blocks ≈ 1 hour for
+    // BTC). Returns an empty map if the backend can't provide them.
+    virtual std::map<int, double> GetFeeEstimates() = 0;
 };
 
 // Process-level registry of ChainBackends, keyed by Name(). Init

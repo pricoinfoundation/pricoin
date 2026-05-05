@@ -320,6 +320,11 @@ MockForeignChainClient::GetAddressBalance(const std::string& /*address*/)
     return {};
 }
 
+std::map<int, double> MockForeignChainClient::GetFeeEstimates()
+{
+    return {};  // mock has no fee state
+}
+
 std::string MockForeignChainClient::Broadcast(const std::string& tx_hex)
 {
     std::lock_guard<std::mutex> lk(m_mu);

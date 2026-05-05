@@ -5,16 +5,17 @@
 #include <qt/pricoin_match_dialog.h>
 
 #include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QPushButton>
-#include <QSpinBox>
 #include <QStandardItemModel>
 #include <QTableView>
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 namespace {
@@ -129,10 +130,18 @@ void PricoinMatchDialog::buildLayout()
     outer->addWidget(m_table, /*stretch=*/1);
 
     auto* amt_row = new QHBoxLayout();
-    amt_row->addWidget(new QLabel(tr("Actual PRIC fill (×10^-8 PRIC):"), this));
-    m_amount_spin = new QSpinBox(this);
-    m_amount_spin->setRange(0, std::numeric_limits<int>::max());
-    m_amount_spin->setSingleStep(100'000'000);
+    amt_row->addWidget(new QLabel(tr("Actual PRIC fill:"), this));
+    // Display in PRIC (8 decimals) instead of raw sats — keeps the
+    // value human-readable. Internal conversion ×1e8 = sats. Range
+    // covers the full int64 sat space (~92 billion PRIC); QDouble-
+    // SpinBox holds it as a double which is lossless to ~92 PRIC at
+    // 8-decimal precision (well above any realistic order size).
+    m_amount_spin = new QDoubleSpinBox(this);
+    m_amount_spin->setDecimals(8);
+    m_amount_spin->setRange(0.0, 1e10);
+    m_amount_spin->setSingleStep(1.0);
+    m_amount_spin->setSuffix(QStringLiteral(" PRIC"));
+    m_amount_spin->setAlignment(Qt::AlignRight);
     amt_row->addWidget(m_amount_spin);
     amt_row->addStretch();
     outer->addLayout(amt_row);
@@ -149,7 +158,11 @@ void PricoinMatchDialog::buildLayout()
         const int idx = selectedCandidateIndex();
         if (idx < 0) { reject(); return; }
         m_chosen_their_id = m_candidates[idx].their_order_id;
-        m_chosen_actual_pric_sat = m_amount_spin->value();
+        // Convert PRIC display to sats (×1e8) for storage. llround
+        // for the half-up conversion since QDoubleSpinBox stepping
+        // can leave tiny float drift.
+        m_chosen_actual_pric_sat = static_cast<int64_t>(
+            std::llround(m_amount_spin->value() * 100'000'000.0));
         accept();
     });
     connect(bb, &QDialogButtonBox::rejected, this, &QDialog::reject);
@@ -160,7 +173,7 @@ void PricoinMatchDialog::buildLayout()
                 this, &PricoinMatchDialog::onCandidateChanged);
     }
     connect(m_amount_spin,
-            QOverload<int>::of(&QSpinBox::valueChanged),
+            QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             this, &PricoinMatchDialog::onAmountChanged);
 }
 
@@ -179,27 +192,26 @@ void PricoinMatchDialog::onCandidateChanged()
 {
     const int idx = selectedCandidateIndex();
     if (idx < 0) {
-        m_amount_spin->setRange(0, 0);
-        m_amount_spin->setValue(0);
+        m_amount_spin->setRange(0.0, 0.0);
+        m_amount_spin->setValue(0.0);
         m_preview_label->setText({});
         m_ok_button->setEnabled(false);
         return;
     }
     const auto& c = m_candidates[idx];
-    // Cap at INT_MAX since QSpinBox range is int, not int64. PRIC sats
-    // can theoretically exceed int max but realistic order amounts
-    // won't (max int ≈ 2.1e9 sats = 21 PRIC; if needed, swap for a
-    // wider widget or use a QLineEdit with manual validation).
-    const int max_v = static_cast<int>(std::min<int64_t>(
-        c.max_actual_pric_sat,
-        static_cast<int64_t>(std::numeric_limits<int>::max())));
-    m_amount_spin->setRange(1, std::max(1, max_v));
-    m_amount_spin->setValue(max_v);  // default to maximum legal fill
+    // Convert sat-cap to PRIC for the display widget. doubles handle
+    // values up to 2^53 sats precisely, so no precision concern for
+    // any realistic order.
+    const double max_pric =
+        static_cast<double>(c.max_actual_pric_sat) / 100'000'000.0;
+    const double min_pric = 0.00000001;   // 1 sat
+    m_amount_spin->setRange(min_pric, std::max(min_pric, max_pric));
+    m_amount_spin->setValue(max_pric);    // default to maximum legal fill
     m_ok_button->setEnabled(true);
     updatePreview();
 }
 
-void PricoinMatchDialog::onAmountChanged(int)
+void PricoinMatchDialog::onAmountChanged(double)
 {
     updatePreview();
 }
@@ -209,7 +221,8 @@ void PricoinMatchDialog::updatePreview()
     const int idx = selectedCandidateIndex();
     if (idx < 0) { m_preview_label->setText({}); return; }
     const auto& c = m_candidates[idx];
-    const int64_t actual_pric = static_cast<int64_t>(m_amount_spin->value());
+    const int64_t actual_pric = static_cast<int64_t>(
+        std::llround(m_amount_spin->value() * 100'000'000.0));
 
     // Identify the maker (asker) — whichever side is sell_pric.
     // The maker's rate determines the trade.

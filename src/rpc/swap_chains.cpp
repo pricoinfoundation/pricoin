@@ -66,6 +66,34 @@ RPCMethod pricoin_chainwatch_list()
     };
 }
 
+RPCMethod pricoin_chainwatch_fee_estimates()
+{
+    return RPCMethod{
+        "pricoin_chainwatch_fee_estimates",
+        "Return the foreign chain backend's per-confirmation-target fee-rate\n"
+        "estimates, in sat/vB. Source format: Esplora's /fee-estimates\n"
+        "(strings keyed by target-blocks → number sat/vB). Returns an empty\n"
+        "object if the backend can't provide them — callers should fall\n"
+        "back to a hardcoded default.\n",
+        {{"chain", RPCArg::Type::STR, RPCArg::Optional::NO, "Symbolic chain name (btc, ltc, ...)"}},
+        RPCResult{
+            RPCResult::Type::OBJ_DYN, "", "",
+            {{RPCResult::Type::NUM, "TARGET_BLOCKS", "sat/vB rate for that target"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_chainwatch_fee_estimates", "btc")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            const std::string chain = request.params[0].get_str();
+            auto backend = RequireBackend(chain);
+            const auto est = backend->GetFeeEstimates();
+            UniValue out{UniValue::VOBJ};
+            for (const auto& [target, rate] : est) {
+                out.pushKV(strprintf("%d", target), rate);
+            }
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_chainwatch_height()
 {
     return RPCMethod{
@@ -228,6 +256,7 @@ void RegisterPricoinChainwatchRPCCommands(CRPCTable& t)
     static const CRPCCommand commands[]{
         {"pricoin", &pricoin_chainwatch_list},
         {"pricoin", &pricoin_chainwatch_height},
+        {"pricoin", &pricoin_chainwatch_fee_estimates},
         {"pricoin", &pricoin_chainwatch_get_tx},
         {"pricoin", &pricoin_chainwatch_address_txs},
         {"pricoin", &pricoin_chainwatch_broadcast},

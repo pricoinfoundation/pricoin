@@ -576,6 +576,43 @@ public:
         return out;
     }
 
+    std::map<int, double> GetFeeEstimates() override
+    {
+        // Esplora `/fee-estimates` returns an object like:
+        //   { "1": 18.0, "2": 15.5, "3": 12.0, "6": 8.0,
+        //     "10": 6.0, "20": 4.0, "144": 1.0, "1008": 1.0 }
+        // Keys are confirmation-target block counts (string), values
+        // are sat/vB rates. Mempool's fork of esplora returns the
+        // same shape. Returns an empty map on failure rather than
+        // throwing so callers can fall back to a hardcoded default.
+        try {
+            const std::string path = "/fee-estimates";
+            auto reply = DoRequest(m_url, m_opts.timeout_seconds, EVHTTP_REQ_GET, path);
+            if (reply.status < 200 || reply.status >= 300) return {};
+            UniValue v = ParseJSON(reply.body, path);
+            if (!v.isObject()) return {};
+            std::map<int, double> out;
+            for (const auto& key : v.getKeys()) {
+                try {
+                    const int target = std::stoi(key);
+                    const UniValue& num = v[key];
+                    double rate = 0.0;
+                    if      (num.isNum())     rate = num.get_real();
+                    else if (num.isStr())     rate = std::stod(num.get_str());
+                    else                       continue;
+                    if (rate > 0.0 && target > 0) {
+                        out[target] = rate;
+                    }
+                } catch (const std::exception&) {
+                    // Skip malformed entries; keep the rest.
+                }
+            }
+            return out;
+        } catch (const std::exception&) {
+            return {};
+        }
+    }
+
     std::string Broadcast(const std::string& tx_hex) override
     {
         if (tx_hex.empty() || tx_hex.size() % 2 != 0) {

@@ -7,8 +7,11 @@
 #include <interfaces/node.h>
 #include <qt/platformstyle.h>
 #include <qt/walletmodel.h>
+#include <tinyformat.h>
 
 #include <univalue.h>
+
+#include <cmath>
 
 #include <QApplication>
 #include <QClipboard>
@@ -268,6 +271,68 @@ void PricoinHoldingPage::doSweep(const QString& chain, const ChainPanel& panel)
 {
     if (!m_model) return;
 
+    // Pull a current sat/vB fee estimate + UTXO count from the chain
+    // backend so we can pre-populate the fee field with something
+    // reasonable instead of the old 1000-sat hardcode (which was
+    // wildly off in either direction depending on the fee market).
+    //
+    //   estimated_size_vb = N_inputs * input_size + 1 * output_size + overhead
+    //   estimated_fee_sat = ceil(size * sat_per_vb)
+    //
+    // Per-input sizes are vbyte counts for a key-path-spend of the
+    // holding wallet's address type (P2TR for BTC, P2WPKH for LTC).
+    int64_t suggested_fee = 1000;       // fallback if backend unreachable
+    QString fee_hint;
+    {
+        UniValue pe{UniValue::VARR};
+        pe.push_back(chain.toStdString());
+        std::string err_e;
+        auto e = CallWalletRpc(m_model, "pricoin_chainwatch_fee_estimates",
+                                pe, &err_e);
+        UniValue pb{UniValue::VARR};
+        pb.push_back(chain.toStdString());
+        std::string err_b;
+        auto b = CallWalletRpc(m_model, "pricoin_btc_getbalance", pb, &err_b);
+
+        const int input_vb  = (chain == "btc") ? 58 : 68;  // P2TR / P2WPKH
+        const int output_vb = (chain == "btc") ? 43 : 31;
+        const int overhead_vb = 11;
+        // Cover a wide range of realistic UTXO counts. If we can read
+        // the backend's count, use it; otherwise assume 3 inputs.
+        int n_inputs = 3;
+        if (b) {
+            const auto utxo_count = (*b)["utxo_count"];
+            if (utxo_count.isNum() && utxo_count.getInt<int>() > 0) {
+                n_inputs = utxo_count.getInt<int>();
+            }
+        }
+        const int est_size_vb = n_inputs * input_vb + output_vb + overhead_vb;
+
+        // Pick the 6-block target if available, else any nearby target.
+        double sat_per_vb = -1.0;
+        if (e && e->isObject()) {
+            for (int t : {6, 10, 3, 20, 144, 2, 1}) {
+                const auto v = (*e)[strprintf("%d", t)];
+                if (v.isNum() && v.get_real() > 0) {
+                    sat_per_vb = v.get_real();
+                    break;
+                }
+            }
+        }
+        if (sat_per_vb > 0.0) {
+            suggested_fee = static_cast<int64_t>(
+                std::ceil(static_cast<double>(est_size_vb) * sat_per_vb));
+            fee_hint = tr("Suggested: %1 sat/vB × ~%2 vB tx (%3 input%4) = %5 sats")
+                .arg(QString::number(sat_per_vb, 'f', 1))
+                .arg(est_size_vb)
+                .arg(n_inputs)
+                .arg(n_inputs == 1 ? QString() : QStringLiteral("s"))
+                .arg(suggested_fee);
+        } else {
+            fee_hint = tr("(fee-rate unavailable — using fallback default)");
+        }
+    }
+
     QDialog dlg(this);
     dlg.setWindowTitle(tr("Sweep %1 holding wallet").arg(chain.toUpper()));
     auto* form = new QFormLayout(&dlg);
@@ -281,8 +346,12 @@ void PricoinHoldingPage::doSweep(const QString& chain, const ChainPanel& panel)
         : tr("ltc1q… bech32 address"));
     form->addRow(tr("Destination:"), dest);
     auto* fee = new QLineEdit(&dlg);
-    fee->setText(QStringLiteral("1000"));
+    fee->setText(QString::number(suggested_fee));
     form->addRow(tr("Fee (sats):"), fee);
+    auto* fee_hint_label = new QLabel(fee_hint, &dlg);
+    fee_hint_label->setStyleSheet(QStringLiteral("QLabel { color: #555; }"));
+    fee_hint_label->setWordWrap(true);
+    form->addRow(QString(), fee_hint_label);
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     QObject::connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     QObject::connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);

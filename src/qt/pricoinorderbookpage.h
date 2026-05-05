@@ -71,6 +71,7 @@ private Q_SLOTS:
     void onRelaySettingsClicked();
     void onStartSwapClicked();
     void onNostrOfferReceived(const QString& uri);
+    void onNostrDmReceived(const QString& from_xonly_hex, const QString& plaintext);
     void onNostrLog(const QString& msg);
     void onNostrRelayStatus(const QString& url, bool connected);
     void onAutoRefreshTick();

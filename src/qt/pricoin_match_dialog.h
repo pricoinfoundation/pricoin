@@ -13,9 +13,9 @@
 #include <interfaces/wallet.h>
 
 QT_BEGIN_NAMESPACE
+class QDoubleSpinBox;
 class QLabel;
 class QPushButton;
-class QSpinBox;
 class QTableView;
 class QStandardItemModel;
 QT_END_NAMESPACE
@@ -49,7 +49,7 @@ public:
 
 private Q_SLOTS:
     void onCandidateChanged();
-    void onAmountChanged(int);
+    void onAmountChanged(double);
 
 private:
     interfaces::Wallet::PricoinOfferSnapshot m_mine;
@@ -59,7 +59,7 @@ private:
 
     QTableView* m_table{nullptr};
     QStandardItemModel* m_model{nullptr};
-    QSpinBox* m_amount_spin{nullptr};
+    QDoubleSpinBox* m_amount_spin{nullptr};
     QLabel* m_preview_label{nullptr};
     QPushButton* m_ok_button{nullptr};
 

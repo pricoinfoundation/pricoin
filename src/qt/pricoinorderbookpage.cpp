@@ -21,6 +21,9 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QInputDialog>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -531,6 +534,8 @@ void PricoinOrderbookPage::rebuildNostrClient()
     if (!m_nostr) return;
     connect(m_nostr, &PricoinNostrClient::offerReceived,
             this, &PricoinOrderbookPage::onNostrOfferReceived);
+    connect(m_nostr, &PricoinNostrClient::directMessageReceived,
+            this, &PricoinOrderbookPage::onNostrDmReceived);
     connect(m_nostr, &PricoinNostrClient::log,
             this, &PricoinOrderbookPage::onNostrLog);
     connect(m_nostr, &PricoinNostrClient::relayStatusChanged,
@@ -666,9 +671,16 @@ void PricoinOrderbookPage::onStartSwapClicked()
     form->addRow(tr("Joint stealth address:"), joint_row);
     QObject::connect(btn_joint_wizard, &QPushButton::clicked, &dlg,
         [this, &dlg, joint_edit, peer]() {
-        const QString peer_xonly = peer
-            ? QString::fromStdString(peer->maker_pubkey_hex.substr(2))
-            : QString{};
+        // maker_pubkey_hex is the peer's 33-byte compressed pubkey
+        // hex (66 chars: 02/03 parity prefix + 64-char x-only). Strip
+        // the parity byte for the joint-stealth dialog, which expects
+        // x-only. Defensive: an empty / malformed hex would crash
+        // substr(2) — fall back to empty xonly so the dialog opens
+        // and surfaces a clear error rather than killing the app.
+        QString peer_xonly;
+        if (peer && peer->maker_pubkey_hex.size() >= 66) {
+            peer_xonly = QString::fromStdString(peer->maker_pubkey_hex.substr(2));
+        }
         PricoinJointStealthDialog d(m_model, peer_xonly, &dlg);
         if (d.exec() == QDialog::Accepted && !d.chosenJointAddress().isEmpty()) {
             joint_edit->setText(d.chosenJointAddress());
@@ -901,11 +913,105 @@ void PricoinOrderbookPage::onFindMatchesClicked()
         return;
     }
     refreshTable();
-    setStatus(tr("Matched %1 PRIC against %2…")
+
+    // Notify counterparty via NIP-04 DM so their wallet mirrors the
+    // match (no manual step on their end). We assume two strangers
+    // with no other contact channel — the DM is the synchronization
+    // mechanism. Receive-side handler is onNostrDmReceived.
+    int dm_sent = 0;
+    if (m_nostr) {
+        const auto their = m_model->wallet().offerGet(their_id);
+        if (their && their->maker_pubkey_hex.size() >= 66) {
+            const QString peer_xonly = QString::fromStdString(
+                their->maker_pubkey_hex.substr(2));
+            QJsonObject msg;
+            msg.insert(QStringLiteral("type"),
+                QStringLiteral("pricoin:match/v1"));
+            // From the sender's view: "my" is the matcher's order,
+            // "their" is the maker's order. The receiver flips this.
+            msg.insert(QStringLiteral("my_order_id"),
+                QString::fromStdString(oid));
+            msg.insert(QStringLiteral("their_order_id"),
+                QString::fromStdString(their_id));
+            msg.insert(QStringLiteral("actual_pric_sat"),
+                static_cast<double>(actual_pric));
+            const QString plaintext = QString::fromUtf8(
+                QJsonDocument(msg).toJson(QJsonDocument::Compact));
+            if (m_nostr->publishDirectMessage(peer_xonly, plaintext)) {
+                dm_sent = 1;
+            }
+        }
+    }
+    setStatus(tr("Matched %1 PRIC against %2… %3")
         .arg(QString::asprintf("%lld.%08lld",
             static_cast<long long>(actual_pric / 100'000'000),
             static_cast<long long>(actual_pric % 100'000'000)))
-        .arg(QString::fromStdString(their_id).left(12)));
+        .arg(QString::fromStdString(their_id).left(12))
+        .arg(dm_sent ? tr("(notified counterparty)")
+                     : tr("(WARN: counterparty not notified — check relay connection)")));
+}
+
+void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
+                                              const QString& plaintext)
+{
+    // Match-notification handler. Counterparty side of onMatchClicked.
+    // Auth model: only accept a match-notification if the sender's
+    // xonly matches the maker pubkey of the order *they claim is theirs*
+    // (`my_order_id` from the DM, which is OUR `their_order_id`).
+    QJsonParseError pe;
+    auto doc = QJsonDocument::fromJson(plaintext.toUtf8(), &pe);
+    if (pe.error != QJsonParseError::NoError || !doc.isObject()) return;
+    const auto obj = doc.object();
+    if (obj.value(QStringLiteral("type")).toString() !=
+        QStringLiteral("pricoin:match/v1")) {
+        return;  // Some other DM; ignore.
+    }
+    // Sender's "my" = sender's order = our "their"; flip on receive.
+    const std::string sender_oid =
+        obj.value(QStringLiteral("my_order_id")).toString().toStdString();
+    const std::string my_oid =
+        obj.value(QStringLiteral("their_order_id")).toString().toStdString();
+    const int64_t actual_pric = static_cast<int64_t>(
+        obj.value(QStringLiteral("actual_pric_sat")).toDouble());
+    if (sender_oid.empty() || my_oid.empty() || actual_pric <= 0) return;
+
+    if (!m_model) return;
+
+    // Authorization: the sender's xonly must match maker_pubkey_hex
+    // of the sender's order (sender_oid). Otherwise anyone could
+    // forge a match-DM.
+    const auto sender_order = m_model->wallet().offerGet(sender_oid);
+    if (!sender_order) {
+        setStatus(tr("Match-DM from %1: their order %2 not in our orderbook")
+            .arg(from_xonly_hex.left(12) + "…")
+            .arg(QString::fromStdString(sender_oid).left(12)), true);
+        return;
+    }
+    if (sender_order->maker_pubkey_hex.size() >= 66) {
+        const QString claimed_xonly = QString::fromStdString(
+            sender_order->maker_pubkey_hex.substr(2));
+        if (claimed_xonly != from_xonly_hex) {
+            setStatus(tr("Match-DM rejected: sender %1 is not the maker of "
+                          "order %2")
+                .arg(from_xonly_hex.left(12) + "…")
+                .arg(QString::fromStdString(sender_oid).left(12)), true);
+            return;
+        }
+    }
+
+    auto r = m_model->wallet().offerMatch(my_oid, sender_oid, actual_pric);
+    if (!r) {
+        setStatus(tr("Match-DM from %1 — local apply failed: %2")
+            .arg(from_xonly_hex.left(12) + "…")
+            .arg(QString::fromStdString(util::ErrorString(r).original)), true);
+        return;
+    }
+    refreshTable();
+    setStatus(tr("Counterparty matched our order %1 — %2 PRIC.")
+        .arg(QString::fromStdString(my_oid).left(12) + "…")
+        .arg(QString::asprintf("%lld.%08lld",
+            static_cast<long long>(actual_pric / 100'000'000),
+            static_cast<long long>(actual_pric % 100'000'000))));
 }
 
 void PricoinOrderbookPage::onFillClicked()

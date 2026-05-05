@@ -1654,6 +1654,10 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                         throw std::runtime_error(e.what());
                     }
                 }
+                std::map<int, double> GetFeeEstimates() override {
+                    try { return m_backend->GetFeeEstimates(); }
+                    catch (const ::pricoin::swap::ChainBackendError&) { return {}; }
+                }
             private:
                 std::shared_ptr<::pricoin::swap::ChainBackend> m_backend;
             };

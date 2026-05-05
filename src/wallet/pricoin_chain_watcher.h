@@ -151,6 +151,12 @@ public:
         int     utxo_count{0};
     };
     virtual Balance GetAddressBalance(const std::string& address) = 0;
+
+    // Backend's per-confirmation-target fee-rate estimates, in sat/vB.
+    // Empty map if the backend can't provide them; callers fall back
+    // to a hardcoded default in that case. See Esplora's
+    // `/fee-estimates` for the source format.
+    virtual std::map<int, double> GetFeeEstimates() = 0;
 };
 
 // Pluggable factory for resolving a foreign-chain client by chain
@@ -179,6 +185,7 @@ public:
     std::string Broadcast(const std::string& tx_hex) override;
     std::vector<Utxo>    GetAddressUtxos(const std::string& address) override;
     Balance              GetAddressBalance(const std::string& address) override;
+    std::map<int, double> GetFeeEstimates() override;
 
     // Test config — protected by an internal mutex.
     void SetTipHeight(std::optional<int> h);
