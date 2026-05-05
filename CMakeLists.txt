@@ -30,7 +30,7 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 set(CLIENT_NAME "Pricoin")
 set(CLIENT_VERSION_MAJOR 0)
 set(CLIENT_VERSION_MINOR 1)
-set(CLIENT_VERSION_BUILD 25)
+set(CLIENT_VERSION_BUILD 26)
 set(CLIENT_VERSION_RC 0)
 set(CLIENT_VERSION_IS_RELEASE "false")
 set(COPYRIGHT_YEAR "2026")
@@ -54,7 +54,7 @@ set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES
 project(Pricoin
   VERSION ${CLIENT_VERSION_MAJOR}.${CLIENT_VERSION_MINOR}.${CLIENT_VERSION_BUILD}
   DESCRIPTION "Pricoin: a privacy-by-default cryptocurrency (experimental fork of Bitcoin Core)"
-  HOMEPAGE_URL "https://pricoin.org/"
+  HOMEPAGE_URL "https://pricoin.io/"
   LANGUAGES NONE
 )
 

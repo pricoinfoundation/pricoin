@@ -48,7 +48,7 @@ static const int TOOLTIP_WRAP_THRESHOLD = 80;
 #define SPINNER_FRAMES 36
 
 #define QAPP_ORG_NAME "Pricoin"
-#define QAPP_ORG_DOMAIN "pricoin.org"
+#define QAPP_ORG_DOMAIN "pricoin.io"
 #define QAPP_APP_NAME_DEFAULT "Pricoin-Qt"
 #define QAPP_APP_NAME_TESTNET "Pricoin-Qt-testnet"
 #define QAPP_APP_NAME_TESTNET4 "Pricoin-Qt-testnet4"

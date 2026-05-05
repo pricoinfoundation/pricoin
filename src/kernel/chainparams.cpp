@@ -213,10 +213,10 @@ public:
         // Pricoin mainnet DNS seeds. Each entry should resolve to an A/AAAA
         // record of a long-running node accepting incoming connections on
         // nDefaultPort (9543).
-        vSeeds.emplace_back("peer1.pricoin.net.");
-        vSeeds.emplace_back("peer2.pricoin.net.");
-        vSeeds.emplace_back("peer3.pricoin.net.");
-        vSeeds.emplace_back("peer4.pricoin.net.");
+        vSeeds.emplace_back("peer1.pricoin.io.");
+        vSeeds.emplace_back("peer2.pricoin.io.");
+        vSeeds.emplace_back("peer3.pricoin.io.");
+        vSeeds.emplace_back("peer4.pricoin.io.");
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,0);
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,5);

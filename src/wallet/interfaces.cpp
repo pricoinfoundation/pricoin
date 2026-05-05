@@ -4,9 +4,14 @@
 
 #include <interfaces/wallet.h>
 
+#include <secp256k1.h>
+#include <secp256k1_extrakeys.h>
+#include <secp256k1_schnorrsig.h>
+
 #include <algorithm>
 #include <common/args.h>
 #include <crypto/hmac_sha256.h>
+#include <key.h>     // for GetSigningContext()
 #include <consensus/amount.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
@@ -730,18 +735,33 @@ public:
     }
 
     util::Result<std::string> signNostrEvent(const uint256& event_id_hash) override {
+        // Raw BIP340 sign — NOT BIP341 taproot-tweaked. Nostr relays
+        // verify with `schnorr_verify(id, sig, event.pubkey)` where
+        // event.pubkey is the wallet's untweaked x-only swap-identity
+        // pubkey. CKey::SignSchnorr unconditionally applies the taproot
+        // tweak (key + H_TapTweak(P)) before signing, so the resulting
+        // sig only verifies under the *tweaked* key — which we don't
+        // publish. Result was every relay rejecting events with
+        // "signature/id mismatch". Use libsecp256k1's raw schnorrsig
+        // API directly to avoid the tweak.
         CKey priv;
         if (!deriveSwapIdentityPriv(priv)) {
             return util::Error{Untranslated("swap-identity priv unavailable (wallet locked?)")};
         }
+        const secp256k1_context* ctx = GetSigningContext();
+        secp256k1_keypair kp;
+        if (!secp256k1_keypair_create(ctx, &kp, UCharCast(priv.begin()))) {
+            return util::Error{Untranslated("keypair_create failed")};
+        }
         std::vector<unsigned char> sig(64);
         uint256 aux;
         GetStrongRandBytes(aux);
-        if (!priv.SignSchnorr(event_id_hash,
-                              std::span<unsigned char>{sig.data(), sig.size()},
-                              /*merkle_root=*/nullptr,
-                              aux)) {
-            return util::Error{Untranslated("BIP340 sign failed")};
+        const int rc = secp256k1_schnorrsig_sign32(
+            ctx, sig.data(), event_id_hash.begin(), &kp, aux.begin());
+        secp256k1_keypair k_zero{};
+        std::memcpy(&kp, &k_zero, sizeof(kp));   // wipe
+        if (rc != 1) {
+            return util::Error{Untranslated("schnorrsig_sign32 failed")};
         }
         return HexStr(sig);
     }
