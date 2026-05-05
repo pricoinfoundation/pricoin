@@ -30,10 +30,19 @@ bool ValidRelayUrl(const QString& s)
 
 QStringList PricoinRelaySettingsDialog::defaultRelays()
 {
+    // Pricoin-operated cross-streamed relay mesh. Each instance runs
+    // strfry behind Caddy TLS and bidirectionally syncs to the other
+    // three via `strfry stream --dir both`, so events ingested at
+    // any one are visible at all four. Generic public relays remain
+    // available as opt-in via Relay settings — but using only the
+    // Pricoin mesh by default keeps the orderbook focused on
+    // Pricoin traffic and avoids spam-filter rejections from
+    // general-purpose relays that don't expect kind=30030.
     return {
-        QStringLiteral("wss://relay.damus.io"),
-        QStringLiteral("wss://nos.lol"),
-        QStringLiteral("wss://relay.snort.social"),
+        QStringLiteral("wss://relay1.pricoin.io"),
+        QStringLiteral("wss://relay2.pricoin.io"),
+        QStringLiteral("wss://relay3.pricoin.io"),
+        QStringLiteral("wss://relay4.pricoin.io"),
     };
 }
 

@@ -1,0 +1,35 @@
+[Unit]
+Description=Pricoin Nostr relay (strfry)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pricoin-relay
+Group=pricoin-relay
+ExecStart=/usr/local/bin/strfry --config /etc/pricoin-relay/strfry.conf relay
+Restart=on-failure
+RestartSec=5
+
+# Resource limits.
+LimitNOFILE=1048576
+
+# Sandboxing.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/pricoin-relay /var/log/pricoin-relay
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,43 @@
+[Unit]
+Description=Pricoin relay cross-stream → %i
+After=pricoin-relay.service network-online.target
+Wants=pricoin-relay.service network-online.target
+PartOf=pricoin-relay.service
+
+[Service]
+Type=simple
+User=pricoin-relay
+Group=pricoin-relay
+# %i is the systemd instance specifier — encode the peer hostname
+# into the unit name so each stream is independently
+# start/stop/restartable. e.g.
+#   systemctl enable --now pricoin-relay-stream@relay2.pricoin.io.service
+#
+# `--dir both` mirrors events in both directions; with full mesh
+# of 4 nodes each running 3 of these (one per peer), every event
+# ingested anywhere lands on every relay in the mesh within a
+# few hundred ms.
+ExecStart=/usr/local/bin/strfry --config /etc/pricoin-relay/strfry.conf \
+    stream wss://%i --dir both
+Restart=always
+RestartSec=10
+
+# Sandboxing.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/pricoin-relay
+
+[Install]
+WantedBy=multi-user.target
