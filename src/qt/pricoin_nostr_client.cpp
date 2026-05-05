@@ -268,6 +268,14 @@ bool PricoinNostrClient::publishOfferUri(const QString& uri,
     const uint256 id = Sha256(canon);
     const QString id_hex = QString::fromStdString(id.GetHex());
 
+    // TEMP: surface the canonical bytes + computed id so we can
+    // diff against the reference NIP-01 canonical when relays reject
+    // with "bad event id". Remove once we've nailed down the bug.
+    Q_EMIT log(QStringLiteral("[debug] canon_len=%1 id=%2…")
+        .arg(canon.size()).arg(id_hex.left(16)));
+    Q_EMIT log(QStringLiteral("[debug] canon=%1")
+        .arg(QString::fromUtf8(canon)));
+
     auto sig_or = m_model->wallet().signNostrEvent(id);
     if (!sig_or) {
         Q_EMIT log(tr("Cannot sign Nostr event: %1")

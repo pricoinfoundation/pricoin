@@ -16,7 +16,15 @@
 
 namespace {
 
-constexpr const char* kSettingsKey = "pricoin/orderbook/nostr_relays";
+// Bumped from "pricoin/orderbook/nostr_relays" (v1) to v2 when the
+// default mesh switched from the public Damus/snort/nos.lol set to
+// Pricoin's own cross-streamed strfry mesh (relay1..4.pricoin.io).
+// On first launch of the new build, loadFromSettings() sees no v2
+// key and falls through to the new defaults — replacing any cached
+// v1 list. Manual customizations from v1 are NOT preserved (rare;
+// user can re-add via Relay settings).
+constexpr const char* kSettingsKey   = "pricoin/orderbook/nostr_relays_v2";
+constexpr const char* kSettingsKeyV1 = "pricoin/orderbook/nostr_relays";
 
 bool ValidRelayUrl(const QString& s)
 {
@@ -49,7 +57,12 @@ QStringList PricoinRelaySettingsDialog::defaultRelays()
 QStringList PricoinRelaySettingsDialog::loadFromSettings()
 {
     QSettings s;
-    if (!s.contains(kSettingsKey)) return defaultRelays();
+    // First-time-on-v2: stale v1 key is irrelevant — start from
+    // the new defaults and clear v1 so it doesn't accumulate.
+    if (!s.contains(kSettingsKey)) {
+        s.remove(kSettingsKeyV1);
+        return defaultRelays();
+    }
     const QStringList stored = s.value(kSettingsKey).toStringList();
     if (stored.isEmpty()) return defaultRelays();
     return stored;
@@ -59,6 +72,9 @@ void PricoinRelaySettingsDialog::saveToSettings(const QStringList& urls)
 {
     QSettings s;
     s.setValue(kSettingsKey, urls);
+    // Keep v1 cleared so we don't re-read it on a subsequent
+    // downgrade.
+    s.remove(kSettingsKeyV1);
 }
 
 PricoinRelaySettingsDialog::PricoinRelaySettingsDialog(QWidget* parent)
