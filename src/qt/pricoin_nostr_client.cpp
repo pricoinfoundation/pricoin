@@ -449,6 +449,8 @@ void PricoinNostrClient::onTextMessage(const QString& message)
             static_cast<qint64>(ev.value("created_at").toDouble());
 
         if (m_seen_event_ids.contains(id_hex)) return;
+        Q_EMIT log(tr("Received kind=%1 event %2 from %3…")
+            .arg(kind).arg(id_hex.left(12) + "…").arg(pubkey_hex.left(12)));
 
         // Reconstruct canonical serialization.
         QList<QStringList> tags;
@@ -490,9 +492,23 @@ void PricoinNostrClient::onTextMessage(const QString& message)
             }
             Q_EMIT directMessageReceived(pubkey_hex, *pt_or);
         }
-    } else if (tag == QStringLiteral("EOSE") || tag == QStringLiteral("OK") ||
-               tag == QStringLiteral("NOTICE") || tag == QStringLiteral("CLOSED") ||
+    } else if (tag == QStringLiteral("OK")) {
+        // ["OK", <event_id>, <accepted_bool>, <message>]  (NIP-20).
+        // Surface so users can see whether their published events
+        // were accepted or rejected by each relay.
+        const QString eid = arr.size() > 1 ? arr[1].toString() : QString{};
+        const bool accepted = arr.size() > 2 && arr[2].toBool();
+        const QString why  = arr.size() > 3 ? arr[3].toString() : QString{};
+        Q_EMIT log(tr("Relay OK: event %1 %2%3")
+            .arg(eid.left(12) + "…")
+            .arg(accepted ? tr("accepted") : tr("rejected"))
+            .arg(why.isEmpty() ? QString{} : QStringLiteral(" — ") + why));
+    } else if (tag == QStringLiteral("NOTICE")) {
+        const QString notice = arr.size() > 1 ? arr[1].toString() : QString{};
+        Q_EMIT log(tr("Relay NOTICE: %1").arg(notice));
+    } else if (tag == QStringLiteral("EOSE") ||
+               tag == QStringLiteral("CLOSED") ||
                tag == QStringLiteral("AUTH")) {
-        // Silently ignore non-EVENT control frames for v0.
+        // Silently ignore EOSE / CLOSED / AUTH for v0.
     }
 }
