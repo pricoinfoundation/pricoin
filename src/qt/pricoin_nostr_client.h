@@ -81,7 +81,16 @@ public:
     // The wallet derives the AES key via ECDH(my_swap_priv,
     // peer_xonly→even-y), encrypts `plaintext` with AES-256-CBC +
     // random IV, and packages it as a kind-4 event with a `["p",
-    // peer]` tag. Returns true if at least one relay was sent to.
+    // peer]` tag.
+    //
+    // If `plaintext` parses as a JSON object and doesn't already
+    // contain a `dm_id` field, a fresh random 16-byte hex is
+    // injected. The `dmSent` signal then carries that id; the peer
+    // will emit `dmAcked(dm_id, ...)` once its wallet processes the
+    // message — giving the caller positive proof of receipt instead
+    // of the ambiguous "delivered to relays" they have today.
+    //
+    // Returns true if at least one relay was sent to.
     bool publishDirectMessage(const QString& peer_xonly_hex,
                                const QString& plaintext);
 
@@ -116,8 +125,24 @@ Q_SIGNALS:
     // Fired for each VALIDATED inbound NIP-04 DM. `from_xonly_hex`
     // is the sender's xonly pubkey (32-byte hex). `plaintext` is
     // the decrypted content.
+    //
+    // ACKs (`{"type":"pricoin:ack/v1"}`) DO NOT fire this signal —
+    // they fire `dmAcked` instead. Callers who want a per-DM
+    // delivered-confirmation should track the `dm_id` returned by
+    // `dmSent` and listen for the matching `dmAcked`.
     void directMessageReceived(const QString& from_xonly_hex,
                                  const QString& plaintext);
+    // Fired immediately after publishDirectMessage delivers to at
+    // least one relay. `dm_id` is the id we injected (or empty if
+    // the plaintext wasn't structured-JSON). UI can stash this and
+    // wait for the matching `dmAcked` to flip from "Awaiting…" to
+    // "Received by counterparty".
+    void dmSent(const QString& dm_id,
+                  const QString& peer_xonly_hex);
+    // Fired when the counterparty's wallet ACK'd a DM we sent.
+    // The dm_id matches the one from a prior `dmSent`.
+    void dmAcked(const QString& dm_id,
+                   const QString& peer_xonly_hex);
     // Status delta — true=connected, false=disconnected.
     void relayStatusChanged(const QString& relay_url, bool connected);
     // Diagnostic stream (relay errors, parse failures, etc.).

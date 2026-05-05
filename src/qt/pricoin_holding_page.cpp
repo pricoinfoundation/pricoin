@@ -99,6 +99,38 @@ void PricoinHoldingPage::buildLayout()
 {
     auto* outer = new QVBoxLayout(this);
 
+    // Header: explain what these wallets are and the user's role.
+    // The biggest source of confusion in the UI is "is my BTC/LTC
+    // safe in here, or is this a custodial wallet?". The header
+    // makes the answer concrete.
+    auto* header = new QLabel(this);
+    header->setWordWrap(true);
+    header->setTextFormat(Qt::RichText);
+    header->setText(tr(
+        "<p><b>BTC and LTC holding wallets — for atomic swaps only.</b></p>"
+        "<p>These are simplified wallets that hold the small amounts "
+        "of BTC / LTC you need to fund cross-chain swaps. <b>You are "
+        "in full control of these funds at all times</b> — the keys "
+        "are derived from your stealth seed (the same seed that "
+        "controls your PRIC wallet), so anyone who can restore your "
+        "Pricoin wallet can also recover this BTC and LTC.</p>"
+        "<p>What they support:</p>"
+        "<ul>"
+        "<li><b>Receive</b> — deposit BTC / LTC at the address shown "
+        "below; balance auto-refreshes every 15 seconds.</li>"
+        "<li><b>Sweep</b> — send all funds out to any address. The "
+        "fee defaults to a live network estimate.</li>"
+        "<li><b>Atomic-swap funding</b> — when an order matches, the "
+        "wallet uses these funds (plus the swap protocol's "
+        "MuSig2/HTLC scripts) to lock the foreign-chain leg.</li>"
+        "</ul>"
+        "<p>What they do NOT support: address book, fee estimation "
+        "for arbitrary spends, multi-recipient sends, lightning, or "
+        "anything beyond the swap-funding flow. For a full BTC / LTC "
+        "wallet experience, run a separate dedicated wallet and "
+        "sweep into here only the amount you intend to swap.</p>"));
+    outer->addWidget(header);
+
     // Top row: status + refresh.
     auto* top = new QHBoxLayout();
     m_btn_refresh = new QPushButton(tr("Refresh now"), this);

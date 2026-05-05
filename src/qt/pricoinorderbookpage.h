@@ -5,6 +5,8 @@
 #ifndef BITCOIN_QT_PRICOINORDERBOOKPAGE_H
 #define BITCOIN_QT_PRICOINORDERBOOKPAGE_H
 
+#include <QHash>
+#include <QString>
 #include <QWidget>
 
 #include <vector>
@@ -72,6 +74,8 @@ private Q_SLOTS:
     void onStartSwapClicked();
     void onNostrOfferReceived(const QString& uri);
     void onNostrDmReceived(const QString& from_xonly_hex, const QString& plaintext);
+    void onNostrDmSent(const QString& dm_id, const QString& peer_xonly_hex);
+    void onNostrDmAcked(const QString& dm_id, const QString& peer_xonly_hex);
     void onNostrLog(const QString& msg);
     void onNostrRelayStatus(const QString& url, bool connected);
     void onAutoRefreshTick();
@@ -102,6 +106,16 @@ private:
     QLabel*      m_status_label{nullptr};
     QLabel*      m_relay_status_label{nullptr};
     QTimer*      m_auto_refresh_timer{nullptr};
+
+    // Pending DM tracking — maps dm_id → human description ("Match
+    // notification for order X…"). Populated on dmSent, cleared on
+    // dmAcked. Used to surface "Awaiting receipt…" / "Counterparty
+    // received" status updates.
+    QHash<QString, QString> m_pending_dms;
+    // Label for the NEXT publishDirectMessage call. Set just before
+    // the publish; consumed by onNostrDmSent (which fires
+    // synchronously via Qt::AutoConnection on the same thread).
+    QString                 m_next_dm_label;
 
     PricoinNostrClient* m_nostr{nullptr};
     int                 m_connected_relay_count{0};

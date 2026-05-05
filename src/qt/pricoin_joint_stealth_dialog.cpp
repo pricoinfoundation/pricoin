@@ -19,6 +19,7 @@
 #include <QLineEdit>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
 
@@ -44,6 +45,32 @@ PricoinJointStealthDialog::PricoinJointStealthDialog(
     }
     if (m_btn_send_dm) {
         m_btn_send_dm->setEnabled(m_nostr && !m_peer_xonly.isEmpty());
+    }
+
+    // Auto-fire the full handshake: send our envelope as soon as we
+    // can after construction (deferred a tick so the connect()'s and
+    // populateMyEnvelope() above have settled), and retry every 5s
+    // while we're still waiting on the peer. The retry covers the
+    // race where this side opens the dialog before the peer does —
+    // their first opportunity to receive our envelope is when their
+    // own dialog instance attaches its directMessageReceived slot.
+    if (m_nostr && !m_peer_xonly.isEmpty()) {
+        QTimer::singleShot(100, this, [this]() { onSendDM(); });
+        m_resend_timer = new QTimer(this);
+        m_resend_timer->setInterval(5000);
+        connect(m_resend_timer, &QTimer::timeout, this, [this]() {
+            // Stop resending once the peer's envelope has landed
+            // (onDMReceived populates m_peer_envelope and stops the
+            // timer there). If the user has manually pasted, also
+            // stop.
+            if (!m_peer_envelope ||
+                !m_peer_envelope->toPlainText().trimmed().isEmpty()) {
+                m_resend_timer->stop();
+                return;
+            }
+            onSendDM();
+        });
+        m_resend_timer->start();
     }
 }
 
@@ -240,6 +267,28 @@ void PricoinJointStealthDialog::onDMReceived(const QString& from_xonly_hex,
     UniValue env;
     if (!env.read(plaintext.toStdString()) || !env.isObject()) return;
     if (!env.exists("type") || env["type"].get_str() != "joint_stealth_keys") return;
+
+    // Already have it? (idempotent — peer might re-send via their
+    // resend timer.)
+    if (m_peer_envelope &&
+        !m_peer_envelope->toPlainText().trimmed().isEmpty()) {
+        return;
+    }
     m_peer_envelope->setPlainText(plaintext);
-    setStatus(tr("Peer envelope auto-pasted from DM. Click Build."));
+    setStatus(tr("Peer envelope received. Building joint stealth address…"));
+    if (m_resend_timer) m_resend_timer->stop();
+
+    // Echo our envelope back once more in case the peer's dialog
+    // wasn't open when we initially sent — this is their last
+    // chance to receive our envelope before we close.
+    onSendDM();
+
+    // Auto-fire Build → Use, with a small visual delay so the user
+    // can see the dialog progress instead of it flashing past.
+    QTimer::singleShot(300, this, [this]() {
+        onBuildClicked();
+        if (!m_joint_address->text().trimmed().isEmpty()) {
+            QTimer::singleShot(400, this, [this]() { onUseClicked(); });
+        }
+    });
 }

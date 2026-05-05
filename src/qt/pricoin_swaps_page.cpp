@@ -20,6 +20,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFont>
+#include <QFontMetrics>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -175,13 +176,13 @@ void PricoinSwapsPage::buildLayout()
     m_btn_sw_add    = new QPushButton(tr("Add watch…"),    sw_box);
     m_btn_sw_remove = new QPushButton(tr("Remove watch"),  sw_box);
     m_btn_adapt_btc_claim = new QPushButton(
-        tr("Adapt + broadcast foreign claim… (Alice)"), sw_box);
+        tr("Adapt + broadcast foreign claim… (PRIC seller)"), sw_box);
     m_btn_adapt_pric_claim = new QPushButton(
-        tr("Adapt + broadcast PRIC claim… (Bob)"), sw_box);
+        tr("Adapt + broadcast PRIC claim… (PRIC buyer)"), sw_box);
     m_btn_ltc_refund = new QPushButton(
-        tr("LTC refund… (Bob)"), sw_box);
+        tr("LTC refund… (PRIC buyer)"), sw_box);
     m_btn_extract_t = new QPushButton(
-        tr("Extract t… (Alice)"), sw_box);
+        tr("Extract t… (PRIC seller)"), sw_box);
     sw_bot->addWidget(m_btn_sw_add);
     sw_bot->addWidget(m_btn_sw_remove);
     sw_bot->addWidget(m_btn_adapt_btc_claim);
@@ -269,8 +270,12 @@ void PricoinSwapsPage::refreshTable()
         f.setBold(true);
         state_item->setFont(f);
         m_table_model->setItem(static_cast<int>(i), col++, state_item);
+        // Show full pubkey + joint stealth address — operators verify
+        // these visually against the counterparty (DM exchange, etc.)
+        // and truncating with "…" defeats that. The table is set up
+        // with horizontal scroll so wide rows are usable.
         m_table_model->setItem(static_cast<int>(i), col++,
-            new QStandardItem(QString::fromStdString(s.counterparty_pubkey_hex).left(16) + "…"));
+            new QStandardItem(QString::fromStdString(s.counterparty_pubkey_hex)));
         m_table_model->setItem(static_cast<int>(i), col++,
             new QStandardItem(QString::fromStdString(s.foreign_chain)));
         m_table_model->setItem(static_cast<int>(i), col++,
@@ -278,11 +283,15 @@ void PricoinSwapsPage::refreshTable()
         m_table_model->setItem(static_cast<int>(i), col++,
             new QStandardItem(FormatSat(s.pric_amount_sat)));
         m_table_model->setItem(static_cast<int>(i), col++,
-            new QStandardItem(QString::fromStdString(s.pric_joint_stealth_address).left(20) + "…"));
+            new QStandardItem(QString::fromStdString(s.pric_joint_stealth_address)));
         m_table_model->setItem(static_cast<int>(i), col++,
             new QStandardItem(QString::number(s.updated_time)));
     }
     m_table->resizeColumnsToContents();
+    // Allow per-pixel horizontal scrolling for the wide address
+    // columns; without this the table only scrolls one column at a
+    // time and feels jittery.
+    m_table->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
     onSelectionChanged();
 }
 
@@ -426,9 +435,10 @@ void PricoinSwapsPage::onAdvanceClicked()
         auto* T_H = AddTextRow(form, tr("T_H (33-byte compressed hex):"), &dlg);
         auto* dleq = AddBlobRow(form, tr("DLEQ proof blob (hex):"), &dlg, 80);
         auto* t_secret_label = new QLabel(snap.role == "bob"
-            ? tr("(Bob — required)") : tr("(Alice — leave empty)"), &dlg);
+            ? tr("(PRIC buyer — required)")
+            : tr("(PRIC seller — leave empty)"), &dlg);
         auto* t_secret = new QLineEdit(&dlg);
-        t_secret->setPlaceholderText(tr("32-byte hex if Bob, empty if Alice"));
+        t_secret->setPlaceholderText(tr("32-byte hex (PRIC buyer), empty (PRIC seller)"));
         form->addRow(tr("t_secret:"), t_secret);
         form->addRow(QString(), t_secret_label);
 
@@ -617,8 +627,8 @@ void PricoinSwapsPage::onAdvanceClicked()
         dlg.setWindowTitle(tr("Set pre-signatures"));
         form->addRow(new QLabel(is_ltc
             ? tr("LTC swap: only PRIC pre-signatures are required. The LTC HTLC "
-                 "is unilaterally claimable (Alice with t) and refundable (Bob "
-                 "after timelock) — no cooperative MuSig2 step.")
+                 "is unilaterally claimable (PRIC seller with t) and refundable "
+                 "(PRIC buyer after timelock) — no cooperative MuSig2 step.")
             : tr("Paste the 4 cooperative pre-signatures "
                  "(spec §6.2 step 5+6+7) as hex blobs."),
             &dlg));
@@ -715,7 +725,7 @@ void PricoinSwapsPage::onAdvanceClicked()
     // ─── PreSigned → PricClaimed ───
     if (snap.state == "pre_signed") {
         dlg.setWindowTitle(tr("Set PRIC claimed"));
-        form->addRow(new QLabel(tr("Bob's PRIC claim tx is on-chain — t is now "
+        form->addRow(new QLabel(tr("PRIC buyer's claim tx is on-chain — t is now "
                                     "extractable. Record the claim txid."), &dlg));
         auto* txid = AddTextRow(form, tr("PRIC claim txid:"), &dlg);
         AddOkCancel(form, &dlg);
@@ -732,7 +742,7 @@ void PricoinSwapsPage::onAdvanceClicked()
     // ─── PricClaimed → Complete ───
     if (snap.state == "pric_claimed") {
         dlg.setWindowTitle(tr("Set complete"));
-        form->addRow(new QLabel(tr("Alice's foreign claim tx confirmed; swap done."), &dlg));
+        form->addRow(new QLabel(tr("PRIC seller's foreign claim tx confirmed; swap done."), &dlg));
         auto* txid = AddTextRow(form, tr("Foreign claim txid:"), &dlg);
         AddOkCancel(form, &dlg);
         if (dlg.exec() != QDialog::Accepted) return;
@@ -1019,17 +1029,17 @@ void PricoinSwapsPage::onAdaptBtcClaimClicked()
 
     if (chain == "ltc") {
         QDialog dlg(this);
-        dlg.setWindowTitle(tr("Broadcast LTC HTLC claim (Alice)"));
+        dlg.setWindowTitle(tr("Broadcast LTC HTLC claim (PRIC seller)"));
         auto* form = new QFormLayout(&dlg);
         form->addRow(new QLabel(has_t_snap
-            ? tr("Alice's LTC claim path. t is auto-filled from the swap "
-                 "record (extracted earlier from Bob's on-chain PRIC claim). "
-                 "Specify a destination address for the LTC.")
-            : tr("Alice's LTC claim path. The 32-byte t scalar comes from "
-                 "extracting it on-chain after Bob's PRIC claim confirms — "
-                 "use the \"Extract t…\" button on the swap row, or run "
-                 "pricoin_swapwatch_extract_pric_t. The dest address is "
-                 "where the LTC will be paid."),
+            ? tr("PRIC-seller LTC claim path. t is auto-filled from the swap "
+                 "record (extracted earlier from the PRIC buyer's on-chain "
+                 "PRIC claim). Specify a destination address for the LTC.")
+            : tr("PRIC-seller LTC claim path. The 32-byte t scalar comes from "
+                 "extracting it on-chain after the PRIC buyer's PRIC claim "
+                 "confirms — use the \"Extract t…\" button on the swap row, "
+                 "or run pricoin_swapwatch_extract_pric_t. The dest address "
+                 "is where the LTC will be paid."),
             &dlg));
         auto* t_in    = new QLineEdit(&dlg);
         t_in->setEchoMode(QLineEdit::Password);
@@ -1040,6 +1050,10 @@ void PricoinSwapsPage::onAdaptBtcClaimClicked()
         form->addRow(tr("t (hex):"), t_in);
         auto* dest_in = new QLineEdit(&dlg);
         dest_in->setPlaceholderText(tr("ltc1q… bech32 address"));
+        {
+            QFontMetrics fm(dest_in->font());
+            dest_in->setMinimumWidth(fm.horizontalAdvance(QLatin1Char('M')) * 70);
+        }
         form->addRow(tr("Destination LTC address:"), dest_in);
         auto* fee_in  = new QLineEdit(&dlg);
         fee_in->setText(QStringLiteral("1000"));
@@ -1136,7 +1150,8 @@ void PricoinSwapsPage::onExtractTClicked()
         }
     }
     if (role != "alice") {
-        setStatus(tr("Extract is for Alice — Bob already holds t from setup."), true);
+        setStatus(tr("Extract is for the PRIC seller — the PRIC buyer already "
+                      "holds t from setup."), true);
         return;
     }
     if (already_has_t) {
@@ -1145,26 +1160,26 @@ void PricoinSwapsPage::onExtractTClicked()
     }
 
     QDialog dlg(this);
-    dlg.setWindowTitle(tr("Extract t from Bob's PRIC claim"));
+    dlg.setWindowTitle(tr("Extract t from PRIC buyer's claim tx"));
     auto* form = new QFormLayout(&dlg);
     form->addRow(new QLabel(persisted_ring.empty()
-        ? tr("Recovers the adaptor scalar t from Bob's on-chain PRIC "
-             "claim CLSAG signature. The ring + sig hex come from "
-             "Bob's Nostr DM (he sent them when he broadcast). On "
-             "success t is persisted into the swap record so the LTC "
-             "claim dialog auto-fills it.\n\n"
-             "Note: under the watcher auto-extract path, this dialog "
-             "is rarely needed — Alice's wallet picks up the spend "
-             "directly from chain. Use this only if the wallet was "
-             "offline when Bob's claim hit chain.")
-        : tr("Recovers the adaptor scalar t from Bob's on-chain PRIC "
-             "claim CLSAG signature. The ring is auto-filled from "
-             "the swap record — only paste the on-chain sig hex (Bob "
+        ? tr("Recovers the adaptor scalar t from the PRIC buyer's on-chain "
+             "PRIC claim CLSAG signature. The ring + sig hex come from the "
+             "buyer's Nostr DM (sent when they broadcast). On success t is "
+             "persisted into the swap record so the LTC claim dialog "
+             "auto-fills it.\n\n"
+             "Note: under the watcher auto-extract path, this dialog is "
+             "rarely needed — the wallet picks up the spend directly from "
+             "chain. Use this only if the wallet was offline when the "
+             "buyer's claim hit chain.")
+        : tr("Recovers the adaptor scalar t from the PRIC buyer's on-chain "
+             "PRIC claim CLSAG signature. The ring is auto-filled from the "
+             "swap record — only paste the on-chain sig hex (the buyer "
              "sends it via Nostr DM).\n\n"
-             "Note: under the watcher auto-extract path, this dialog "
-             "is rarely needed — Alice's wallet picks up the spend "
-             "directly from chain. Use this only if the wallet was "
-             "offline when Bob's claim hit chain."),
+             "Note: under the watcher auto-extract path, this dialog is "
+             "rarely needed — the wallet picks up the spend directly from "
+             "chain. Use this only if the wallet was offline when the "
+             "buyer's claim hit chain."),
         &dlg));
     auto* ring_in = new QPlainTextEdit(&dlg);
     ring_in->setPlaceholderText(tr("JSON array of 33-byte compressed pubkey hex strings"));
@@ -1181,7 +1196,7 @@ void PricoinSwapsPage::onExtractTClicked()
     }
     form->addRow(tr("ring (JSON):"), ring_in);
     auto* sig_in = new QPlainTextEdit(&dlg);
-    sig_in->setPlaceholderText(tr("hex of pricoin::ringsig::Signature blob from Bob's PRIC claim tx"));
+    sig_in->setPlaceholderText(tr("hex of pricoin::ringsig::Signature blob from the PRIC buyer's claim tx"));
     sig_in->setMaximumHeight(80);
     form->addRow(tr("sig (hex):"), sig_in);
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
@@ -1236,18 +1251,22 @@ void PricoinSwapsPage::onLtcRefundClicked()
         return;
     }
     if (role != "bob") {
-        setStatus(tr("LTC HTLC refund is performed by Bob (the LTC seller)."), true);
+        setStatus(tr("LTC HTLC refund is performed by the PRIC buyer (LTC seller)."), true);
         return;
     }
 
     QDialog dlg(this);
-    dlg.setWindowTitle(tr("Broadcast LTC HTLC refund (Bob)"));
+    dlg.setWindowTitle(tr("Broadcast LTC HTLC refund (PRIC buyer)"));
     auto* form = new QFormLayout(&dlg);
     form->addRow(new QLabel(tr("Spends the LTC HTLC refund branch. Only valid after "
                                 "the foreign refund timelock expires; the network "
                                 "rejects earlier broadcasts."), &dlg));
     auto* dest_in = new QLineEdit(&dlg);
-    dest_in->setPlaceholderText(tr("ltc1q… bech32 address (where Bob receives refund)"));
+    dest_in->setPlaceholderText(tr("ltc1q… bech32 address (where the PRIC buyer receives the refunded LTC)"));
+    {
+        QFontMetrics fm(dest_in->font());
+        dest_in->setMinimumWidth(fm.horizontalAdvance(QLatin1Char('M')) * 70);
+    }
     form->addRow(tr("Destination LTC address:"), dest_in);
     auto* fee_in = new QLineEdit(&dlg);
     fee_in->setText(QStringLiteral("1000"));
@@ -1295,13 +1314,13 @@ void PricoinSwapsPage::onAdaptPricClaimClicked()
         return;
     }
     QDialog dlg(this);
-    dlg.setWindowTitle(tr("Adapt + broadcast PRIC claim (Bob)"));
+    dlg.setWindowTitle(tr("Adapt + broadcast PRIC claim (PRIC buyer)"));
     auto* form = new QFormLayout(&dlg);
-    form->addRow(new QLabel(tr("Bob-only: uses the wallet's stored t_secret to "
-        "adapt the PRIC adaptor pre-sig and broadcast the claim. The 3 inputs "
-        "below come from Bob's cooperative-sign dialog session — paste tx_hex "
-        "(buildtx output), the single-layer ring of joint pubkeys, and the "
-        "32-byte sighash."), &dlg));
+    form->addRow(new QLabel(tr("PRIC buyer only: uses the wallet's stored "
+        "t_secret to adapt the PRIC adaptor pre-sig and broadcast the claim. "
+        "The 3 inputs below come from the cooperative-sign dialog session — "
+        "paste tx_hex (buildtx output), the single-layer ring of joint "
+        "pubkeys, and the 32-byte sighash."), &dlg));
     auto* tx_hex = new QPlainTextEdit(&dlg);
     tx_hex->setPlaceholderText(tr("Skeleton tx hex from pricoin_jointspend_buildtx"));
     tx_hex->setMaximumHeight(80);

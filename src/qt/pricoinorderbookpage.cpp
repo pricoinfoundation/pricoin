@@ -9,7 +9,12 @@
 #include <qt/pricoin_nostr_client.h>
 #include <qt/pricoin_relay_settings_dialog.h>
 #include <qt/walletmodel.h>
+#include <interfaces/node.h>
+#include <tinyformat.h>
 #include <util/translation.h>
+#include <univalue.h>
+
+#include <cmath>
 
 #include <QApplication>
 #include <QClipboard>
@@ -370,6 +375,19 @@ void PricoinOrderbookPage::setModel(WalletModel* model)
     if (m_model && m_auto_refresh_timer && !m_auto_refresh_timer->isActive()) {
         m_auto_refresh_timer->start();
     }
+
+    // Auto-connect to the configured Nostr relay set on first attach.
+    // Without this the user has to click "Connect to relays" before
+    // anything in the orderbook works (publish, receive offers, match
+    // DMs). Idempotent — connectAll() is safe if already connected.
+    if (m_model) {
+        rebuildNostrClient();
+        if (m_nostr) {
+            m_nostr->connectAll();
+            setStatus(tr("Connecting to %1 relays…")
+                .arg(m_nostr->relayUrls().size()));
+        }
+    }
 }
 
 void PricoinOrderbookPage::refreshTable()
@@ -536,6 +554,10 @@ void PricoinOrderbookPage::rebuildNostrClient()
             this, &PricoinOrderbookPage::onNostrOfferReceived);
     connect(m_nostr, &PricoinNostrClient::directMessageReceived,
             this, &PricoinOrderbookPage::onNostrDmReceived);
+    connect(m_nostr, &PricoinNostrClient::dmSent,
+            this, &PricoinOrderbookPage::onNostrDmSent);
+    connect(m_nostr, &PricoinNostrClient::dmAcked,
+            this, &PricoinOrderbookPage::onNostrDmAcked);
     connect(m_nostr, &PricoinNostrClient::log,
             this, &PricoinOrderbookPage::onNostrLog);
     connect(m_nostr, &PricoinNostrClient::relayStatusChanged,
@@ -620,8 +642,8 @@ void PricoinOrderbookPage::onStartSwapClicked()
     }
 
     // Map orderbook side → adaptor-swap role.
-    //   sell_pric (giving up PRIC, receiving foreign) → Alice
-    //   buy_pric  (giving up foreign, receiving PRIC) → Bob
+    //   sell_pric (giving up PRIC, receiving foreign) → Alice (PRIC seller)
+    //   buy_pric  (giving up foreign, receiving PRIC) → Bob   (PRIC buyer)
     const std::string my_role = (mine->side == "sell_pric") ? "alice" : "bob";
 
     // Compute the actual amounts at the maker's (peer's, when
@@ -646,6 +668,139 @@ void PricoinOrderbookPage::onStartSwapClicked()
         (static_cast<__int128>(pric_amount) *
          static_cast<__int128>(ask->foreign_amount_at_max_sat)) /
         static_cast<__int128>(ask->max_pric_amount_sat));
+
+    // Funds gate — fail fast if the user obviously can't fund their
+    // side. Doesn't account for fees (the user should leave a small
+    // buffer); we add ~0.1% headroom for the fee + dust margin.
+    //
+    // On failure we don't just refuse — we also release the match
+    // (DM the peer to mirror) and cancel the local order, so the
+    // counterparty isn't left holding a dead match they have to
+    // manually unwind. The cancel keeps the order from re-matching
+    // until funds are deposited and the user re-creates it.
+    auto release_and_cancel = [&](const QString& msg) {
+        setStatus(msg, true);
+        std::string peer_oid;
+        {
+            const auto rec = m_model->wallet().offerGet(oid);
+            if (rec) peer_oid = rec->matched_with_order_id;
+        }
+        m_model->wallet().offerUnmatch(oid);
+        if (m_nostr && !peer_oid.empty()) {
+            const auto peer_rec = m_model->wallet().offerGet(peer_oid);
+            if (peer_rec && peer_rec->maker_pubkey_hex.size() >= 66) {
+                const QString peer_xonly = QString::fromStdString(
+                    peer_rec->maker_pubkey_hex.substr(2));
+                QJsonObject msgj;
+                msgj.insert(QStringLiteral("type"),
+                    QStringLiteral("pricoin:unmatch/v1"));
+                msgj.insert(QStringLiteral("my_order_id"),
+                    QString::fromStdString(oid));
+                msgj.insert(QStringLiteral("their_order_id"),
+                    QString::fromStdString(peer_oid));
+                const QString plaintext = QString::fromUtf8(
+                    QJsonDocument(msgj).toJson(QJsonDocument::Compact));
+                m_nostr->publishDirectMessage(peer_xonly, plaintext);
+            }
+        }
+        m_model->wallet().offerCancel(oid);
+        refreshTable();
+    };
+
+    // Local helper to call a wallet RPC inline (no global helper here).
+    auto call_rpc = [&](const std::string& method, const UniValue& params,
+                          UniValue& out, std::string& err_out) -> bool {
+        const QString wallet_name = m_model->getWalletName();
+        std::string uri;
+        if (!wallet_name.isEmpty()) {
+            uri = "/wallet/" + std::string(
+                QUrl::toPercentEncoding(wallet_name).constData());
+        }
+        try {
+            out = m_model->node().executeRpc(method, params, uri);
+            return true;
+        } catch (const UniValue& e) {
+            err_out = e.isObject() && e.exists("message")
+                ? e["message"].get_str() : e.write();
+        } catch (const std::exception& e) {
+            err_out = e.what();
+        }
+        return false;
+    };
+
+    if (my_role == "bob") {
+        // PRIC buyer locks foreign in the holding wallet. Confirmed
+        // balance must cover the swap amount + the actual funding-tx
+        // fee. We compute the fee from the chain backend's live
+        // sat/vB (rather than a flat percentage), so the gate is
+        // tight enough to refuse marginal fills but doesn't reject
+        // when the user has exactly amount + minimum fee.
+        //
+        // Foreign funding-tx vbyte estimate:
+        //   * BTC: 1 P2TR input (~58 vB) + P2TR target (~43) + P2WPKH
+        //     change (~31) + overhead (~11) = 143 vB.
+        //   * LTC: 1 P2WPKH input (~68 vB) + P2WSH HTLC target (~43) +
+        //     P2WPKH change (~31) + overhead (~11) = 153 vB.
+        const int est_size_vb = (mine->foreign_chain == "btc") ? 143 : 153;
+
+        UniValue bal, fees;
+        std::string err;
+        UniValue chain_arg{UniValue::VARR};
+        chain_arg.push_back(mine->foreign_chain);
+        if (!call_rpc("pricoin_btc_getbalance", chain_arg, bal, err)) {
+            release_and_cancel(tr("Cannot verify holding-wallet balance for %1: %2. "
+                          "Match released and order cancelled.")
+                .arg(QString::fromStdString(mine->foreign_chain))
+                .arg(QString::fromStdString(err)));
+            return;
+        }
+        // Fee-estimates are best-effort; if the backend can't supply
+        // them, fall back to 2 sat/vB (a comfortable upper bound for
+        // current quiet conditions on both BTC and LTC).
+        double sat_per_vb = 2.0;
+        if (call_rpc("pricoin_chainwatch_fee_estimates", chain_arg, fees, err)) {
+            for (int t : {6, 10, 3, 20}) {
+                const auto v = fees[strprintf("%d", t)];
+                if (v.isNum() && v.get_real() > 0) {
+                    sat_per_vb = v.get_real();
+                    break;
+                }
+            }
+        }
+        const int64_t fee_sat = static_cast<int64_t>(
+            std::ceil(static_cast<double>(est_size_vb) * sat_per_vb));
+
+        const UniValue conf_v = bal["confirmed_sat"];
+        const int64_t confirmed = conf_v.isNum() ? conf_v.getInt<int64_t>() : 0;
+        const int64_t needed = foreign_amount + fee_sat;
+        if (confirmed < needed) {
+            release_and_cancel(tr("Insufficient %1 in holding wallet. "
+                          "Have %2 sat confirmed, need %3 sat (%4 + %5 fee at "
+                          "%6 sat/vB × ~%7 vB). Match released and order cancelled — "
+                          "deposit %1 in the Holding tab and re-create the order.")
+                .arg(QString::fromStdString(mine->foreign_chain).toUpper())
+                .arg(confirmed).arg(needed).arg(foreign_amount).arg(fee_sat)
+                .arg(QString::number(sat_per_vb, 'f', 1)).arg(est_size_vb));
+            return;
+        }
+    } else {
+        // PRIC seller locks PRIC. The CT-send path handles fees
+        // internally via the bundle's transparent_fee output; pad
+        // the requirement by one CT-tx-typical fee so the user
+        // doesn't fall a few sats short on their own send.
+        const int64_t pric_fee_buffer = 100'000;   // 0.001 PRIC
+        const CAmount conf = m_model->wallet().confidentialBalance();
+        const int64_t needed = pric_amount + pric_fee_buffer;
+        if (conf < needed) {
+            release_and_cancel(tr("Insufficient confidential PRIC. "
+                          "Have %1 sat, need %2 sat (%3 + %4 fee buffer). "
+                          "Match released and order cancelled — top up your "
+                          "confidential PRIC and re-create the order.")
+                .arg(static_cast<long long>(conf))
+                .arg(needed).arg(pric_amount).arg(pric_fee_buffer));
+            return;
+        }
+    }
 
     // Prompt for the joint stealth address (the user computed it via
     // pricoin_buildjointstealthaddress out-of-band) plus refund timelocks.
@@ -701,26 +856,26 @@ void PricoinOrderbookPage::onStartSwapClicked()
         : "";
 
     auto* btc_alice_rcpt = new QLineEdit(&dlg);
-    btc_alice_rcpt->setPlaceholderText(tr("32-byte x-only — Alice's BTC P2TR refund recipient"));
-    form->addRow(tr("BTC refund (Alice's xonly):"), btc_alice_rcpt);
+    btc_alice_rcpt->setPlaceholderText(tr("32-byte x-only — PRIC seller's BTC P2TR refund recipient"));
+    form->addRow(tr("BTC refund (PRIC seller's xonly):"), btc_alice_rcpt);
 
     auto* btc_bob_rcpt = new QLineEdit(&dlg);
-    btc_bob_rcpt->setPlaceholderText(tr("32-byte x-only — Bob's BTC P2TR claim recipient"));
-    form->addRow(tr("BTC claim (Bob's xonly):"), btc_bob_rcpt);
+    btc_bob_rcpt->setPlaceholderText(tr("32-byte x-only — PRIC buyer's BTC P2TR claim recipient"));
+    form->addRow(tr("BTC claim (PRIC buyer's xonly):"), btc_bob_rcpt);
 
     auto* pric_alice_rcpt = new QLineEdit(&dlg);
-    pric_alice_rcpt->setPlaceholderText(tr("Alice's PRIC stealth claim recipient"));
+    pric_alice_rcpt->setPlaceholderText(tr("PRIC seller's stealth claim recipient"));
     if (my_role == "alice" && !my_stealth.empty()) {
         pric_alice_rcpt->setText(QString::fromStdString(my_stealth));
     }
-    form->addRow(tr("PRIC claim (Alice's stealth):"), pric_alice_rcpt);
+    form->addRow(tr("PRIC claim (PRIC seller's stealth):"), pric_alice_rcpt);
 
     auto* pric_bob_rcpt = new QLineEdit(&dlg);
-    pric_bob_rcpt->setPlaceholderText(tr("Bob's PRIC stealth refund recipient"));
+    pric_bob_rcpt->setPlaceholderText(tr("PRIC buyer's stealth refund recipient"));
     if (my_role == "bob" && !my_stealth.empty()) {
         pric_bob_rcpt->setText(QString::fromStdString(my_stealth));
     }
-    form->addRow(tr("PRIC refund (Bob's stealth):"), pric_bob_rcpt);
+    form->addRow(tr("PRIC refund (PRIC buyer's stealth):"), pric_bob_rcpt);
 
     auto* pric_lock = new QSpinBox(&dlg);
     pric_lock->setRange(1, 2'147'483'647);
@@ -762,7 +917,62 @@ void PricoinOrderbookPage::onStartSwapClicked()
             .arg(QString::fromStdString(util::ErrorString(r).original)), true);
         return;
     }
-    setStatus(tr("Swap created. Switch to the Swaps tab to track its state."));
+
+    // DM the counterparty so their wallet auto-creates the mirror
+    // swap record. Without this, the counterparty has to fill out
+    // the same Start-swap dialog independently and risk transcribing
+    // any of the 8 fields wrong. With it, only one side fills the
+    // form and the other side's wallet creates an identical record
+    // in the background.
+    //
+    // The DM carries every field needed to reconstruct the swap on
+    // the other side, plus the local swap_id (purely informational
+    // — both sides generate their own random swap_id; the link is
+    // via counterparty_pub).
+    if (m_nostr && peer->maker_pubkey_hex.size() >= 66) {
+        const QString peer_xonly = QString::fromStdString(
+            peer->maker_pubkey_hex.substr(2));
+        QJsonObject swap_dm;
+        swap_dm.insert(QStringLiteral("type"),
+            QStringLiteral("pricoin:swap_start/v1"));
+        // Sender's role; the receiver flips it (alice ↔ bob).
+        swap_dm.insert(QStringLiteral("sender_role"),
+            QString::fromStdString(my_role));
+        swap_dm.insert(QStringLiteral("foreign_chain"),
+            QString::fromStdString(ap.foreign_chain));
+        swap_dm.insert(QStringLiteral("foreign_amount_sat"),
+            static_cast<double>(ap.foreign_amount_sat));
+        swap_dm.insert(QStringLiteral("pric_amount_sat"),
+            static_cast<double>(ap.pric_amount_sat));
+        swap_dm.insert(QStringLiteral("pric_joint_stealth_address"),
+            QString::fromStdString(ap.pric_joint_stealth_address));
+        swap_dm.insert(QStringLiteral("memo"),
+            QString::fromStdString(ap.memo));
+        swap_dm.insert(QStringLiteral("btc_alice_recipient_xonly_hex"),
+            QString::fromStdString(ap.btc_alice_recipient_xonly_hex));
+        swap_dm.insert(QStringLiteral("btc_bob_recipient_xonly_hex"),
+            QString::fromStdString(ap.btc_bob_recipient_xonly_hex));
+        swap_dm.insert(QStringLiteral("pric_alice_recipient_stealth"),
+            QString::fromStdString(ap.pric_alice_recipient_stealth));
+        swap_dm.insert(QStringLiteral("pric_bob_recipient_stealth"),
+            QString::fromStdString(ap.pric_bob_recipient_stealth));
+        // Match the matched-orders pair so the receiver can validate
+        // this DM corresponds to a real match in their orderbook.
+        swap_dm.insert(QStringLiteral("my_order_id"),
+            QString::fromStdString(oid));
+        swap_dm.insert(QStringLiteral("their_order_id"),
+            QString::fromStdString(peer->order_id));
+
+        const QString plaintext = QString::fromUtf8(
+            QJsonDocument(swap_dm).toJson(QJsonDocument::Compact));
+        m_next_dm_label = tr("Swap-start params for %1…")
+            .arg(QString::fromStdString(peer->order_id).left(12));
+        m_nostr->publishDirectMessage(peer_xonly, plaintext);
+        m_next_dm_label.clear();
+    }
+
+    setStatus(tr("Swap created. Counterparty's wallet will mirror it "
+                  "automatically. Switch to the Swaps tab to track state."));
 }
 
 void PricoinOrderbookPage::onNostrOfferReceived(const QString& uri)
@@ -776,6 +986,31 @@ void PricoinOrderbookPage::onNostrOfferReceived(const QString& uri)
     }
     refreshTable();
     setStatus(tr("Imported new offer from network."));
+}
+
+void PricoinOrderbookPage::onNostrDmSent(const QString& dm_id,
+                                           const QString& peer_xonly_hex)
+{
+    Q_UNUSED(peer_xonly_hex);
+    if (dm_id.isEmpty()) return;
+    // Caller of publishDirectMessage stashes a description into
+    // m_pending_dms[dm_id] just before sending. If they didn't,
+    // this just becomes a no-op pending entry that the ack clears.
+    const QString label = m_next_dm_label.isEmpty()
+        ? tr("(unlabeled DM)") : m_next_dm_label;
+    m_next_dm_label.clear();
+    m_pending_dms.insert(dm_id, label);
+    setStatus(tr("Sent: %1 — awaiting counterparty receipt…").arg(label));
+}
+
+void PricoinOrderbookPage::onNostrDmAcked(const QString& dm_id,
+                                           const QString& peer_xonly_hex)
+{
+    Q_UNUSED(peer_xonly_hex);
+    if (dm_id.isEmpty()) return;
+    const QString desc = m_pending_dms.take(dm_id);
+    if (desc.isEmpty()) return;  // Not one of ours.
+    setStatus(tr("Counterparty received: %1").arg(desc));
 }
 
 void PricoinOrderbookPage::onNostrLog(const QString& msg)
@@ -937,9 +1172,12 @@ void PricoinOrderbookPage::onFindMatchesClicked()
                 static_cast<double>(actual_pric));
             const QString plaintext = QString::fromUtf8(
                 QJsonDocument(msg).toJson(QJsonDocument::Compact));
+            m_next_dm_label = tr("Match notification for order %1…")
+                .arg(QString::fromStdString(their_id).left(12));
             if (m_nostr->publishDirectMessage(peer_xonly, plaintext)) {
                 dm_sent = 1;
             }
+            m_next_dm_label.clear();  // belt-and-suspenders
         }
     }
     setStatus(tr("Matched %1 PRIC against %2… %3")
@@ -962,27 +1200,27 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
     auto doc = QJsonDocument::fromJson(plaintext.toUtf8(), &pe);
     if (pe.error != QJsonParseError::NoError || !doc.isObject()) return;
     const auto obj = doc.object();
-    if (obj.value(QStringLiteral("type")).toString() !=
-        QStringLiteral("pricoin:match/v1")) {
-        return;  // Some other DM; ignore.
-    }
+    const QString type = obj.value(QStringLiteral("type")).toString();
+    const bool is_match      = (type == QStringLiteral("pricoin:match/v1"));
+    const bool is_unmatch    = (type == QStringLiteral("pricoin:unmatch/v1"));
+    const bool is_swap_start = (type == QStringLiteral("pricoin:swap_start/v1"));
+    if (!is_match && !is_unmatch && !is_swap_start) return;
+
     // Sender's "my" = sender's order = our "their"; flip on receive.
     const std::string sender_oid =
         obj.value(QStringLiteral("my_order_id")).toString().toStdString();
     const std::string my_oid =
         obj.value(QStringLiteral("their_order_id")).toString().toStdString();
-    const int64_t actual_pric = static_cast<int64_t>(
-        obj.value(QStringLiteral("actual_pric_sat")).toDouble());
-    if (sender_oid.empty() || my_oid.empty() || actual_pric <= 0) return;
+    if (sender_oid.empty() || my_oid.empty()) return;
 
     if (!m_model) return;
 
     // Authorization: the sender's xonly must match maker_pubkey_hex
     // of the sender's order (sender_oid). Otherwise anyone could
-    // forge a match-DM.
+    // forge a match/unmatch-DM and corrupt our orderbook state.
     const auto sender_order = m_model->wallet().offerGet(sender_oid);
     if (!sender_order) {
-        setStatus(tr("Match-DM from %1: their order %2 not in our orderbook")
+        setStatus(tr("DM from %1: their order %2 not in our orderbook")
             .arg(from_xonly_hex.left(12) + "…")
             .arg(QString::fromStdString(sender_oid).left(12)), true);
         return;
@@ -991,27 +1229,104 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
         const QString claimed_xonly = QString::fromStdString(
             sender_order->maker_pubkey_hex.substr(2));
         if (claimed_xonly != from_xonly_hex) {
-            setStatus(tr("Match-DM rejected: sender %1 is not the maker of "
-                          "order %2")
+            setStatus(tr("DM rejected: sender %1 is not the maker of order %2")
                 .arg(from_xonly_hex.left(12) + "…")
                 .arg(QString::fromStdString(sender_oid).left(12)), true);
             return;
         }
     }
 
-    auto r = m_model->wallet().offerMatch(my_oid, sender_oid, actual_pric);
-    if (!r) {
-        setStatus(tr("Match-DM from %1 — local apply failed: %2")
-            .arg(from_xonly_hex.left(12) + "…")
-            .arg(QString::fromStdString(util::ErrorString(r).original)), true);
-        return;
+    if (is_match) {
+        const int64_t actual_pric = static_cast<int64_t>(
+            obj.value(QStringLiteral("actual_pric_sat")).toDouble());
+        if (actual_pric <= 0) return;
+        auto r = m_model->wallet().offerMatch(my_oid, sender_oid, actual_pric);
+        if (!r) {
+            setStatus(tr("Match-DM from %1 — local apply failed: %2")
+                .arg(from_xonly_hex.left(12) + "…")
+                .arg(QString::fromStdString(util::ErrorString(r).original)), true);
+            return;
+        }
+        refreshTable();
+        setStatus(tr("Counterparty matched our order %1 — %2 PRIC.")
+            .arg(QString::fromStdString(my_oid).left(12) + "…")
+            .arg(QString::asprintf("%lld.%08lld",
+                static_cast<long long>(actual_pric / 100'000'000),
+                static_cast<long long>(actual_pric % 100'000'000))));
+    } else if (is_unmatch) {
+        // Unmatch — release the local match so the order returns
+        // to Active. offerUnmatch operates on a single order_id;
+        // it clears the matched_with link on both ends if both
+        // are in this wallet, but for two-stranger swaps only the
+        // local side matters here.
+        auto r = m_model->wallet().offerUnmatch(my_oid);
+        if (!r) {
+            setStatus(tr("Unmatch-DM from %1 — local apply failed: %2")
+                .arg(from_xonly_hex.left(12) + "…")
+                .arg(QString::fromStdString(util::ErrorString(r).original)), true);
+            return;
+        }
+        refreshTable();
+        setStatus(tr("Counterparty released the match on order %1.")
+            .arg(QString::fromStdString(my_oid).left(12) + "…"));
+    } else if (is_swap_start) {
+        // Counterparty clicked "Start swap" on their side. They've
+        // sent us all the params; we mirror-create our own
+        // AdaptorSwap record so the user doesn't have to fill out
+        // the same dialog independently.
+        //
+        // Sanity gates: their `my_order_id` must be the order they
+        // matched against us (sender_oid we already validated as
+        // theirs above), and `their_order_id` must be the one we
+        // matched in their direction (my_oid — our local order).
+        // Then flip role: if sender said "alice" we are "bob".
+        const QString sender_role = obj.value(
+            QStringLiteral("sender_role")).toString();
+        const QString my_flipped_role =
+            (sender_role == QStringLiteral("alice")) ? QStringLiteral("bob")
+                                                     : QStringLiteral("alice");
+
+        // Verify the local order actually exists + is in matched state.
+        const auto my_order = m_model->wallet().offerGet(my_oid);
+        if (!my_order) {
+            setStatus(tr("Swap-start DM from %1: our order %2 not found.")
+                .arg(from_xonly_hex.left(12) + "…")
+                .arg(QString::fromStdString(my_oid).left(12)), true);
+            return;
+        }
+
+        interfaces::Wallet::PricoinAdaptorSwapCreateParams ap;
+        ap.role = my_flipped_role.toStdString();
+        ap.counterparty_pubkey_hex = sender_order->maker_pubkey_hex;
+        ap.foreign_chain = obj.value(
+            QStringLiteral("foreign_chain")).toString().toStdString();
+        ap.foreign_amount_sat = static_cast<int64_t>(
+            obj.value(QStringLiteral("foreign_amount_sat")).toDouble());
+        ap.pric_amount_sat = static_cast<int64_t>(
+            obj.value(QStringLiteral("pric_amount_sat")).toDouble());
+        ap.pric_joint_stealth_address = obj.value(
+            QStringLiteral("pric_joint_stealth_address")).toString().toStdString();
+        ap.memo = obj.value(QStringLiteral("memo")).toString().toStdString();
+        ap.btc_alice_recipient_xonly_hex = obj.value(
+            QStringLiteral("btc_alice_recipient_xonly_hex")).toString().toStdString();
+        ap.btc_bob_recipient_xonly_hex = obj.value(
+            QStringLiteral("btc_bob_recipient_xonly_hex")).toString().toStdString();
+        ap.pric_alice_recipient_stealth = obj.value(
+            QStringLiteral("pric_alice_recipient_stealth")).toString().toStdString();
+        ap.pric_bob_recipient_stealth = obj.value(
+            QStringLiteral("pric_bob_recipient_stealth")).toString().toStdString();
+
+        auto r = m_model->wallet().adaptorSwapCreate(ap);
+        if (!r) {
+            setStatus(tr("Swap-start DM from %1 — local create failed: %2")
+                .arg(from_xonly_hex.left(12) + "…")
+                .arg(QString::fromStdString(util::ErrorString(r).original)), true);
+            return;
+        }
+        refreshTable();
+        setStatus(tr("Counterparty started the swap; mirror record "
+                      "created on this side. Switch to the Swaps tab."));
     }
-    refreshTable();
-    setStatus(tr("Counterparty matched our order %1 — %2 PRIC.")
-        .arg(QString::fromStdString(my_oid).left(12) + "…")
-        .arg(QString::asprintf("%lld.%08lld",
-            static_cast<long long>(actual_pric / 100'000'000),
-            static_cast<long long>(actual_pric % 100'000'000))));
 }
 
 void PricoinOrderbookPage::onFillClicked()
@@ -1042,6 +1357,15 @@ void PricoinOrderbookPage::onUnmatchClicked()
             tr("Release this match back to Active? Use when the swap setup "
                "has aborted but the order should remain available."),
             QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) return;
+
+    // Snapshot the matched-with peer before unmatching, so we can DM
+    // them. After offerUnmatch the matched_with link is cleared.
+    std::string peer_oid;
+    {
+        const auto rec = m_model->wallet().offerGet(oid);
+        if (rec) peer_oid = rec->matched_with_order_id;
+    }
+
     auto r = m_model->wallet().offerUnmatch(oid);
     if (!r) {
         setStatus(tr("Unmatch failed: %1")
@@ -1049,5 +1373,32 @@ void PricoinOrderbookPage::onUnmatchClicked()
         return;
     }
     refreshTable();
-    setStatus(tr("Released."));
+
+    // Notify counterparty via NIP-04 DM so their wallet mirrors the
+    // release. Symmetrical to the match-DM flow in onFindMatchesClicked.
+    int dm_sent = 0;
+    if (m_nostr && !peer_oid.empty()) {
+        const auto peer = m_model->wallet().offerGet(peer_oid);
+        if (peer && peer->maker_pubkey_hex.size() >= 66) {
+            const QString peer_xonly = QString::fromStdString(
+                peer->maker_pubkey_hex.substr(2));
+            QJsonObject msg;
+            msg.insert(QStringLiteral("type"),
+                QStringLiteral("pricoin:unmatch/v1"));
+            msg.insert(QStringLiteral("my_order_id"),
+                QString::fromStdString(oid));
+            msg.insert(QStringLiteral("their_order_id"),
+                QString::fromStdString(peer_oid));
+            const QString plaintext = QString::fromUtf8(
+                QJsonDocument(msg).toJson(QJsonDocument::Compact));
+            m_next_dm_label = tr("Unmatch notification for order %1…")
+                .arg(QString::fromStdString(peer_oid).left(12));
+            if (m_nostr->publishDirectMessage(peer_xonly, plaintext)) {
+                dm_sent = 1;
+            }
+            m_next_dm_label.clear();
+        }
+    }
+    setStatus(dm_sent ? tr("Released. Counterparty notified.")
+                      : tr("Released. (counterparty not notified — DM failed)"));
 }

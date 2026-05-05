@@ -326,7 +326,37 @@ bool PricoinNostrClient::publishDirectMessage(const QString& peer_xonly_hex,
             .arg(QString::fromStdString(util::ErrorString(key_or).original)));
         return false;
     }
-    auto content_or = pricoin::nip04::Encrypt(*key_or, plaintext);
+
+    // dm_id injection: if plaintext is a JSON object, ensure it has a
+    // `dm_id` field for ACK tracking. Free-form (non-JSON) plaintext
+    // gets no ACK — it's an opaque payload to us.
+    QString dm_id;
+    QString actual_plaintext = plaintext;
+    {
+        QJsonParseError pe;
+        auto doc = QJsonDocument::fromJson(plaintext.toUtf8(), &pe);
+        if (pe.error == QJsonParseError::NoError && doc.isObject()) {
+            QJsonObject obj = doc.object();
+            // Skip ACK injection on ACKs themselves (would loop).
+            const bool is_ack = (obj.value(QStringLiteral("type")).toString()
+                                  == QStringLiteral("pricoin:ack/v1"));
+            if (!is_ack) {
+                if (!obj.contains(QStringLiteral("dm_id"))) {
+                    unsigned char rnd[16];
+                    GetStrongRandBytes(rnd);
+                    dm_id = QString::fromStdString(
+                        HexStr(std::span<const unsigned char>{rnd, 16}));
+                    obj.insert(QStringLiteral("dm_id"), dm_id);
+                } else {
+                    dm_id = obj.value(QStringLiteral("dm_id")).toString();
+                }
+                actual_plaintext = QString::fromUtf8(
+                    QJsonDocument(obj).toJson(QJsonDocument::Compact));
+            }
+        }
+    }
+
+    auto content_or = pricoin::nip04::Encrypt(*key_or, actual_plaintext);
     if (!content_or) {
         Q_EMIT log(tr("NIP-04 encrypt failed"));
         return false;
@@ -381,6 +411,9 @@ bool PricoinNostrClient::publishDirectMessage(const QString& peer_xonly_hex,
     }
     Q_EMIT log(tr("Published DM to %1 → %2 relay(s).")
         .arg(peer_xonly_hex.left(12) + "…").arg(sent));
+    if (sent > 0 && !dm_id.isEmpty()) {
+        Q_EMIT dmSent(dm_id, peer_xonly_hex);
+    }
     return sent > 0;
 }
 
@@ -491,7 +524,48 @@ void PricoinNostrClient::onTextMessage(const QString& message)
                     .arg(pubkey_hex.left(12) + "…"));
                 return;
             }
-            Q_EMIT directMessageReceived(pubkey_hex, *pt_or);
+
+            // Inspect the plaintext for ACK frames + dm_id tracking.
+            // Two cases:
+            //   (1) type == "pricoin:ack/v1" — peer confirms receipt
+            //       of an earlier DM we sent. Emit dmAcked, do not
+            //       fan out as a normal DM.
+            //   (2) any other JSON object — if it carries a dm_id,
+            //       echo back an ACK so the sender sees delivery.
+            //       Then emit directMessageReceived for normal handling.
+            const QString pt_qstr = *pt_or;
+            QJsonParseError pe;
+            const auto doc = QJsonDocument::fromJson(pt_qstr.toUtf8(), &pe);
+            bool is_ack = false;
+            QString incoming_dm_id;
+            if (pe.error == QJsonParseError::NoError && doc.isObject()) {
+                const auto obj = doc.object();
+                if (obj.value(QStringLiteral("type")).toString()
+                    == QStringLiteral("pricoin:ack/v1")) {
+                    const QString ack_for =
+                        obj.value(QStringLiteral("ack_for")).toString();
+                    if (!ack_for.isEmpty()) {
+                        Q_EMIT dmAcked(ack_for, pubkey_hex);
+                    }
+                    is_ack = true;
+                } else {
+                    incoming_dm_id = obj.value(QStringLiteral("dm_id")).toString();
+                }
+            }
+            if (is_ack) return;
+            if (!incoming_dm_id.isEmpty()) {
+                // Auto-ACK back. We synthesize a small JSON object —
+                // publishDirectMessage will skip dm_id injection on
+                // ACKs because of the type check.
+                QJsonObject ack;
+                ack.insert(QStringLiteral("type"),
+                    QStringLiteral("pricoin:ack/v1"));
+                ack.insert(QStringLiteral("ack_for"), incoming_dm_id);
+                const QString ack_json = QString::fromUtf8(
+                    QJsonDocument(ack).toJson(QJsonDocument::Compact));
+                publishDirectMessage(pubkey_hex, ack_json);
+            }
+            Q_EMIT directMessageReceived(pubkey_hex, pt_qstr);
         }
     } else if (tag == QStringLiteral("OK")) {
         // ["OK", <event_id>, <accepted_bool>, <message>]  (NIP-20).

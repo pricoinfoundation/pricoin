@@ -16,6 +16,7 @@ class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
 class QPushButton;
+class QTimer;
 QT_END_NAMESPACE
 
 // Joint stealth address wizard for atomic swaps.
@@ -71,6 +72,7 @@ private:
     QPushButton*    m_btn_send_dm{nullptr};
     QPushButton*    m_btn_build{nullptr};
     QPushButton*    m_btn_use{nullptr};
+    QTimer*         m_resend_timer{nullptr};
 
     void buildLayout();
     void populateMyEnvelope();
