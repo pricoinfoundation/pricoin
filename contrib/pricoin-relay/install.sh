@@ -84,34 +84,34 @@ install -m 0755 "${DIR}/writepolicy.sh" /usr/local/lib/pricoin-relay/writepolicy
 install -m 0644 "${DIR}/pricoin-relay.service"          /etc/systemd/system/
 install -m 0644 "${DIR}/pricoin-relay-stream@.service"  /etc/systemd/system/
 
-# ─── 6. nginx vhost ──────────────────────────────────────────────
+# ─── 6. nginx vhost: phase 1 (HTTP-only ACME challenge) ─────────
+# Drop the HTTP-only vhost first so certbot's webroot challenge
+# works without trying to deal with non-existent TLS certs.
 sed "s|RELAY_HOSTNAME_HERE|${SELF_HOST}|g" \
-    "${DIR}/nginx-relay.conf" > /etc/nginx/sites-available/pricoin-relay
+    "${DIR}/nginx-relay-acme.conf" > /etc/nginx/sites-available/pricoin-relay
 ln -sf /etc/nginx/sites-available/pricoin-relay /etc/nginx/sites-enabled/pricoin-relay
-
-# nginx-relay.conf references LE certs that don't exist yet — temporarily
-# install a self-signed placeholder so `nginx -t` passes, certbot's
-# --nginx plugin will replace it on first cert issue.
-LE_DIR="/etc/letsencrypt/live/${SELF_HOST}"
-if [[ ! -f "${LE_DIR}/fullchain.pem" ]]; then
-    mkdir -p "${LE_DIR}"
-    openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-        -keyout "${LE_DIR}/privkey.pem" \
-        -out    "${LE_DIR}/fullchain.pem" \
-        -subj   "/CN=${SELF_HOST}" 2>/dev/null
-fi
 nginx -t
 systemctl reload nginx
 
-# ─── 7. Issue real cert via certbot --nginx ──────────────────────
-# `--non-interactive` + `--agree-tos` for unattended install. Email
-# is best-effort; LE accepts a placeholder for technical contacts.
-certbot --nginx \
-    --non-interactive --agree-tos \
-    --email "ops@pricoin.io" \
-    --redirect \
-    -d "${SELF_HOST}" \
-    || echo "WARN: certbot failed; check DNS resolution for ${SELF_HOST}"
+# ─── 7. Obtain LE cert via webroot ──────────────────────────────
+# Idempotent: certbot reports "Certificate not yet due for renewal"
+# on re-runs and exits 0.
+LE_DIR="/etc/letsencrypt/live/${SELF_HOST}"
+if [[ ! -f "${LE_DIR}/fullchain.pem" ]]; then
+    if ! certbot certonly --webroot -w /var/www/certbot \
+        --non-interactive --agree-tos \
+        --email "ops@pricoin.io" \
+        -d "${SELF_HOST}"; then
+        echo "ERROR: certbot failed; check DNS resolution + :80 reachability"
+        echo "       for ${SELF_HOST}, then re-run this installer."
+        exit 1
+    fi
+fi
+
+# ─── 8. nginx vhost: phase 2 (full HTTPS reverse proxy) ─────────
+sed "s|RELAY_HOSTNAME_HERE|${SELF_HOST}|g" \
+    "${DIR}/nginx-relay.conf" > /etc/nginx/sites-available/pricoin-relay
+nginx -t
 systemctl reload nginx
 
 # ─── 8. Start relay + stream daemons ─────────────────────────────
