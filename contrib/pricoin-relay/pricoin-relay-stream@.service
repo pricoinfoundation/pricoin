@@ -22,6 +22,11 @@ ExecStart=/usr/local/bin/strfry --config /etc/pricoin-relay/strfry.conf \
 Restart=always
 RestartSec=10
 
+# Match the relay daemon's file-descriptor headroom — strfry parses
+# the same config and applies setrlimit(NOFILE, relay.nofiles) on
+# startup, which fails if the unit's hard limit is below.
+LimitNOFILE=131072
+
 # Sandboxing.
 NoNewPrivileges=yes
 ProtectSystem=strict
