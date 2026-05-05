@@ -267,7 +267,7 @@ bool PricoinNostrClient::publishOfferUri(const QString& uri,
     const QByteArray canon =
         CanonicalSerialize(kOfferKind, pubkey_hex, created_at, tags, uri);
     const uint256 id = Sha256(canon);
-    const QString id_hex = QString::fromStdString(id.GetHex());
+    const QString id_hex = QString::fromStdString(HexStr(id));
 
     // TEMP: surface the canonical bytes + computed id so we can
     // diff against the reference NIP-01 canonical when relays reject
@@ -353,7 +353,7 @@ bool PricoinNostrClient::publishDirectMessage(const QString& peer_xonly_hex,
     const QByteArray canon =
         CanonicalSerialize(kDmKind, my_pubkey_hex, created_at, tags, *content_or);
     const uint256 id = Sha256(canon);
-    const QString id_hex = QString::fromStdString(id.GetHex());
+    const QString id_hex = QString::fromStdString(HexStr(id));
 
     auto sig_or = m_model->wallet().signNostrEvent(id);
     if (!sig_or) {
@@ -425,7 +425,7 @@ bool PricoinNostrClient::verifyEvent(const QString& pubkey_hex,
     // Recompute id and verify it matches.
     const QByteArray canon = canonical_serialized.toUtf8();
     const uint256 id = Sha256(canon);
-    if (QString::fromStdString(id.GetHex()) != id_hex) return false;
+    if (QString::fromStdString(HexStr(id)) != id_hex) return false;
 
     // Verify BIP340 sig.
     const auto pub_bytes = TryParseHex<unsigned char>(pubkey_hex.toStdString());
