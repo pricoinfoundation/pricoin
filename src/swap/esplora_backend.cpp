@@ -163,9 +163,41 @@ SSL_CTX* GetSSLContext()
         if (!ctx) return;
         // Refuse pre-TLS-1.2.
         SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-        // Use the system's default CA bundle. SSL_CTX_set_default_verify_paths
-        // honors SSL_CERT_FILE / SSL_CERT_DIR env vars for testing.
+        // Honor compile-time defaults + SSL_CERT_FILE / SSL_CERT_DIR
+        // env vars first.
         SSL_CTX_set_default_verify_paths(ctx);
+        // Fallback CA-bundle discovery: when OpenSSL was built
+        // statically (depends-based release binaries), the compiled-in
+        // CA paths point at the build host's filesystem layout — which
+        // typically doesn't exist on user machines. Without a usable
+        // verify store, every TLS handshake silently fails with what
+        // looks like a connection EOF. Try the common Linux/macOS
+        // bundle locations and load whichever exist; OpenSSL accumulates
+        // them into the same X509_STORE so multi-distro coverage is
+        // additive.
+        constexpr const char* kCandidatePaths[] = {
+            "/etc/ssl/certs/ca-certificates.crt",                   // Debian/Ubuntu
+            "/etc/pki/tls/certs/ca-bundle.crt",                     // RHEL/CentOS/Fedora
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",    // RHEL alt
+            "/etc/ssl/cert.pem",                                    // Alpine, macOS Homebrew
+            "/etc/ssl/ca-bundle.pem",                               // OpenSUSE
+            "/usr/local/etc/openssl@3/cert.pem",                    // macOS Homebrew openssl@3
+            "/usr/local/etc/openssl/cert.pem",                      // macOS Homebrew openssl
+            "/opt/homebrew/etc/openssl@3/cert.pem",                 // macOS Apple-Silicon Homebrew
+        };
+        constexpr const char* kCandidateDirs[] = {
+            "/etc/ssl/certs",                                       // Debian/Ubuntu hashed dir
+            "/etc/pki/tls/certs",                                   // RHEL hashed dir
+        };
+        for (const char* path : kCandidatePaths) {
+            // SSL_CTX_load_verify_locations is no-op when the file
+            // doesn't exist; ignore the return — we just want any
+            // load to succeed.
+            (void)SSL_CTX_load_verify_locations(ctx, path, nullptr);
+        }
+        for (const char* dir : kCandidateDirs) {
+            (void)SSL_CTX_load_verify_locations(ctx, nullptr, dir);
+        }
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
     });
     return ctx;
@@ -202,6 +234,15 @@ HTTPReply DoRequest(
         // SNI — required by virtually every modern HTTPS host (incl.
         // blockstream.info, mempool.space, litecoinspace.org).
         SSL_set_tlsext_host_name(ssl, url.host.c_str());
+        // ALPN advertise HTTP/1.1. Cloudflare (which fronts
+        // blockstream.info) silently RSTs TLS connections that
+        // don't negotiate ALPN — symptom: handshake completes,
+        // server immediately closes, libevent reports a bare EOF.
+        // Length-prefixed protocol list per RFC 7301: 0x08 'h'..'1'.
+        static const unsigned char kAlpn[] = {
+            0x08, 'h', 't', 't', 'p', '/', '1', '.', '1'
+        };
+        SSL_set_alpn_protos(ssl, kAlpn, sizeof(kAlpn));
         // Hostname verification via libcrypto's X509_VERIFY_PARAM_set1_host.
         if (auto* param = SSL_get0_param(ssl)) {
             X509_VERIFY_PARAM_set_hostflags(param, 0);
@@ -271,9 +312,31 @@ HTTPReply DoRequest(
     event_base_dispatch(base.get());
 
     if (reply.status == 0) {
-        const std::string err_str = (reply.error >= 0)
+        std::string err_str = (reply.error >= 0)
             ? http_errorstring(reply.error)
             : "no response";
+#ifdef HAVE_LIBEVENT_OPENSSL
+        // For HTTPS, libevent's evhttp callback mostly hands back the
+        // generic "EOF" code even when the underlying problem was a
+        // TLS handshake failure (verify error, hostname mismatch,
+        // unsupported protocol). Drain the per-thread OpenSSL error
+        // queue and append whatever was waiting — turns silent EOFs
+        // into actionable diagnostics like "certificate verify failed:
+        // unable to get local issuer certificate".
+        if (url.https) {
+            std::string ssl_diag;
+            unsigned long e;
+            while ((e = ERR_get_error()) != 0) {
+                char buf[256];
+                ERR_error_string_n(e, buf, sizeof(buf));
+                if (!ssl_diag.empty()) ssl_diag += "; ";
+                ssl_diag += buf;
+            }
+            if (!ssl_diag.empty()) {
+                err_str += " [openssl: " + ssl_diag + "]";
+            }
+        }
+#endif
         throw ChainBackendError(strprintf("%s error talking to %s:%u%s — %s",
             url.https ? "HTTPS" : "HTTP",
             url.host, url.port, full_path, err_str));
