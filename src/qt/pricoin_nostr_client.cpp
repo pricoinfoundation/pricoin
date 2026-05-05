@@ -269,18 +269,6 @@ bool PricoinNostrClient::publishOfferUri(const QString& uri,
     const uint256 id = Sha256(canon);
     const QString id_hex = QString::fromStdString(HexStr(id));
 
-    // TEMP: surface the canonical bytes + computed id so we can
-    // diff against the reference NIP-01 canonical when relays reject
-    // with "bad event id". Goes to stderr (the orderbook status pane
-    // overwrites multi-line content too quickly to read). Remove once
-    // we've nailed down the bug.
-    std::fprintf(stderr,
-        "[pricoin-nostr-debug] canon_len=%lld id=%s\n[pricoin-nostr-debug] canon=%s\n",
-        static_cast<long long>(canon.size()),
-        id_hex.toLatin1().constData(),
-        canon.constData());
-    std::fflush(stderr);
-
     auto sig_or = m_model->wallet().signNostrEvent(id);
     if (!sig_or) {
         Q_EMIT log(tr("Cannot sign Nostr event: %1")
