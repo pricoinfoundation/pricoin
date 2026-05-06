@@ -23,7 +23,7 @@
 // that txid and, when threshold is reached, calls the matching
 // SetX transition.
 //
-// For toy/regtest scope without a real foreign-chain HTTP client,
+// For experimental/regtest scope without a real foreign-chain HTTP client,
 // an external script (or the user) can drive transitions directly
 // via `pricoin_chainwatch_notify`, which acts as a manual
 // "confirmation observed" event.

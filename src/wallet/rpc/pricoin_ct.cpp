@@ -213,7 +213,7 @@ RPCMethod walletsendct()
 
             UniValue out{UniValue::VOBJ};
             out.pushKV("txid", res->ToString());
-            out.pushKV("dest_was_stealth", ::pricoin::stealth::Decode(dest_addr_str).has_value());
+            out.pushKV("dest_was_stealth", ::pricoin::stealth::ParseStealthAddress(dest_addr_str).has_value());
             return out;
         }
     };
@@ -413,8 +413,8 @@ util::Result<ResolvedDest> ResolveDest(
     const std::vector<unsigned char>& pinned_ephemeral_priv = {})
 {
     ResolvedDest d;
-    const auto stealth = ::pricoin::stealth::Decode(addr);
-    if (stealth) {
+    const auto parsed = ::pricoin::stealth::ParseStealthAddress(addr);
+    if (parsed) {
         CKey r;
         if (!pinned_ephemeral_priv.empty()) {
             if (pinned_ephemeral_priv.size() != 32) {
@@ -428,12 +428,16 @@ util::Result<ResolvedDest> ResolveDest(
         } else {
             r.MakeNewKey(/*fCompressed=*/true);
         }
-        CPubKey R = r.GetPubKey();
-        std::memcpy(d.R.data(), R.data(), 33);
-        auto S = ::pricoin::stealth::ECDHPoint(r, stealth->view);
+        // R = r·G for main, r·B_i for subaddress. The receiver scan
+        // formula S = a·R is identical in both cases.
+        const auto R_bytes = ::pricoin::stealth::ComputeStealthR(
+            r, parsed->address, parsed->kind);
+        if (!R_bytes) return util::Error{Untranslated("stealth R derivation failed")};
+        std::memcpy(d.R.data(), R_bytes->data(), 33);
+        auto S = ::pricoin::stealth::ECDHPoint(r, parsed->address.view);
         if (!S) return util::Error{Untranslated("stealth ECDH failed")};
         auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, output_index);
-        auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, stealth->spend);
+        auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, parsed->address.spend);
         if (!P) return util::Error{Untranslated("stealth onetime pubkey failed")};
         d.spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
         std::memcpy(d.otp.data(), P->data(), 33);
@@ -660,10 +664,15 @@ struct RecoveredOutput {
     CScript scriptPubKey;
     CKey one_time_priv; // derived spend key for this output
     pricoin::ringsig::Point key_image{}; // I = x · H_p(P) — for spent-by-KI lookup
+    // Subaddress this output paid: 0 == master, ≥1 == subaddress index.
+    // The scanner sets this from the matched B-point lookup; downstream
+    // RPCs surface it so exchanges can attribute deposits to users.
+    uint32_t subaddress_index{0};
 };
 
 std::optional<RecoveredOutput> TryRecoverCTOutput(
     const ::wallet::pricoin_stealth::Identity& id,
+    const ::wallet::pricoin_stealth::SubaddressLookup& lookup,
     const CTransaction& tx,
     uint32_t output_index)
 {
@@ -680,15 +689,30 @@ std::optional<RecoveredOutput> TryRecoverCTOutput(
     CPubKey R(std::span<const unsigned char>{out.tx_pubkey.data(), out.tx_pubkey.size()});
     if (!R.IsValid()) return std::nullopt;
 
+    // Validate the on-chain one_time_pubkey before using it to recover
+    // B_candidate. If P_observed doesn't hash to the script's WitnessV0
+    // keyhash, the output isn't a recognised stealth payment and we
+    // skip without doing further crypto work.
+    CPubKey P_observed(std::span<const unsigned char>{
+        out.one_time_pubkey.data(), out.one_time_pubkey.size()});
+    if (!P_observed.IsValid()) return std::nullopt;
+    const CScript expected_spk = GetScriptForDestination(WitnessV0KeyHash{P_observed.GetID()});
+    if (tx.vout[output_index].scriptPubKey != expected_spk) return std::nullopt;
+
     auto S = ::pricoin::stealth::ECDHPoint(id.view, R);
     if (!S) return std::nullopt;
     auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, output_index);
-    auto P = ::pricoin::stealth::DeriveOneTimePubkey(shared, id.public_address.spend);
-    if (!P) return std::nullopt;
-    const CScript expected_spk = GetScriptForDestination(WitnessV0KeyHash{P->GetID()});
-    if (tx.vout[output_index].scriptPubKey != expected_spk) return std::nullopt;
 
-    // Match! Rewind the rangeproof.
+    // Recover B_candidate = P_observed − shared·G and look it up in the
+    // wallet's known-B map. Master matches at index 0; subaddresses
+    // match at their own index. Miss => not addressed to us.
+    auto B_candidate = ::pricoin::stealth::RecoverSpendPointFromOneTime(P_observed, shared);
+    if (!B_candidate) return std::nullopt;
+    auto it = lookup.by_b_point.find(*B_candidate);
+    if (it == lookup.by_b_point.end()) return std::nullopt;
+    const ::wallet::pricoin_stealth::SubaddressLookupEntry& match = it->second;
+
+    // Rewind the rangeproof using the per-output nonce.
     auto nonce = ::pricoin::stealth::DeriveRangeProofNonce(*S, output_index);
     pricoin::ct::BlindingFactor nonce_arr{};
     std::memcpy(nonce_arr.data(), nonce.data(), 32);
@@ -700,13 +724,15 @@ std::optional<RecoveredOutput> TryRecoverCTOutput(
         nonce_arr);
     if (!rewound) return std::nullopt;
 
-    auto one_time_priv = ::pricoin::stealth::DeriveOneTimePriv(shared, id.spend);
+    // p = shared + b_match. b_match is master b for index 0, b_i for i ≥ 1
+    // — pre-derived in BuildSubaddressLookup.
+    auto one_time_priv = ::pricoin::stealth::DeriveOneTimePriv(shared, match.spend_priv);
     if (!one_time_priv) return std::nullopt;
 
     // Compute the key image for this output — needed to detect whether
     // it has been spent on chain (the KI would appear in the global set).
     pricoin::ringsig::Point P_bytes{};
-    std::memcpy(P_bytes.data(), P->data(), 33);
+    std::memcpy(P_bytes.data(), P_observed.data(), 33);
     pricoin::ringsig::Scalar x_bytes{};
     std::memcpy(x_bytes.data(), one_time_priv->begin(), 32);
     auto ki = pricoin::ringsig::ComputeKeyImage(P_bytes, x_bytes);
@@ -720,6 +746,7 @@ std::optional<RecoveredOutput> TryRecoverCTOutput(
         .scriptPubKey = tx.vout[output_index].scriptPubKey,
         .one_time_priv = std::move(*one_time_priv),
         .key_image = *ki,
+        .subaddress_index = match.index,
     };
 }
 
@@ -755,22 +782,28 @@ std::optional<RecoveredOutput> TryRecoverCTOutput(
 //   [num_entries:varint]       compact size
 //   [entry]*
 //
-// Each entry (85 bytes):
+// Each entry (89 bytes for v2):
 //   [txid:32][vout:u32 LE][output_index:u32 LE]
-//   [value:i64 LE][key_image:33][height:i32 LE]
+//   [value:i64 LE][key_image:33][height:i32 LE][subaddress_index:u32 LE]
 //
 // Reorg detection still fires on load — if the chain at last_scanned_height
 // no longer hashes to last_scanned_hash, the deserialised cache is
 // dropped and a full fresh scan runs. The persisted cache is best-effort:
 // missing it (corruption, wrong key, or wallet locked at scan time) just
 // means a one-time full rescan on next access.
-constexpr unsigned char kRecoveryCacheInnerVer = 0x01;
+//
+// v0x01: pre-subaddress format. Loaders skip v1 caches and force a full
+//        rescan — they predate the subaddress lookup, and re-deriving the
+//        index for old cached entries would require a chain re-walk anyway.
+// v0x02: adds subaddress_index per entry.
+constexpr unsigned char kRecoveryCacheInnerVer = 0x02;
 
 struct CachedRecovery {
     uint32_t output_index{0};
     CAmount value{0};
     pricoin::ringsig::Point key_image{};
     int height{0};
+    uint32_t subaddress_index{0};
 };
 struct CTRecoveryIndex {
     std::map<COutPoint, CachedRecovery> entries;
@@ -803,6 +836,7 @@ std::vector<unsigned char> SerializeRecoveryIndex(const CTRecoveryIndex& index)
         ds << static_cast<int64_t>(rec.value);
         ds.write(std::as_bytes(std::span{rec.key_image.data(), rec.key_image.size()}));
         ds << static_cast<int32_t>(rec.height);
+        ds << rec.subaddress_index;
     }
     return std::vector<unsigned char>(
         reinterpret_cast<const unsigned char*>(ds.data()),
@@ -840,6 +874,7 @@ bool DeserializeRecoveryIndex(std::span<const unsigned char> bytes,
             int32_t height;
             ds >> height;
             cr.height = height;
+            ds >> cr.subaddress_index;
             index.entries[outpoint] = cr;
         }
         return true;
@@ -945,6 +980,9 @@ CTRecoveryIndex& SyncRecoveryIndexLocked(CWallet& wallet, SyncStats* stats = nul
     // that case we can't scan, and the exception propagates to the RPC
     // caller (matches pre-existing pricoin_listownct semantics).
     const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+    // Build the subaddress lookup once per sync pass — cheap for
+    // master-only wallets and amortised across the block walk.
+    const auto subaddr_lookup = ::wallet::pricoin_stealth::BuildSubaddressLookup(wallet);
 
     int new_blocks = 0;
     for (int h = index.last_scanned_height + 1; h <= tip_height; ++h) {
@@ -955,14 +993,20 @@ CTRecoveryIndex& SyncRecoveryIndexLocked(CWallet& wallet, SyncStats* stats = nul
         for (const auto& tx_ref : block.vtx) {
             if (tx_ref->version != PRICOIN_CT_VERSION) continue;
             for (uint32_t i = 0; i < tx_ref->vout.size(); ++i) {
-                auto rec = TryRecoverCTOutput(id, *tx_ref, i);
+                auto rec = TryRecoverCTOutput(id, subaddr_lookup, *tx_ref, i);
                 if (!rec) continue;
                 CachedRecovery cr;
                 cr.output_index = rec->output_index;
                 cr.value = rec->value;
                 cr.key_image = rec->key_image;
                 cr.height = h;
+                cr.subaddress_index = rec->subaddress_index;
                 index.entries[COutPoint{tx_ref->GetHash(), rec->output_index}] = cr;
+                // Restore-mode gap discovery: a payment past the
+                // wallet's current ceiling bumps max_used_index so
+                // future scans (and the subaddress lookup) include it.
+                ::wallet::pricoin_stealth::NoteSubaddressDiscovered(
+                    wallet, rec->subaddress_index);
             }
         }
         index.last_scanned_height = h;
@@ -987,7 +1031,9 @@ RPCMethod pricoin_listownct()
     return RPCMethod{
         "pricoin_listownct",
         "Scan confirmed blocks (and the mempool) for confidential outputs addressed to this wallet's\n"
-        "stealth identity, recovering their hidden values via rangeproof rewind. Phase 5e demo.\n",
+        "stealth identity (master + any subaddresses), recovering their hidden values via rangeproof\n"
+        "rewind. Each row reports the subaddress index it paid (0 == master) and, for non-master\n"
+        "deposits, the encoded subaddress so callers can attribute funds without an extra lookup.\n",
         {
             {"startheight", RPCArg::Type::NUM, RPCArg::Default{0}, "Block height to start scanning from"},
         },
@@ -1004,6 +1050,10 @@ RPCMethod pricoin_listownct()
                             {RPCResult::Type::NUM, "vout", ""},
                             {RPCResult::Type::STR_AMOUNT, "value", "Recovered amount in PRIC"},
                             {RPCResult::Type::NUM, "height", "Block height (-1 if mempool)"},
+                            {RPCResult::Type::NUM, "subaddress_index",
+                                "Subaddress index that received this output (0 == master)"},
+                            {RPCResult::Type::STR, "subaddress",
+                                "Encoded subaddress (pricsub-prefixed); empty when subaddress_index == 0"},
                         }}}}
             }
         },
@@ -1033,6 +1083,10 @@ RPCMethod pricoin_listownct()
                 // spent (they're kept indefinitely as ring-decoy
                 // candidates). Filter by the global key-image set —
                 // an output is spent iff its KI has been committed.
+                // Used to encode subaddress strings for non-master rows.
+                // Building it once per RPC is fine — the master id derive
+                // is cached and subaddress derivation is sub-microsecond.
+                const auto& wid = ::wallet::pricoin_stealth::GetOrCreate(wallet);
                 for (const auto& [outpoint, rec] : index.entries) {
                     if (rec.height < startheight) continue;
                     if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
@@ -1042,6 +1096,16 @@ RPCMethod pricoin_listownct()
                     entry.pushKV("vout", (int)outpoint.n);
                     entry.pushKV("value", ValueFromAmount(rec.value));
                     entry.pushKV("height", rec.height);
+                    entry.pushKV("subaddress_index", (uint64_t)rec.subaddress_index);
+                    std::string sub_enc;
+                    if (rec.subaddress_index != 0) {
+                        if (auto sa = ::pricoin::stealth::DeriveSubaddressPublic(
+                                wid.view, wid.public_address.spend, rec.subaddress_index)) {
+                            sub_enc = ::pricoin::stealth::EncodeSubaddress(
+                                sa->public_address, sa->index);
+                        }
+                    }
+                    entry.pushKV("subaddress", sub_enc);
                     outputs.push_back(entry);
                 }
             }
@@ -1070,6 +1134,7 @@ RPCMethod pricoin_listownct()
 // stale entry — caller drops the cache and resyncs).
 std::optional<RecoveredOutput> RehydrateRecovery(
     const ::wallet::pricoin_stealth::Identity& id,
+    const ::wallet::pricoin_stealth::SubaddressLookup& lookup,
     interfaces::Chain& chain,
     const COutPoint& outpoint,
     int height)
@@ -1079,7 +1144,7 @@ std::optional<RecoveredOutput> RehydrateRecovery(
     if (!chain.findBlock(block_hash, interfaces::FoundBlock().data(block))) return std::nullopt;
     for (const auto& tx_ref : block.vtx) {
         if (tx_ref->GetHash() != outpoint.hash) continue;
-        return TryRecoverCTOutput(id, *tx_ref, outpoint.n);
+        return TryRecoverCTOutput(id, lookup, *tx_ref, outpoint.n);
     }
     return std::nullopt;
 }
@@ -1240,8 +1305,10 @@ RPCMethod walletsendct_ring()
             const int ring_size = request.params[3].isNull() ? 4 : request.params[3].getInt<int>();
             if (ring_size < 2) throw JSONRPCError(RPC_INVALID_PARAMETER, "ring_size must be >= 2");
 
-            const auto stealth_dest = ::pricoin::stealth::Decode(dest_addr_str);
-            if (!stealth_dest) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "dest_address must be a stealth address");
+            const auto parsed_dest = ::pricoin::stealth::ParseStealthAddress(dest_addr_str);
+            if (!parsed_dest) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "dest_address must be a stealth address");
+            const auto* stealth_dest = &parsed_dest->address;
+            const auto dest_kind = parsed_dest->kind;
 
             const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
             interfaces::Chain& chain = wallet.chain();
@@ -1269,7 +1336,8 @@ RPCMethod walletsendct_ring()
                 }
             }
             if (picked_height >= 0) {
-                picked = RehydrateRecovery(id, chain, picked_outpoint, picked_height);
+                const auto subaddr_lookup = ::wallet::pricoin_stealth::BuildSubaddressLookup(wallet);
+                picked = RehydrateRecovery(id, subaddr_lookup, chain, picked_outpoint, picked_height);
             }
             if (!picked) throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No recovered CT output of sufficient value");
 
@@ -1339,13 +1407,16 @@ RPCMethod walletsendct_ring()
             struct PendingOut {
                 const ::pricoin::stealth::StealthAddress* stealth;
                 CAmount amount;
+                ::pricoin::stealth::AddressKind kind;
             };
             std::vector<PendingOut> pending;
             pending.reserve(3);
-            pending.push_back({&*stealth_dest, dest_amount});
-            pending.push_back({&id.public_address, change_value});
+            pending.push_back({stealth_dest, dest_amount, dest_kind});
+            pending.push_back({&id.public_address, change_value,
+                               ::pricoin::stealth::AddressKind::Main});
             while (pending.size() < 3) {
-                pending.push_back({&id.public_address, 0});
+                pending.push_back({&id.public_address, 0,
+                                   ::pricoin::stealth::AddressKind::Main});
             }
             FastRandomContext shuffle_rng;
             std::shuffle(pending.begin(), pending.end(), shuffle_rng);
@@ -1363,10 +1434,12 @@ RPCMethod walletsendct_ring()
             outs.reserve(pending.size());
             for (size_t i = 0; i < pending.size(); ++i) {
                 CKey r; r.MakeNewKey(true);
-                CPubKey R = r.GetPubKey();
                 ResolvedOut ro;
                 ro.amount = pending[i].amount;
-                std::memcpy(ro.R.data(), R.data(), 33);
+                const auto R_bytes = ::pricoin::stealth::ComputeStealthR(
+                    r, *pending[i].stealth, pending[i].kind);
+                if (!R_bytes) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("stealth R derivation failed (output %u)", i));
+                std::memcpy(ro.R.data(), R_bytes->data(), 33);
                 auto S = ::pricoin::stealth::ECDHPoint(r, pending[i].stealth->view);
                 if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("stealth ECDH failed (output %u)", i));
                 auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, static_cast<uint32_t>(i));
@@ -1553,8 +1626,9 @@ RPCMethod walletsendct_from_ct()
 
             std::vector<PickedCT> picked_list;
             CAmount input_total = 0;
+            const auto subaddr_lookup = ::wallet::pricoin_stealth::BuildSubaddressLookup(wallet);
             for (const auto& cand : sorted) {
-                auto rehydrated = RehydrateRecovery(id, chain, cand.outpoint, cand.height);
+                auto rehydrated = RehydrateRecovery(id, subaddr_lookup, chain, cand.outpoint, cand.height);
                 if (!rehydrated) continue;  // stale cache entry; skip
                 input_total += rehydrated->value;
                 picked_list.push_back({std::move(*rehydrated), cand.outpoint});
@@ -1571,9 +1645,9 @@ RPCMethod walletsendct_from_ct()
             // SendConfidentialTxMultiImpl. Dest may be stealth (foreign) or
             // a plain transparent script; change and decoy are always
             // stealth-to-self.
-            const auto stealth_dest = ::pricoin::stealth::Decode(dest_addr_str);
+            const auto parsed_dest = ::pricoin::stealth::ParseStealthAddress(dest_addr_str);
             CScript transparent_dest_spk;
-            if (!stealth_dest) {
+            if (!parsed_dest) {
                 CTxDestination d = DecodeDestination(dest_addr_str);
                 if (!IsValidDestination(d)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid dest_address");
                 transparent_dest_spk = GetScriptForDestination(d);
@@ -1586,17 +1660,23 @@ RPCMethod walletsendct_from_ct()
                 const ::pricoin::stealth::StealthAddress* stealth;
                 CScript transparent_spk;
                 CAmount amount;
+                ::pricoin::stealth::AddressKind addr_kind;
             };
             std::vector<OutputSpec> pending;
             pending.reserve(3);
-            if (stealth_dest) {
-                pending.push_back({OutputSpec::Kind::StealthForeign, &*stealth_dest, {}, dest_amount});
+            if (parsed_dest) {
+                pending.push_back({OutputSpec::Kind::StealthForeign, &parsed_dest->address,
+                                   {}, dest_amount, parsed_dest->kind});
             } else {
-                pending.push_back({OutputSpec::Kind::Transparent, nullptr, transparent_dest_spk, dest_amount});
+                pending.push_back({OutputSpec::Kind::Transparent, nullptr,
+                                   transparent_dest_spk, dest_amount,
+                                   ::pricoin::stealth::AddressKind::Main});
             }
-            pending.push_back({OutputSpec::Kind::StealthSelf, &id.public_address, {}, change_value});
+            pending.push_back({OutputSpec::Kind::StealthSelf, &id.public_address, {},
+                               change_value, ::pricoin::stealth::AddressKind::Main});
             while (pending.size() < 3) {
-                pending.push_back({OutputSpec::Kind::StealthSelf, &id.public_address, {}, 0});
+                pending.push_back({OutputSpec::Kind::StealthSelf, &id.public_address, {},
+                                   0, ::pricoin::stealth::AddressKind::Main});
             }
             FastRandomContext shuffle_rng;
             std::shuffle(pending.begin(), pending.end(), shuffle_rng);
@@ -1621,8 +1701,10 @@ RPCMethod walletsendct_from_ct()
                     GetRandBytes(ro.nonce);
                 } else {
                     CKey r; r.MakeNewKey(true);
-                    CPubKey R = r.GetPubKey();
-                    std::memcpy(ro.R.data(), R.data(), 33);
+                    const auto R_bytes = ::pricoin::stealth::ComputeStealthR(
+                        r, *pending[i].stealth, pending[i].addr_kind);
+                    if (!R_bytes) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("stealth R derivation failed (output %u)", i));
+                    std::memcpy(ro.R.data(), R_bytes->data(), 33);
                     auto S = ::pricoin::stealth::ECDHPoint(r, pending[i].stealth->view);
                     if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("stealth ECDH failed (output %u)", i));
                     auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, static_cast<uint32_t>(i));
@@ -1773,6 +1855,181 @@ RPCMethod pricoin_getstealthaddress()
             out.pushKV("view_pubkey", HexStr(id.public_address.view));
             out.pushKV("spend_pubkey", HexStr(id.public_address.spend));
             return out;
+        }
+    };
+}
+
+namespace {
+UniValue SubaddressJson(const ::wallet::pricoin_stealth::Identity& id,
+                          uint32_t index, const std::string& label)
+{
+    UniValue obj{UniValue::VOBJ};
+    obj.pushKV("index", (uint64_t)index);
+    if (index == 0) {
+        obj.pushKV("address", ::pricoin::stealth::Encode(id.public_address));
+        obj.pushKV("view_pubkey", HexStr(id.public_address.view));
+        obj.pushKV("spend_pubkey", HexStr(id.public_address.spend));
+    } else {
+        auto sa = ::pricoin::stealth::DeriveSubaddressPublic(
+            id.view, id.public_address.spend, index);
+        if (sa) {
+            obj.pushKV("address",
+                ::pricoin::stealth::EncodeSubaddress(sa->public_address, sa->index));
+            obj.pushKV("view_pubkey",  HexStr(sa->public_address.view));
+            obj.pushKV("spend_pubkey", HexStr(sa->public_address.spend));
+        }
+    }
+    obj.pushKV("label", label);
+    return obj;
+}
+} // namespace
+
+RPCMethod pricoin_getnewsubaddress()
+{
+    return RPCMethod{
+        "pricoin_getnewsubaddress",
+        "Allocate a new subaddress index for this wallet. Each call returns a fresh\n"
+        "index ≥ 1; index 0 is reserved for the master stealth address. Encoded\n"
+        "addresses use the pricsub prefix and carry the index in the payload, so a\n"
+        "scanner can attribute incoming payments without an extra lookup.\n"
+        "\n"
+        "Use this when integrating exchange-style deposits: hand each user their own\n"
+        "subaddress, then attribute deposits via the `subaddress_index` field on\n"
+        "`pricoin_listownct` rows.\n",
+        {
+            {"label", RPCArg::Type::STR, RPCArg::Default{""}, "Optional label (utf-8) attached to this index"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM,     "index",        "Allocated index (≥1)"},
+                {RPCResult::Type::STR,     "address",      "Encoded subaddress (pricsub-prefixed base58check)"},
+                {RPCResult::Type::STR_HEX, "view_pubkey",  "Subaddress public view point A_i (33 bytes)"},
+                {RPCResult::Type::STR_HEX, "spend_pubkey", "Subaddress public spend point B_i (33 bytes)"},
+                {RPCResult::Type::STR,     "label",        "Label as supplied; empty if none"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("pricoin_getnewsubaddress", "\"customer-4815\"") +
+            HelpExampleCli("pricoin_getnewsubaddress", "")
+        },
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const std::string label = request.params[0].isNull() ? std::string{}
+                                                                  : request.params[0].get_str();
+            const auto sub = wallet::pricoin_stealth::AllocateNextSubaddress(*wallet_sp, label);
+            const auto& id = wallet::pricoin_stealth::GetOrCreate(*wallet_sp);
+            return SubaddressJson(id, sub.index, label);
+        }
+    };
+}
+
+RPCMethod pricoin_getsubaddress()
+{
+    return RPCMethod{
+        "pricoin_getsubaddress",
+        "Read-only: return the subaddress at the given index. Index 0 returns the\n"
+        "master stealth address. Indices > max_used_index are rejected — call\n"
+        "`pricoin_getnewsubaddress` to allocate.\n",
+        {
+            {"index", RPCArg::Type::NUM, RPCArg::Optional::NO, "Subaddress index (0 == master)"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM,     "index",        "Index"},
+                {RPCResult::Type::STR,     "address",      "Encoded address (pricstl for index 0, pricsub otherwise)"},
+                {RPCResult::Type::STR_HEX, "view_pubkey",  "Public view point (33 bytes)"},
+                {RPCResult::Type::STR_HEX, "spend_pubkey", "Public spend point (33 bytes)"},
+                {RPCResult::Type::STR,     "label",        "Label if set; empty otherwise"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_getsubaddress", "47")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const int64_t idx_signed = request.params[0].getInt<int64_t>();
+            if (idx_signed < 0 || idx_signed > std::numeric_limits<uint32_t>::max()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "index out of range");
+            }
+            const uint32_t idx = static_cast<uint32_t>(idx_signed);
+            const auto state = wallet::pricoin_stealth::LoadSubaddressState(*wallet_sp);
+            if (idx > state.max_used_index) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    strprintf("index %u not allocated (max_used=%u)", idx, state.max_used_index));
+            }
+            const auto& id = wallet::pricoin_stealth::GetOrCreate(*wallet_sp);
+            std::string label;
+            if (auto it = state.labels.find(idx); it != state.labels.end()) label = it->second;
+            return SubaddressJson(id, idx, label);
+        }
+    };
+}
+
+RPCMethod pricoin_listsubaddresses()
+{
+    return RPCMethod{
+        "pricoin_listsubaddresses",
+        "List every allocated subaddress (index 1 … max_used_index). The master\n"
+        "(index 0) is intentionally excluded — use `pricoin_getstealthaddress` for it.\n",
+        {},
+        RPCResult{
+            RPCResult::Type::ARR, "", "",
+            {
+                {RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::NUM, "index", ""},
+                        {RPCResult::Type::STR, "address", ""},
+                        {RPCResult::Type::STR_HEX, "view_pubkey", ""},
+                        {RPCResult::Type::STR_HEX, "spend_pubkey", ""},
+                        {RPCResult::Type::STR, "label", ""},
+                    }}
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_listsubaddresses", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const auto state = wallet::pricoin_stealth::LoadSubaddressState(*wallet_sp);
+            const auto& id = wallet::pricoin_stealth::GetOrCreate(*wallet_sp);
+            UniValue arr{UniValue::VARR};
+            for (uint32_t i = 1; i <= state.max_used_index; ++i) {
+                std::string label;
+                if (auto it = state.labels.find(i); it != state.labels.end()) label = it->second;
+                arr.push_back(SubaddressJson(id, i, label));
+            }
+            return arr;
+        }
+    };
+}
+
+RPCMethod pricoin_setsubaddresslabel()
+{
+    return RPCMethod{
+        "pricoin_setsubaddresslabel",
+        "Set or clear the label on an allocated subaddress index. Pass an empty\n"
+        "string to remove the label. Returns true on success.\n",
+        {
+            {"index", RPCArg::Type::NUM, RPCArg::Optional::NO, "Subaddress index (≥ 1)"},
+            {"label", RPCArg::Type::STR, RPCArg::Optional::NO, "Label text (empty to clear)"},
+        },
+        RPCResult{RPCResult::Type::BOOL, "", "True on success"},
+        RPCExamples{HelpExampleCli("pricoin_setsubaddresslabel", "47 \"customer-4815\"")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const int64_t idx_signed = request.params[0].getInt<int64_t>();
+            if (idx_signed <= 0 || idx_signed > std::numeric_limits<uint32_t>::max()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "index must be ≥ 1");
+            }
+            const uint32_t idx = static_cast<uint32_t>(idx_signed);
+            const std::string label = request.params[1].get_str();
+            const bool ok = wallet::pricoin_stealth::SetSubaddressLabel(
+                *wallet_sp, idx, label);
+            if (!ok) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                strprintf("index %u not allocated", idx));
+            return true;
         }
     };
 }
@@ -2505,8 +2762,10 @@ RPCMethod pricoin_jointspend_buildtx()
             pricoin::ct::SerializedPubKey33 joint_pubkey{};
             std::memcpy(joint_pubkey.data(), pub_bytes.data(), 33);
 
-            auto stealth_dest = ::pricoin::stealth::Decode(dest_addr_str);
-            if (!stealth_dest) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "dest_address must be a stealth address");
+            auto parsed_dest = ::pricoin::stealth::ParseStealthAddress(dest_addr_str);
+            if (!parsed_dest) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "dest_address must be a stealth address");
+            const auto* stealth_dest = &parsed_dest->address;
+            const auto dest_kind = parsed_dest->kind;
 
             // Sanity: prev coin's commitment must match Create(value, blind).
             const COutPoint joint_outpoint{Txid::FromUint256(*joint_txid_opt), joint_vout};
@@ -2614,12 +2873,15 @@ RPCMethod pricoin_jointspend_buildtx()
             struct PendingOut {
                 const ::pricoin::stealth::StealthAddress* stealth;
                 CAmount amount;
+                ::pricoin::stealth::AddressKind kind;
             };
             std::vector<PendingOut> pending;
             pending.reserve(3);
-            pending.push_back({&*stealth_dest, dest_amount});
-            pending.push_back({&id.public_address, change_value});
-            while (pending.size() < 3) pending.push_back({&id.public_address, 0});
+            pending.push_back({stealth_dest, dest_amount, dest_kind});
+            pending.push_back({&id.public_address, change_value,
+                               ::pricoin::stealth::AddressKind::Main});
+            while (pending.size() < 3) pending.push_back({&id.public_address, 0,
+                                                          ::pricoin::stealth::AddressKind::Main});
             FastRandomContext shuffle_rng;
             std::shuffle(pending.begin(), pending.end(), shuffle_rng);
 
@@ -2634,10 +2896,12 @@ RPCMethod pricoin_jointspend_buildtx()
             outs.reserve(pending.size());
             for (size_t i = 0; i < pending.size(); ++i) {
                 CKey r; r.MakeNewKey(true);
-                CPubKey R = r.GetPubKey();
                 ResolvedOut ro;
                 ro.amount = pending[i].amount;
-                std::memcpy(ro.R.data(), R.data(), 33);
+                const auto R_bytes = ::pricoin::stealth::ComputeStealthR(
+                    r, *pending[i].stealth, pending[i].kind);
+                if (!R_bytes) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth R derivation failed");
+                std::memcpy(ro.R.data(), R_bytes->data(), 33);
                 auto S = ::pricoin::stealth::ECDHPoint(r, pending[i].stealth->view);
                 if (!S) throw JSONRPCError(RPC_INTERNAL_ERROR, "stealth ECDH failed");
                 auto shared = ::pricoin::stealth::DeriveSharedSecret(*S, static_cast<uint32_t>(i));
@@ -7877,6 +8141,10 @@ RPCMethod pricoin_swapwatch_notify()
 } // namespace (close outer anonymous — balances open at 590; exports + helpers below are at namespace wallet level)
 
 RPCMethod pricoin_getstealthaddress_export() { return pricoin_getstealthaddress(); }
+RPCMethod pricoin_getnewsubaddress_export()    { return pricoin_getnewsubaddress(); }
+RPCMethod pricoin_getsubaddress_export()       { return pricoin_getsubaddress(); }
+RPCMethod pricoin_listsubaddresses_export()    { return pricoin_listsubaddresses(); }
+RPCMethod pricoin_setsubaddresslabel_export()  { return pricoin_setsubaddresslabel(); }
 RPCMethod pricoin_getstealthseed_export() { return pricoin_getstealthseed(); }
 RPCMethod pricoin_setstealthseed_export() { return pricoin_setstealthseed(); }
 RPCMethod pricoin_buildjointstealthaddress_export() { return pricoin_buildjointstealthaddress(); }
@@ -7980,8 +8248,9 @@ std::vector<PricoinCTRecovery> ScanTxForCTReceives(
     std::vector<PricoinCTRecovery> out;
     if (tx.version != PRICOIN_CT_VERSION) return out;
     const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+    const auto subaddr_lookup = ::wallet::pricoin_stealth::BuildSubaddressLookup(wallet);
     for (uint32_t i = 0; i < tx.vout.size(); ++i) {
-        auto rec = TryRecoverCTOutput(id, tx, i);
+        auto rec = TryRecoverCTOutput(id, subaddr_lookup, tx, i);
         if (!rec) continue;
         PricoinCTRecovery r;
         r.vout_index = rec->output_index;
@@ -8003,7 +8272,7 @@ std::vector<PricoinSwapClaimRecovery> ScanTxForSwapClaim(
     if (tx.ct_bundle.ring_inputs.empty()) return out;
 
     // Pull the snapshot of all swaps once. List is small (per-user,
-    // toy/regtest scope); cheap to iterate per tx.
+    // experimental/regtest scope); cheap to iterate per tx.
     std::vector<AdaptorSwap> swaps;
     if (List(wallet, swaps) != LookupResult::Ok) return out;
 

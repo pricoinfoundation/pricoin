@@ -305,14 +305,14 @@ struct AdaptorSwap {
 
         // Per-leg destination addresses (appended 2026-05-02). These
         // fields are required for new records; existing pre-format
-        // records will fail to deserialize. Toy/regtest scope —
+        // records will fail to deserialize. Experimental/regtest scope —
         // purge old swap records via a wallet reset if needed.
         READWRITE(obj.btc_alice_recipient_xonly_hex);
         READWRITE(obj.btc_bob_recipient_xonly_hex);
         READWRITE(obj.pric_alice_recipient_stealth);
         READWRITE(obj.pric_bob_recipient_stealth);
 
-        // Cooperative ring (appended 2026-05-04). Same toy/regtest
+        // Cooperative ring (appended 2026-05-04). Same experimental/regtest
         // scope caveat — old records will fail to deserialize.
         READWRITE(obj.pric_claim_ring);
     }

@@ -30,7 +30,7 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 set(CLIENT_NAME "Pricoin")
 set(CLIENT_VERSION_MAJOR 0)
 set(CLIENT_VERSION_MINOR 1)
-set(CLIENT_VERSION_BUILD 33)
+set(CLIENT_VERSION_BUILD 34)
 set(CLIENT_VERSION_RC 0)
 set(CLIENT_VERSION_IS_RELEASE "false")
 set(COPYRIGHT_YEAR "2026")
@@ -65,7 +65,7 @@ endif()
 
 set(COPYRIGHT_HOLDERS "The %s developers")
 set(COPYRIGHT_HOLDERS_FINAL "The ${CLIENT_NAME} developers")
-set(CLIENT_BUGREPORT "https://github.com/pricoin/pricoin/issues")
+set(CLIENT_BUGREPORT "https://github.com/pricoinfoundation/pricoin/issues")
 
 #=============================
 # Language setup

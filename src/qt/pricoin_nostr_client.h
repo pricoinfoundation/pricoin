@@ -77,6 +77,21 @@ public:
                          const QString& chain,        // "btc" | "ltc"
                          const QString& side);        // "buy" | "sell"
 
+    // Publish a cancellation tombstone for a previously-published
+    // offer. Uses the same kind=30030 NIP-33 replaceable slot
+    // (pubkey, kind, "d"=order_id), so subscribed peers see this
+    // event in place of the old offer. Tagged with ["x","cancelled"]
+    // and an empty content; receivers branch on the tag and call
+    // their local offerCancel for the matching order_id.
+    //
+    // Only the maker can do this — relays enforce that the event's
+    // pubkey matches the original event's pubkey, and our local
+    // signing uses the wallet's swap-identity key.
+    bool publishOfferCancel(const QString& order_id_hex,
+                              qint64 expiry_unix_sec,
+                              const QString& chain,
+                              const QString& side);
+
     // Publish a NIP-04 encrypted direct message to `peer_xonly_hex`.
     // The wallet derives the AES key via ECDH(my_swap_priv,
     // peer_xonly→even-y), encrypts `plaintext` with AES-256-CBC +
@@ -122,6 +137,10 @@ Q_SIGNALS:
     // has not yet imported. The orderbook page calls offerImport on
     // it and refreshes its view.
     void offerReceived(const QString& uri);
+    // Fired when a maker republishes their offer slot tagged
+    // ["x","cancelled"]. The orderbook page calls offerCancel on
+    // any local snapshot of the matching order_id.
+    void offerCancellationReceived(const QString& order_id_hex);
     // Fired for each VALIDATED inbound NIP-04 DM. `from_xonly_hex`
     // is the sender's xonly pubkey (32-byte hex). `plaintext` is
     // the decrypted content.

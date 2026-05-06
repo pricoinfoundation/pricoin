@@ -19,7 +19,7 @@
 namespace node {
 Warnings::Warnings()
 {
-    // Pricoin: pre-release banner intentionally suppressed. Toy/educational
+    // Pricoin: pre-release banner intentionally suppressed. Experimental
     // status is documented in the README; surfacing it as a top-of-window
     // warning makes the GUI feel like a beta build to end users without
     // adding any actionable information.

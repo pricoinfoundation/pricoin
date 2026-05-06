@@ -725,4 +725,272 @@ void Shutdown()
     g_identities.clear();
 }
 
+SubaddressLookup BuildSubaddressLookup(CWallet& wallet)
+{
+    SubaddressLookup out;
+    const auto& id = GetOrCreate(wallet);  // primes cache, may throw on locked
+
+    // Master entry — the existing behaviour. Index 0 is reserved for
+    // "the master identity" so callers can branch on (index == 0) to
+    // skip subaddress derivation.
+    ::pricoin::stealth::PointBytes master_B{};
+    std::memcpy(master_B.data(), id.public_address.spend.data(), 33);
+    out.by_b_point[master_B] = SubaddressLookupEntry{
+        .index = 0,
+        .spend_priv = id.spend,
+    };
+
+    // Hydrate persisted subaddress indices from the wallet DB plus a
+    // gap-limit window of unused indices. The gap window lets the scanner
+    // recognise payments past the current ceiling (BIP-44 pattern); if a
+    // hit lands in the gap, the wallet bumps max_used_index via
+    // NoteSubaddressDiscovered after the block walk.
+    const auto state = LoadSubaddressState(wallet);
+    const uint64_t high =
+        static_cast<uint64_t>(state.max_used_index) + kSubaddressGapLimit;
+    const uint32_t cap = (high > std::numeric_limits<uint32_t>::max())
+                            ? std::numeric_limits<uint32_t>::max()
+                            : static_cast<uint32_t>(high);
+    for (uint32_t i = 1; i <= cap; ++i) {
+        auto sub = ::pricoin::stealth::DeriveSubaddress(id.view, id.spend, i);
+        if (!sub) continue;  // cosmically rare scalar-invalid case; skip
+        ::pricoin::stealth::PointBytes B_i{};
+        std::memcpy(B_i.data(), sub->public_address.spend.data(), 33);
+        out.by_b_point[B_i] = SubaddressLookupEntry{
+            .index = i,
+            .spend_priv = sub->spend_priv,
+        };
+    }
+    return out;
+}
+
+namespace {
+
+// Subaddress state blob format (versioned, encrypted-at-rest via
+// EncryptWalletBlob). Singleton record under DBKeys::PRICOIN_SUBADDRESS_STATE.
+//   [ver:1=0x01][max_used_index:u32 LE]
+constexpr unsigned char kSubaddrStateVer = 0x01;
+
+// Per-label record: [ver:1=0x01][label_utf8:varbytes].
+constexpr unsigned char kSubaddrLabelVer = 0x01;
+
+struct StateCacheEntry {
+    SubaddressState state;
+    bool unload_wired{false};
+    btcsignals::scoped_connection unload_conn{btcsignals::connection{}};
+};
+Mutex g_subaddr_state_mutex;
+std::map<const CWallet*, StateCacheEntry> g_subaddr_state GUARDED_BY(g_subaddr_state_mutex);
+
+void U32LE(uint32_t v, unsigned char out[4])
+{
+    out[0] = v & 0xff; out[1] = (v >> 8) & 0xff;
+    out[2] = (v >> 16) & 0xff; out[3] = (v >> 24) & 0xff;
+}
+uint32_t U32LERead(const unsigned char in[4])
+{
+    return uint32_t(in[0])
+         | (uint32_t(in[1]) << 8)
+         | (uint32_t(in[2]) << 16)
+         | (uint32_t(in[3]) << 24);
+}
+
+bool DecodeStateBlob(const std::vector<unsigned char>& plain, SubaddressState& out)
+{
+    if (plain.size() != 5) return false;
+    if (plain[0] != kSubaddrStateVer) return false;
+    out.max_used_index = U32LERead(plain.data() + 1);
+    return true;
+}
+
+std::vector<unsigned char> EncodeStateBlob(const SubaddressState& s)
+{
+    std::vector<unsigned char> v(5);
+    v[0] = kSubaddrStateVer;
+    U32LE(s.max_used_index, v.data() + 1);
+    return v;
+}
+
+bool DecodeLabelBlob(const std::vector<unsigned char>& plain, std::string& label_out)
+{
+    if (plain.empty()) return false;
+    if (plain[0] != kSubaddrLabelVer) return false;
+    label_out.assign(reinterpret_cast<const char*>(plain.data() + 1),
+                     plain.size() - 1);
+    return true;
+}
+
+std::vector<unsigned char> EncodeLabelBlob(const std::string& label)
+{
+    std::vector<unsigned char> v;
+    v.reserve(1 + label.size());
+    v.push_back(kSubaddrLabelVer);
+    v.insert(v.end(), label.begin(), label.end());
+    return v;
+}
+
+// Load directly from the wallet DB (skipping the cache). Throws if
+// the wallet is encrypted+locked — labels are kept under at-rest
+// encryption, and we can't decode them otherwise.
+SubaddressState LoadFromDb(CWallet& wallet)
+{
+    SubaddressState out;
+    WalletBatch batch{wallet.GetDatabase()};
+
+    std::vector<unsigned char> blob;
+    if (batch.ReadPricoinSubaddressState(blob)) {
+        std::vector<unsigned char> plain;
+        if (DecryptWalletBlob(wallet, blob, plain)) {
+            DecodeStateBlob(plain, out);
+        }
+    }
+
+    std::map<uint32_t, std::vector<unsigned char>> labels;
+    if (batch.ReadAllPricoinSubaddressLabels(labels)) {
+        for (auto& [idx, lblob] : labels) {
+            std::vector<unsigned char> plain;
+            std::string label;
+            if (DecryptWalletBlob(wallet, lblob, plain) &&
+                DecodeLabelBlob(plain, label)) {
+                out.labels[idx] = std::move(label);
+                if (idx > out.max_used_index) {
+                    // Restore-mode: a label record exists past the
+                    // recorded ceiling. Defensive consistency — bump
+                    // max_used_index so subsequent scans/RPCs see it.
+                    out.max_used_index = idx;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// Cached version. Returns a snapshot so the caller can iterate without
+// holding the mutex.
+SubaddressState LoadStateCached(CWallet& wallet)
+{
+    {
+        LOCK(g_subaddr_state_mutex);
+        auto it = g_subaddr_state.find(&wallet);
+        if (it != g_subaddr_state.end()) return it->second.state;
+    }
+
+    SubaddressState fresh = LoadFromDb(wallet);
+
+    LOCK(g_subaddr_state_mutex);
+    auto& entry = g_subaddr_state[&wallet];
+    entry.state = fresh;
+    if (!entry.unload_wired) {
+        CWallet* wallet_ptr = &wallet;
+        entry.unload_conn = wallet.NotifyUnload.connect([wallet_ptr]() {
+            LOCK(g_subaddr_state_mutex);
+            g_subaddr_state.erase(wallet_ptr);
+        });
+        entry.unload_wired = true;
+    }
+    return entry.state;
+}
+
+void OverwriteStateCache(CWallet& wallet, const SubaddressState& s)
+{
+    LOCK(g_subaddr_state_mutex);
+    auto& entry = g_subaddr_state[&wallet];
+    entry.state = s;
+    if (!entry.unload_wired) {
+        CWallet* wallet_ptr = &wallet;
+        entry.unload_conn = wallet.NotifyUnload.connect([wallet_ptr]() {
+            LOCK(g_subaddr_state_mutex);
+            g_subaddr_state.erase(wallet_ptr);
+        });
+        entry.unload_wired = true;
+    }
+}
+
+} // namespace
+
+SubaddressState LoadSubaddressState(CWallet& wallet)
+{
+    return LoadStateCached(wallet);
+}
+
+::pricoin::stealth::Subaddress AllocateNextSubaddress(
+    CWallet& wallet, const std::string& label)
+{
+    // Need the spend scalar to derive b_i — fail fast if locked.
+    const auto& id = GetOrCreate(wallet);
+    SubaddressState st = LoadStateCached(wallet);
+    const uint32_t new_index = st.max_used_index + 1;
+    if (new_index == 0) {  // overflow; 4 billion subaddresses is a hard ceiling
+        throw std::runtime_error("subaddress index overflow");
+    }
+    auto sub = ::pricoin::stealth::DeriveSubaddress(id.view, id.spend, new_index);
+    if (!sub) throw std::runtime_error("subaddress derivation failed");
+
+    WalletBatch batch{wallet.GetDatabase()};
+    SubaddressState updated = st;
+    updated.max_used_index = new_index;
+
+    std::vector<unsigned char> state_plain = EncodeStateBlob(updated);
+    std::vector<unsigned char> state_blob;
+    if (!EncryptWalletBlob(wallet, state_plain, state_blob) ||
+        !batch.WritePricoinSubaddressState(state_blob)) {
+        throw std::runtime_error("failed to persist subaddress state");
+    }
+
+    if (!label.empty()) {
+        std::vector<unsigned char> label_plain = EncodeLabelBlob(label);
+        std::vector<unsigned char> label_blob;
+        if (!EncryptWalletBlob(wallet, label_plain, label_blob) ||
+            !batch.WritePricoinSubaddressLabel(new_index, label_blob)) {
+            throw std::runtime_error("failed to persist subaddress label");
+        }
+        updated.labels[new_index] = label;
+    }
+
+    OverwriteStateCache(wallet, updated);
+    return *sub;
+}
+
+bool SetSubaddressLabel(CWallet& wallet, uint32_t index, const std::string& label)
+{
+    if (index == 0) return false;
+    SubaddressState st = LoadStateCached(wallet);
+    if (index > st.max_used_index) return false;
+
+    WalletBatch batch{wallet.GetDatabase()};
+    if (label.empty()) {
+        // Treat empty as erase to keep the API simple.
+        batch.ErasePricoinSubaddressLabel(index);
+        st.labels.erase(index);
+    } else {
+        std::vector<unsigned char> plain = EncodeLabelBlob(label);
+        std::vector<unsigned char> blob;
+        if (!EncryptWalletBlob(wallet, plain, blob)) return false;
+        if (!batch.WritePricoinSubaddressLabel(index, blob)) return false;
+        st.labels[index] = label;
+    }
+    OverwriteStateCache(wallet, st);
+    return true;
+}
+
+bool EraseSubaddressLabel(CWallet& wallet, uint32_t index)
+{
+    return SetSubaddressLabel(wallet, index, "");
+}
+
+void NoteSubaddressDiscovered(CWallet& wallet, uint32_t discovered)
+{
+    SubaddressState st = LoadStateCached(wallet);
+    if (discovered <= st.max_used_index) return;  // idempotent
+    st.max_used_index = discovered;
+
+    WalletBatch batch{wallet.GetDatabase()};
+    std::vector<unsigned char> plain = EncodeStateBlob(st);
+    std::vector<unsigned char> blob;
+    if (EncryptWalletBlob(wallet, plain, blob)) {
+        batch.WritePricoinSubaddressState(blob);
+    }
+    OverwriteStateCache(wallet, st);
+}
+
 } // namespace wallet::pricoin_stealth

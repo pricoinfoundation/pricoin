@@ -426,7 +426,7 @@ void ChainWatcher::Tick()
 // — but this only works for txs the wallet knows about. For txs
 // it doesn't, we'd need an indexer.
 //
-// Toy/regtest scope: the watcher polls txs the wallet itself
+// Experimental/regtest scope: the watcher polls txs the wallet itself
 // broadcasts (PRIC claim/refund) so they're in mapWallet. For the
 // foreign leg, we go through IForeignChainClient. PRIC lookups
 // for txs the wallet didn't broadcast aren't supported in this

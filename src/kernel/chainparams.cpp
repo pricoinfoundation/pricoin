@@ -154,7 +154,7 @@ public:
         // the maximum-permissive limit (regtest-style `7fff…`) so the genesis
         // can be mined cheaply and difficulty retargeting can pull nBits up
         // from there as real hashrate arrives. This is a deliberate launch
-        // choice for a toy/educational fork — Bitcoin-mainnet's much tighter
+        // choice for an experimental fork — Bitcoin-mainnet's much tighter
         // limit (`00000000ffff…`) wouldn't allow the easy launch nBits.
         consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 43200; // 12 hours (Pricoin: 288 blocks per retarget at 150s spacing)

@@ -6,6 +6,7 @@
 #define BITCOIN_QT_PRICOINORDERBOOKPAGE_H
 
 #include <QHash>
+#include <QSet>
 #include <QString>
 #include <QWidget>
 
@@ -73,6 +74,7 @@ private Q_SLOTS:
     void onRelaySettingsClicked();
     void onStartSwapClicked();
     void onNostrOfferReceived(const QString& uri);
+    void onNostrOfferCancellationReceived(const QString& order_id_hex);
     void onNostrDmReceived(const QString& from_xonly_hex, const QString& plaintext);
     void onNostrDmSent(const QString& dm_id, const QString& peer_xonly_hex);
     void onNostrDmAcked(const QString& dm_id, const QString& peer_xonly_hex);
@@ -120,7 +122,22 @@ private:
     PricoinNostrClient* m_nostr{nullptr};
     int                 m_connected_relay_count{0};
 
+    // Local orders that have been created/cancelled while no relay
+    // was connected. Drained from onNostrRelayStatus when at least
+    // one relay comes up. Stores the order_id; on drain we re-read
+    // the order's current status from the wallet, so a record that
+    // was created and then immediately cancelled while offline still
+    // gets the cancellation published (not the now-stale create).
+    QSet<QString>       m_pending_publish_offers;
+    QSet<QString>       m_pending_publish_cancels;
+
     void rebuildNostrClient();
+    // Publish helpers used by onCreateClicked / onCancelClicked.
+    // If at least one relay is connected, push immediately;
+    // otherwise queue for drain on relayStatusChanged → connected.
+    void publishOrQueueOffer(const std::string& order_id);
+    void publishOrQueueCancel(const std::string& order_id);
+    void drainPendingPublishes();
 
     // Cached snapshots indexed parallel to table rows so we can map
     // a selected row back to the underlying order_id without

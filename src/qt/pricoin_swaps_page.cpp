@@ -447,7 +447,7 @@ void PricoinSwapsPage::onAdvanceClicked()
         // stealth address, then T_G + T_H + DLEQ proof in one shot.
         // The chosen ephemeral pubkey R = r·G is surfaced so the
         // user can wire it into the eventual walletsendct funding
-        // call (toy scope — the funding RPC currently doesn't accept
+        // call (experimental scope — the funding RPC currently doesn't accept
         // a pinned ephemeral; if it picks a different one, the
         // on-chain P_pi will diverge from the adaptor's binding and
         // the swap will fail at sig time. Track in the swap notes.)

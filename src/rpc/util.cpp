@@ -1035,7 +1035,15 @@ void RPCResult::ToSections(Sections& sections, const OuterType outer_type, const
         return;
     }
     case Type::ANY: {
-        NONFATAL_UNREACHABLE(); // Only for testing
+        // Pricoin: several RPCs (swap session/ceremony/nonce/swap records)
+        // declare their result as ANY because the JSON shape is composed
+        // dynamically. Upstream Bitcoin Core treats ANY as a test-only
+        // sentinel and aborts here — that turned `help <cmd>` into a
+        // non-fatal-unreachable assertion. Render it as an opaque value
+        // with the description, matching how line ~617 already skips ANY
+        // when generating the schema.
+        sections.PushSection({indent + maybe_key + "value" + maybe_separator, Description("json value")});
+        return;
     }
     case Type::NONE: {
         sections.PushSection({indent + "null" + maybe_separator, Description("json null")});

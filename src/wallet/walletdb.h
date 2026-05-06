@@ -89,6 +89,8 @@ extern const std::string POOL;
 extern const std::string PRICOIN_STEALTH;
 extern const std::string PRICOIN_STEALTH_SEED;
 extern const std::string PRICOIN_RECOVERY_CACHE;
+extern const std::string PRICOIN_SUBADDRESS_STATE;
+extern const std::string PRICOIN_SUBADDRESS_LABEL;
 // Atomic-swap stage 2b — per-wallet records tracking the lifecycle
 // of cooperative-CLSAG signing sessions. Multi-record per wallet,
 // keyed by uint256 session_id. Format: encrypted blob via the
@@ -331,6 +333,20 @@ public:
     bool WritePricoinRecoveryCache(const std::vector<unsigned char>& blob);
     bool ReadPricoinRecoveryCache(std::vector<unsigned char>& blob);
     bool ErasePricoinRecoveryCache();
+    // Pricoin subaddress state. Two record kinds:
+    //   * pct_subaddr_state — singleton holding the highest allocated
+    //     subaddress index (max_used_index). Restore-mode gap scans
+    //     extend this when payments are observed past the current ceiling.
+    //   * pct_subaddr_label, <index> — per-index label string. Optional;
+    //     missing label simply means the index has no human-friendly name.
+    bool WritePricoinSubaddressState(const std::vector<unsigned char>& blob);
+    bool ReadPricoinSubaddressState(std::vector<unsigned char>& blob);
+    bool ErasePricoinSubaddressState();
+    bool WritePricoinSubaddressLabel(uint32_t index,
+                                       const std::vector<unsigned char>& blob);
+    bool ErasePricoinSubaddressLabel(uint32_t index);
+    bool ReadAllPricoinSubaddressLabels(
+        std::map<uint32_t, std::vector<unsigned char>>& out);
     // Per-session swap records. Multi-keyed by uint256 session_id.
     bool WritePricoinSwapSession(const uint256& session_id,
                                  const std::vector<unsigned char>& blob);

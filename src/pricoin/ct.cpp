@@ -16,6 +16,7 @@
 #include <pricoin/joint_ringsig.h>
 #include <pricoin/joint_stealth.h>
 #include <pricoin/ringsig.h>
+#include <pricoin/stealth.h>
 #include <pricoin/btc_musig2_nonce_policy.h>
 #include <pricoin/clsag_nonce_policy.h>
 #include <swap/atomic_swap_e2e_test.h>
@@ -464,6 +465,12 @@ void RunSelfTest(const SelfTestProgressFn& progress)
     }
     LogInfo("Pricoin CT tx round-trip: version=%u tx serialized=%u bytes",
             parsed_tx.version, ::GetSerializeSize(TX_NO_WITNESS(parsed_tx)));
+
+    // Stealth subaddress derivation (per-index identity from the master
+    // (a, b)). Cheap to run alongside the rest of the boot tests.
+    step("Stealth subaddresses");
+    ::pricoin::stealth::RunSubaddressSelfTest();
+    LogInfo("Pricoin stealth subaddress self-test passed");
 
     // Phase 4a — exercise the CLSAG ring-signature primitives.
     step("CLSAG single-layer");

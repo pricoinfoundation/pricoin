@@ -380,7 +380,7 @@ public:
     //!
     //! Used by the Bob T_H auto-derive helper to obtain P_pi
     //! without manually entering it. The ephemeral priv can be
-    //! freshly generated (toy scope; the same ephemeral must be
+    //! freshly generated (experimental scope; the same ephemeral must be
     //! used by walletsendct when funding to keep the on-chain
     //! P_pi consistent with the adaptor materials).
     //!

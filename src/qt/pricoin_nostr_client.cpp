@@ -310,6 +310,76 @@ bool PricoinNostrClient::publishOfferUri(const QString& uri,
     return sent > 0;
 }
 
+bool PricoinNostrClient::publishOfferCancel(const QString& order_id_hex,
+                                              qint64 expiry_unix_sec,
+                                              const QString& chain,
+                                              const QString& side)
+{
+    if (!m_model) return false;
+    const std::string xonly = m_model->wallet().getSwapIdentityXOnlyHex();
+    if (xonly.empty()) {
+        Q_EMIT log(tr("Cannot publish cancel: swap-identity unavailable (wallet locked?)"));
+        return false;
+    }
+    const QString pubkey_hex = QString::fromStdString(xonly);
+    const qint64 created_at = QDateTime::currentSecsSinceEpoch();
+
+    // Same NIP-33 slot as the offer (pubkey, kind, "d"=order_id) so
+    // this event replaces the offer in subscribed peers' caches.
+    QList<QStringList> tags;
+    tags.append({QStringLiteral("d"), order_id_hex});
+    tags.append({QStringLiteral("expiration"), QString::number(expiry_unix_sec)});
+    tags.append({QStringLiteral("c"), chain});
+    tags.append({QStringLiteral("s"), side});
+    tags.append({QStringLiteral("x"), QStringLiteral("cancelled")});
+
+    const QString content;
+    const QByteArray canon =
+        CanonicalSerialize(kOfferKind, pubkey_hex, created_at, tags, content);
+    const uint256 id = Sha256(canon);
+    const QString id_hex = QString::fromStdString(HexStr(id));
+
+    auto sig_or = m_model->wallet().signNostrEvent(id);
+    if (!sig_or) {
+        Q_EMIT log(tr("Cannot sign cancel event: %1")
+            .arg(QString::fromStdString(util::ErrorString(sig_or).original)));
+        return false;
+    }
+
+    QJsonObject ev;
+    ev.insert("id",         id_hex);
+    ev.insert("pubkey",     pubkey_hex);
+    ev.insert("created_at", static_cast<double>(created_at));
+    ev.insert("kind",       kOfferKind);
+    QJsonArray tags_json;
+    for (const auto& t : tags) {
+        QJsonArray a;
+        for (const auto& v : t) a.append(v);
+        tags_json.append(a);
+    }
+    ev.insert("tags",       tags_json);
+    ev.insert("content",    content);
+    ev.insert("sig",        QString::fromStdString(*sig_or));
+
+    QJsonArray msg;
+    msg.append(QStringLiteral("EVENT"));
+    msg.append(ev);
+    const QString frame = QString::fromUtf8(
+        QJsonDocument(msg).toJson(QJsonDocument::Compact));
+
+    int sent = 0;
+    for (auto it = m_socket_by_url.constBegin();
+         it != m_socket_by_url.constEnd(); ++it) {
+        QWebSocket* sock = it.value();
+        if (sock->state() != QAbstractSocket::ConnectedState) continue;
+        sock->sendTextMessage(frame);
+        ++sent;
+    }
+    Q_EMIT log(tr("Published cancellation for offer %1 to %2 relay(s).")
+        .arg(order_id_hex.left(12) + "…").arg(sent));
+    return sent > 0;
+}
+
 bool PricoinNostrClient::publishDirectMessage(const QString& peer_xonly_hex,
                                                 const QString& plaintext)
 {
@@ -508,7 +578,30 @@ void PricoinNostrClient::onTextMessage(const QString& message)
 
         m_seen_event_ids.insert(id_hex);
         if (kind == kOfferKind) {
-            Q_EMIT offerReceived(content);
+            // Branch on cancellation tombstone. Cancellation events
+            // share the NIP-33 slot of the original offer, so the
+            // relay has already replaced the prior event for new
+            // subscribers — but peers that imported the offer
+            // before cancellation need an explicit signal to mark
+            // their local snapshot cancelled.
+            QString cancelled_order_id;
+            for (const auto& t : tags) {
+                if (t.size() >= 2 && t[0] == QStringLiteral("x") &&
+                    t[1] == QStringLiteral("cancelled")) {
+                    for (const auto& t2 : tags) {
+                        if (t2.size() >= 2 && t2[0] == QStringLiteral("d")) {
+                            cancelled_order_id = t2[1];
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            if (!cancelled_order_id.isEmpty()) {
+                Q_EMIT offerCancellationReceived(cancelled_order_id);
+            } else {
+                Q_EMIT offerReceived(content);
+            }
         } else {
             // kind=4 NIP-04 DM. Decrypt with the wallet's NIP-04
             // shared key for the sender. If the relay was loose

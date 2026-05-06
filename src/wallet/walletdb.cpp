@@ -52,6 +52,8 @@ const std::string POOL{"pool"};
 const std::string PRICOIN_STEALTH{"pct_stealth"};
 const std::string PRICOIN_STEALTH_SEED{"pct_stealth_seed"};
 const std::string PRICOIN_RECOVERY_CACHE{"pct_recovery_cache"};
+const std::string PRICOIN_SUBADDRESS_STATE{"pct_subaddr_state"};
+const std::string PRICOIN_SUBADDRESS_LABEL{"pct_subaddr_label"};
 const std::string PRICOIN_SWAP_SESSION{"pct_swap_session"};
 const std::string PRICOIN_SWAP_CEREMONY{"pct_swap_ceremony"};
 const std::string PRICOIN_CLSAG_NONCE{"pct_clsag_nonce"};
@@ -1298,6 +1300,57 @@ bool WalletBatch::ReadPricoinRecoveryCache(std::vector<unsigned char>& blob)
 bool WalletBatch::ErasePricoinRecoveryCache()
 {
     return EraseIC(DBKeys::PRICOIN_RECOVERY_CACHE);
+}
+
+bool WalletBatch::WritePricoinSubaddressState(const std::vector<unsigned char>& blob)
+{
+    return WriteIC(DBKeys::PRICOIN_SUBADDRESS_STATE, blob);
+}
+
+bool WalletBatch::ReadPricoinSubaddressState(std::vector<unsigned char>& blob)
+{
+    return m_batch->Read(DBKeys::PRICOIN_SUBADDRESS_STATE, blob);
+}
+
+bool WalletBatch::ErasePricoinSubaddressState()
+{
+    return EraseIC(DBKeys::PRICOIN_SUBADDRESS_STATE);
+}
+
+bool WalletBatch::WritePricoinSubaddressLabel(uint32_t index,
+                                                const std::vector<unsigned char>& blob)
+{
+    return WriteIC(std::make_pair(DBKeys::PRICOIN_SUBADDRESS_LABEL, index), blob);
+}
+
+bool WalletBatch::ErasePricoinSubaddressLabel(uint32_t index)
+{
+    return EraseIC(std::make_pair(DBKeys::PRICOIN_SUBADDRESS_LABEL, index));
+}
+
+bool WalletBatch::ReadAllPricoinSubaddressLabels(
+    std::map<uint32_t, std::vector<unsigned char>>& out)
+{
+    DataStream prefix;
+    prefix << DBKeys::PRICOIN_SUBADDRESS_LABEL;
+    std::unique_ptr<DatabaseCursor> cursor = m_batch->GetNewPrefixCursor(prefix);
+    if (!cursor) return false;
+    while (true) {
+        DataStream ssKey;
+        DataStream ssValue;
+        DatabaseCursor::Status status = cursor->Next(ssKey, ssValue);
+        if (status == DatabaseCursor::Status::DONE) break;
+        if (status == DatabaseCursor::Status::FAIL) return false;
+        std::string type;
+        ssKey >> type;
+        if (type != DBKeys::PRICOIN_SUBADDRESS_LABEL) continue;
+        uint32_t index;
+        ssKey >> index;
+        std::vector<unsigned char> blob;
+        ssValue >> blob;
+        out.emplace(index, std::move(blob));
+    }
+    return true;
 }
 
 bool WalletBatch::WritePricoinSwapSession(const uint256& session_id,

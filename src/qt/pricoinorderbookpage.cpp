@@ -562,6 +562,8 @@ void PricoinOrderbookPage::rebuildNostrClient()
             this, &PricoinOrderbookPage::onNostrLog);
     connect(m_nostr, &PricoinNostrClient::relayStatusChanged,
             this, &PricoinOrderbookPage::onNostrRelayStatus);
+    connect(m_nostr, &PricoinNostrClient::offerCancellationReceived,
+            this, &PricoinOrderbookPage::onNostrOfferCancellationReceived);
 }
 
 void PricoinOrderbookPage::onConnectRelaysClicked()
@@ -988,6 +990,76 @@ void PricoinOrderbookPage::onNostrOfferReceived(const QString& uri)
     setStatus(tr("Imported new offer from network."));
 }
 
+void PricoinOrderbookPage::onNostrOfferCancellationReceived(const QString& order_id_hex)
+{
+    if (!m_model) return;
+    const std::string oid = order_id_hex.toStdString();
+    const auto rec = m_model->wallet().offerGet(oid);
+    if (!rec) return; // never imported it; nothing to do
+    if (rec->origin == "local") return; // can't cancel our own via remote signal
+    if (rec->status == "cancelled") return; // already
+    auto r = m_model->wallet().offerCancel(oid);
+    if (!r) return;
+    refreshTable();
+    setStatus(tr("Counterparty cancelled offer %1.")
+        .arg(QString::fromStdString(oid).left(12) + "…"));
+}
+
+void PricoinOrderbookPage::publishOrQueueOffer(const std::string& order_id)
+{
+    if (!m_model) return;
+    if (!m_nostr || m_connected_relay_count == 0) {
+        m_pending_publish_offers.insert(QString::fromStdString(order_id));
+        setStatus(tr("Order created. Will publish to relays once connected."));
+        return;
+    }
+    const auto rec = m_model->wallet().offerGet(order_id);
+    if (!rec || rec->origin != "local" || rec->status != "active") return;
+    const std::string uri = m_model->wallet().offerExportUri(order_id);
+    if (uri.empty()) return;
+    const bool ok = m_nostr->publishOfferUri(
+        QString::fromStdString(uri),
+        QString::fromStdString(order_id),
+        rec->expiry_unix_sec,
+        QString::fromStdString(rec->foreign_chain),
+        QString::fromStdString(rec->side));
+    if (!ok) {
+        // Sender returned false: every relay was non-connected at send
+        // time even though the count said otherwise (race). Re-queue.
+        m_pending_publish_offers.insert(QString::fromStdString(order_id));
+    }
+}
+
+void PricoinOrderbookPage::publishOrQueueCancel(const std::string& order_id)
+{
+    if (!m_model) return;
+    if (!m_nostr || m_connected_relay_count == 0) {
+        m_pending_publish_cancels.insert(QString::fromStdString(order_id));
+        return;
+    }
+    const auto rec = m_model->wallet().offerGet(order_id);
+    if (!rec || rec->origin != "local") return;
+    const bool ok = m_nostr->publishOfferCancel(
+        QString::fromStdString(order_id),
+        rec->expiry_unix_sec,
+        QString::fromStdString(rec->foreign_chain),
+        QString::fromStdString(rec->side));
+    if (!ok) {
+        m_pending_publish_cancels.insert(QString::fromStdString(order_id));
+    }
+}
+
+void PricoinOrderbookPage::drainPendingPublishes()
+{
+    if (!m_nostr || m_connected_relay_count == 0) return;
+    // Snapshot + clear so retries (which re-add on failure) don't loop
+    // within a single drain pass.
+    const auto offers  = m_pending_publish_offers;  m_pending_publish_offers.clear();
+    const auto cancels = m_pending_publish_cancels; m_pending_publish_cancels.clear();
+    for (const auto& oid : offers)  publishOrQueueOffer(oid.toStdString());
+    for (const auto& oid : cancels) publishOrQueueCancel(oid.toStdString());
+}
+
 void PricoinOrderbookPage::onNostrDmSent(const QString& dm_id,
                                            const QString& peer_xonly_hex)
 {
@@ -1031,6 +1103,11 @@ void PricoinOrderbookPage::onNostrRelayStatus(const QString& url, bool connected
             tr("Relays: %1/%2 connected").arg(m_connected_relay_count).arg(total));
     }
     onSelectionChanged();
+    // First relay just came up — push any creations/cancels the user
+    // queued while offline.
+    if (connected && m_connected_relay_count >= 1) {
+        drainPendingPublishes();
+    }
 }
 
 void PricoinOrderbookPage::onRefreshClicked()
@@ -1056,8 +1133,11 @@ void PricoinOrderbookPage::onCreateClicked()
         return;
     }
     refreshTable();
-    setStatus(tr("Order created. URI copied to clipboard — share with counterparty."));
     QApplication::clipboard()->setText(QString::fromStdString(r.uri));
+    publishOrQueueOffer(r.record.order_id);
+    if (m_connected_relay_count > 0) {
+        setStatus(tr("Order created and published to relays. URI also copied to clipboard."));
+    }
 }
 
 void PricoinOrderbookPage::onImportClicked()
@@ -1084,6 +1164,9 @@ void PricoinOrderbookPage::onCancelClicked()
     if (!m_model) return;
     const std::string oid = selectedOrderId();
     if (oid.empty()) return;
+    const auto pre = m_model->wallet().offerGet(oid);
+    if (!pre) return;
+    const bool was_local = (pre->origin == "local");
     if (QMessageBox::question(this, tr("Cancel order"),
             tr("Cancel this order? This is terminal and cannot be undone."),
             QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) return;
@@ -1094,7 +1177,14 @@ void PricoinOrderbookPage::onCancelClicked()
         return;
     }
     refreshTable();
-    setStatus(tr("Cancelled."));
+    if (was_local) {
+        publishOrQueueCancel(oid);
+        setStatus(m_connected_relay_count > 0
+            ? tr("Cancelled and notified relays.")
+            : tr("Cancelled. Notification queued for next relay connect."));
+    } else {
+        setStatus(tr("Cancelled."));
+    }
 }
 
 void PricoinOrderbookPage::onCopyUriClicked()
