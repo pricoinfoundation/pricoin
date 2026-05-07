@@ -1014,6 +1014,7 @@ void PricoinOrderbookPage::onStartSwapClicked()
             .arg(QString::fromStdString(util::ErrorString(r).original)), true);
         return;
     }
+    const std::string created_swap_id = r->swap_id;
 
     // DM the counterparty so their wallet auto-creates the mirror
     // swap record. Without this, the counterparty has to fill out
@@ -1023,9 +1024,9 @@ void PricoinOrderbookPage::onStartSwapClicked()
     // in the background.
     //
     // The DM carries every field needed to reconstruct the swap on
-    // the other side, plus the local swap_id (purely informational
-    // — both sides generate their own random swap_id; the link is
-    // via counterparty_pub).
+    // the other side AND the matcher's swap_id — the receiver pins
+    // its mirror to that same id so subsequent coord DMs (abort,
+    // adaptor_setup) don't need a swap_id-mapping table.
     if (m_nostr && peer->maker_pubkey_hex.size() >= 66) {
         const QString peer_xonly = QString::fromStdString(
             peer->maker_pubkey_hex.substr(2));
@@ -1059,6 +1060,11 @@ void PricoinOrderbookPage::onStartSwapClicked()
             QString::fromStdString(oid));
         swap_dm.insert(QStringLiteral("their_order_id"),
             QString::fromStdString(peer->order_id));
+        // Shared swap_id so the receiver's mirror keys match locally
+        // — required for the abort/adaptor_setup coord DMs to find
+        // the right record on the receiving side.
+        swap_dm.insert(QStringLiteral("swap_id"),
+            QString::fromStdString(created_swap_id));
 
         const QString plaintext = QString::fromUtf8(
             QJsonDocument(swap_dm).toJson(QJsonDocument::Compact));
@@ -1517,6 +1523,11 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
             QStringLiteral("pric_alice_recipient_stealth")).toString().toStdString();
         ap.pric_bob_recipient_stealth = obj.value(
             QStringLiteral("pric_bob_recipient_stealth")).toString().toStdString();
+        // Pin the matcher's swap_id so both sides' records share the
+        // same key — required for cross-DM correlation in abort /
+        // adaptor_setup / future coord DMs.
+        ap.swap_id_hex = obj.value(
+            QStringLiteral("swap_id")).toString().toStdString();
 
         auto r = m_model->wallet().adaptorSwapCreate(ap);
         if (!r) {

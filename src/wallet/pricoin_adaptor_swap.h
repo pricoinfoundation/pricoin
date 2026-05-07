@@ -343,9 +343,13 @@ enum class LookupResult { Ok, NotFound, Locked };
 
 // ─── API ────────────────────────────────────────────────────────
 
-// Create a new swap record. Generates a fresh 32-byte swap_id.
-// The Setup state is initial; the caller subsequently advances
-// through the state machine via the SetX RPCs.
+// Create a new swap record. If `swap_id_pinned` is non-null and
+// non-zero, that id is used instead of generating a fresh one — used
+// by the receiver-side mirror create (the matcher's wallet sends its
+// swap_id in the swap_start DM so both sides key on the same id, with
+// no swap_id-mapping needed in subsequent coord DMs).
+// The Setup state is initial; the caller subsequently advances through
+// the state machine via the SetX RPCs.
 CreateResult Create(
     CWallet& wallet,
     Role role,
@@ -359,7 +363,8 @@ CreateResult Create(
     const std::string& btc_bob_recipient_xonly_hex,
     const std::string& pric_alice_recipient_stealth,
     const std::string& pric_bob_recipient_stealth,
-    AdaptorSwap& out);
+    AdaptorSwap& out,
+    const uint256* swap_id_pinned = nullptr);
 
 // Set adaptor materials. For Bob: provide t_secret + T_G + dleq.
 // For Alice: provide T_G + dleq (Bob's t_secret is not given to her).

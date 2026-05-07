@@ -280,6 +280,12 @@ public:
         std::string btc_bob_recipient_xonly_hex;
         std::string pric_alice_recipient_stealth;
         std::string pric_bob_recipient_stealth;
+        // Optional pre-allocated swap_id (32-byte hex). When non-empty,
+        // adaptorSwapCreate uses this instead of generating a random
+        // id. Lets the matcher's wallet ship a swap_id in the
+        // swap_start DM so the receiver's mirror swap shares the same
+        // id — eliminating the need for swap_id-mapping in coord DMs.
+        std::string swap_id_hex;
     };
 
     virtual std::vector<PricoinAdaptorSwapSnapshot> adaptorSwapList() = 0;

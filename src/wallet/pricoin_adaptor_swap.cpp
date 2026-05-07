@@ -145,7 +145,8 @@ CreateResult Create(
     const std::string& btc_bob_recipient_xonly_hex,
     const std::string& pric_alice_recipient_stealth,
     const std::string& pric_bob_recipient_stealth,
-    AdaptorSwap& out)
+    AdaptorSwap& out,
+    const uint256* swap_id_pinned)
 {
     if (!counterparty_pub.IsValid() || !counterparty_pub.IsCompressed()) {
         return CreateResult::InvalidCounterpartyPubkey;
@@ -159,7 +160,11 @@ CreateResult Create(
     if (!RequireUnlocked(wallet)) return CreateResult::Locked;
 
     AdaptorSwap s;
-    GetStrongRandBytes(s.swap_id);
+    if (swap_id_pinned && !swap_id_pinned->IsNull()) {
+        s.swap_id = *swap_id_pinned;
+    } else {
+        GetStrongRandBytes(s.swap_id);
+    }
     s.role = role;
     s.state = State::Setup;
     s.counterparty_pub = counterparty_pub;

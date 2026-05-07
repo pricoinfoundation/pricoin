@@ -492,6 +492,19 @@ public:
         else if (p.role == "bob") role = ::wallet::pricoin_adaptor_swap::Role::Bob;
         else return util::Error{Untranslated("role must be \"alice\" or \"bob\"")};
 
+        // Optional pinned swap_id (matcher pre-allocates and ships
+        // via swap_start DM so receiver's mirror keys match).
+        uint256 sid_pinned;
+        const uint256* sid_pinned_ptr = nullptr;
+        if (!p.swap_id_hex.empty()) {
+            const auto bytes = TryParseHex<unsigned char>(p.swap_id_hex);
+            if (!bytes || bytes->size() != 32) {
+                return util::Error{Untranslated("swap_id_hex must be 32-byte hex if present")};
+            }
+            std::copy(bytes->begin(), bytes->end(), sid_pinned.begin());
+            sid_pinned_ptr = &sid_pinned;
+        }
+
         ::wallet::pricoin_adaptor_swap::AdaptorSwap s;
         auto r = ::wallet::pricoin_adaptor_swap::Create(
             *m_wallet, role, cp, p.foreign_chain, p.foreign_amount_sat,
@@ -499,7 +512,7 @@ public:
             p.btc_alice_recipient_xonly_hex,
             p.btc_bob_recipient_xonly_hex,
             p.pric_alice_recipient_stealth,
-            p.pric_bob_recipient_stealth, s);
+            p.pric_bob_recipient_stealth, s, sid_pinned_ptr);
         using CR = ::wallet::pricoin_adaptor_swap::CreateResult;
         switch (r) {
         case CR::Ok: return ToSwapSnapshot(s);
