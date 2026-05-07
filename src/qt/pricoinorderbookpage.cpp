@@ -857,18 +857,47 @@ void PricoinOrderbookPage::onStartSwapClicked()
         ? m_model->wallet().getStealthAddress()
         : "";
 
+    // Resolve "my own" foreign-side recipient: the BTC P2TR xonly of
+    // the wallet's holding-wallet identity for this swap's foreign
+    // chain. Lazy-derived; identity persists per chain.
+    const QString my_btc_xonly = getMyBtcXOnly(
+        QString::fromStdString(mine->foreign_chain));
+
+    // Look up the peer's swap addresses if they've been received via
+    // DM (auto-exchanged at match time). Empty strings if not yet
+    // received — the user can still paste manually as a fallback.
+    PeerSwapAddrs peer_addrs;
+    {
+        auto it = m_peer_swap_addrs.find(QString::fromStdString(mine->order_id));
+        if (it != m_peer_swap_addrs.end()) peer_addrs = *it;
+    }
+    const QString peer_btc_xonly  = peer_addrs.btc_xonly;
+    const QString peer_pric_stlth = peer_addrs.pric_stealth;
+
     auto* btc_alice_rcpt = new QLineEdit(&dlg);
     btc_alice_rcpt->setPlaceholderText(tr("32-byte x-only — PRIC seller's BTC P2TR refund recipient"));
+    if (my_role == "alice" && !my_btc_xonly.isEmpty()) {
+        btc_alice_rcpt->setText(my_btc_xonly);
+    } else if (my_role == "bob" && !peer_btc_xonly.isEmpty()) {
+        btc_alice_rcpt->setText(peer_btc_xonly);
+    }
     form->addRow(tr("BTC refund (PRIC seller's xonly):"), btc_alice_rcpt);
 
     auto* btc_bob_rcpt = new QLineEdit(&dlg);
     btc_bob_rcpt->setPlaceholderText(tr("32-byte x-only — PRIC buyer's BTC P2TR claim recipient"));
+    if (my_role == "bob" && !my_btc_xonly.isEmpty()) {
+        btc_bob_rcpt->setText(my_btc_xonly);
+    } else if (my_role == "alice" && !peer_btc_xonly.isEmpty()) {
+        btc_bob_rcpt->setText(peer_btc_xonly);
+    }
     form->addRow(tr("BTC claim (PRIC buyer's xonly):"), btc_bob_rcpt);
 
     auto* pric_alice_rcpt = new QLineEdit(&dlg);
     pric_alice_rcpt->setPlaceholderText(tr("PRIC seller's stealth claim recipient"));
     if (my_role == "alice" && !my_stealth.empty()) {
         pric_alice_rcpt->setText(QString::fromStdString(my_stealth));
+    } else if (my_role == "bob" && !peer_pric_stlth.isEmpty()) {
+        pric_alice_rcpt->setText(peer_pric_stlth);
     }
     form->addRow(tr("PRIC claim (PRIC seller's stealth):"), pric_alice_rcpt);
 
@@ -876,6 +905,8 @@ void PricoinOrderbookPage::onStartSwapClicked()
     pric_bob_rcpt->setPlaceholderText(tr("PRIC buyer's stealth refund recipient"));
     if (my_role == "bob" && !my_stealth.empty()) {
         pric_bob_rcpt->setText(QString::fromStdString(my_stealth));
+    } else if (my_role == "alice" && !peer_pric_stlth.isEmpty()) {
+        pric_bob_rcpt->setText(peer_pric_stlth);
     }
     form->addRow(tr("PRIC refund (PRIC buyer's stealth):"), pric_bob_rcpt);
 
@@ -1268,6 +1299,14 @@ void PricoinOrderbookPage::onFindMatchesClicked()
                 dm_sent = 1;
             }
             m_next_dm_label.clear();  // belt-and-suspenders
+
+            // Swap-address auto-exchange: send my BTC xonly + PRIC stealth
+            // so the peer's Start-swap dialog opens fully populated.
+            // Foreign-chain is the matcher's own offer side.
+            const auto my_offer = m_model->wallet().offerGet(oid);
+            if (my_offer) {
+                sendSwapAddrs(oid, their_id, my_offer->foreign_chain);
+            }
         }
     }
     setStatus(tr("Matched %1 PRIC against %2… %3")
@@ -1294,7 +1333,8 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
     const bool is_match      = (type == QStringLiteral("pricoin:match/v1"));
     const bool is_unmatch    = (type == QStringLiteral("pricoin:unmatch/v1"));
     const bool is_swap_start = (type == QStringLiteral("pricoin:swap_start/v1"));
-    if (!is_match && !is_unmatch && !is_swap_start) return;
+    const bool is_swap_addrs = (type == QStringLiteral("pricoin:swap_addrs/v1"));
+    if (!is_match && !is_unmatch && !is_swap_start && !is_swap_addrs) return;
 
     // Sender's "my" = sender's order = our "their"; flip on receive.
     const std::string sender_oid =
@@ -1343,6 +1383,14 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
             .arg(QString::asprintf("%lld.%08lld",
                 static_cast<long long>(actual_pric / 100'000'000),
                 static_cast<long long>(actual_pric % 100'000'000))));
+
+        // Reciprocal swap-address exchange: my counterparty (the
+        // matcher) sent us their addresses; we now send ours back so
+        // both Start-swap dialogs can open fully populated.
+        const auto my_offer = m_model->wallet().offerGet(my_oid);
+        if (my_offer) {
+            sendSwapAddrs(my_oid, sender_oid, my_offer->foreign_chain);
+        }
     } else if (is_unmatch) {
         // Unmatch — release the local match so the order returns
         // to Active. offerUnmatch operates on a single order_id;
@@ -1416,6 +1464,18 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
         refreshTable();
         setStatus(tr("Counterparty started the swap; mirror record "
                       "created on this side. Switch to the Swaps tab."));
+    } else if (is_swap_addrs) {
+        // Peer sent their BTC P2TR xonly + PRIC stealth so our
+        // Start-swap dialog can pre-fill the four address fields.
+        // Stash keyed by our local order id so Start-swap can look it
+        // up.
+        PeerSwapAddrs pair;
+        pair.btc_xonly = obj.value(QStringLiteral("btc_xonly")).toString();
+        pair.pric_stealth = obj.value(QStringLiteral("pric_stealth")).toString();
+        if (pair.btc_xonly.isEmpty() || pair.pric_stealth.isEmpty()) return;
+        m_peer_swap_addrs[QString::fromStdString(my_oid)] = pair;
+        setStatus(tr("Counterparty sent swap addresses for order %1 — Start swap will be pre-filled.")
+            .arg(QString::fromStdString(my_oid).left(12) + "…"));
     }
 }
 
@@ -1491,4 +1551,81 @@ void PricoinOrderbookPage::onUnmatchClicked()
     }
     setStatus(dm_sent ? tr("Released. Counterparty notified.")
                       : tr("Released. (counterparty not notified — DM failed)"));
+}
+
+// ─── Swap-address auto-exchange helpers ──────────────────────────────
+//
+// At match time both clients DM each other their BTC P2TR xonly + PRIC
+// stealth address. The peer's pair lands in `m_peer_swap_addrs` keyed
+// by THE LOCAL ORDER ID it pertains to, so the Start-swap dialog can
+// pre-fill all four address fields without the user pasting anything.
+
+QString PricoinOrderbookPage::getMyBtcXOnly(const QString& chain) const
+{
+    if (!m_model) return {};
+    const QString wallet_name = m_model->getWalletName();
+    std::string uri;
+    if (!wallet_name.isEmpty()) {
+        uri = "/wallet/" + std::string(
+            QUrl::toPercentEncoding(wallet_name).constData());
+    }
+    UniValue p{UniValue::VARR};
+    p.push_back(chain.toStdString());
+    UniValue r;
+    try {
+        r = m_model->node().executeRpc("pricoin_btc_getaddress", p, uri);
+    } catch (const UniValue&) {
+        return {};
+    } catch (const std::exception&) {
+        return {};
+    }
+    if (!r.isObject() || !r.exists("xonly")) return {};
+    return QString::fromStdString(r["xonly"].get_str());
+}
+
+QString PricoinOrderbookPage::getMyPricStealth() const
+{
+    if (!m_model) return {};
+    const std::string s = m_model->wallet().getStealthAddress();
+    return QString::fromStdString(s);
+}
+
+void PricoinOrderbookPage::sendSwapAddrs(
+    const std::string& my_oid,
+    const std::string& peer_oid,
+    const std::string& foreign_chain)
+{
+    if (!m_nostr || !m_model) return;
+    const auto peer = m_model->wallet().offerGet(peer_oid);
+    if (!peer || peer->maker_pubkey_hex.size() < 66) return;
+    const QString peer_xonly = QString::fromStdString(
+        peer->maker_pubkey_hex.substr(2));
+
+    const QString my_btc_xonly = getMyBtcXOnly(
+        QString::fromStdString(foreign_chain));
+    const QString my_stealth   = getMyPricStealth();
+    if (my_btc_xonly.isEmpty() || my_stealth.isEmpty()) {
+        // Wallet probably locked, or holding-wallet identity not
+        // derivable. Skip — the Start-swap dialog will fall back to
+        // manual paste for the missing slots.
+        return;
+    }
+
+    QJsonObject msg;
+    msg.insert(QStringLiteral("type"),
+        QStringLiteral("pricoin:swap_addrs/v1"));
+    msg.insert(QStringLiteral("my_order_id"),
+        QString::fromStdString(my_oid));
+    msg.insert(QStringLiteral("their_order_id"),
+        QString::fromStdString(peer_oid));
+    msg.insert(QStringLiteral("foreign_chain"),
+        QString::fromStdString(foreign_chain));
+    msg.insert(QStringLiteral("btc_xonly"),    my_btc_xonly);
+    msg.insert(QStringLiteral("pric_stealth"), my_stealth);
+    const QString plaintext = QString::fromUtf8(
+        QJsonDocument(msg).toJson(QJsonDocument::Compact));
+    m_next_dm_label = tr("Swap-address exchange for order %1…")
+        .arg(QString::fromStdString(peer_oid).left(12));
+    m_nostr->publishDirectMessage(peer_xonly, plaintext);
+    m_next_dm_label.clear();
 }

@@ -131,6 +131,14 @@ private:
     QSet<QString>       m_pending_publish_offers;
     QSet<QString>       m_pending_publish_cancels;
 
+    // Counterparty's swap-side addresses, keyed by THE LOCAL ORDER ID
+    // they're pinned to. Populated when the swap_addrs DM lands;
+    // consumed when the user opens Start-swap so they don't have to
+    // paste the peer's BTC P2TR xonly + PRIC stealth manually. Both
+    // sides exchange these automatically right after a match.
+    struct PeerSwapAddrs { QString btc_xonly; QString pric_stealth; };
+    QHash<QString, PeerSwapAddrs> m_peer_swap_addrs;
+
     void rebuildNostrClient();
     // Publish helpers used by onCreateClicked / onCancelClicked.
     // If at least one relay is connected, push immediately;
@@ -138,6 +146,21 @@ private:
     void publishOrQueueOffer(const std::string& order_id);
     void publishOrQueueCancel(const std::string& order_id);
     void drainPendingPublishes();
+
+    // Wallet-derived helpers used by the Start-swap pre-fill path.
+    // Both pull from the loaded wallet via the existing RPC surface:
+    //   pricoin_btc_getaddress(chain) → {address, xonly, chain}
+    //   pricoin_getstealthaddress    → {address, view_pubkey, …}
+    // Returns empty on failure (locked wallet, RPC error, …).
+    QString getMyBtcXOnly(const QString& chain) const;
+    QString getMyPricStealth() const;
+
+    // Send the peer my BTC P2TR xonly + PRIC stealth so they can
+    // pre-fill their Start-swap dialog. Symmetrical: both sides call
+    // it right after a match. Idempotent.
+    void sendSwapAddrs(const std::string& my_oid,
+                        const std::string& peer_oid,
+                        const std::string& foreign_chain);
 
     // Cached snapshots indexed parallel to table rows so we can map
     // a selected row back to the underlying order_id without
