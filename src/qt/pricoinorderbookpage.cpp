@@ -220,6 +220,62 @@ private:
     QLineEdit* m_notes;
 };
 
+// Fetch the wallet's stealth identity as (view_pubkey, spend_pubkey)
+// hex pair. Empty pair on failure.
+struct MyStealthPubkeys { QString view_hex, spend_hex; };
+inline MyStealthPubkeys GetMyStealthPubkeys(WalletModel* wm)
+{
+    MyStealthPubkeys out;
+    if (!wm) return out;
+    const QString wallet_name = wm->getWalletName();
+    std::string uri;
+    if (!wallet_name.isEmpty()) {
+        uri = "/wallet/" + std::string(
+            QUrl::toPercentEncoding(wallet_name).constData());
+    }
+    UniValue empty_params{UniValue::VARR};
+    UniValue r;
+    try {
+        r = wm->node().executeRpc("pricoin_getstealthaddress", empty_params, uri);
+    } catch (const UniValue&) {
+        return out;
+    } catch (const std::exception&) {
+        return out;
+    }
+    if (!r.isObject()) return out;
+    if (r.exists("view_pubkey"))  out.view_hex  = QString::fromStdString(r["view_pubkey"].get_str());
+    if (r.exists("spend_pubkey")) out.spend_hex = QString::fromStdString(r["spend_pubkey"].get_str());
+    return out;
+}
+
+// Build the joint stealth address from (my privs + peer pubkeys).
+// Returns "" on RPC failure.
+inline QString BuildJointStealthAddr(WalletModel* wm,
+                                       const QString& peer_view_hex,
+                                       const QString& peer_spend_hex)
+{
+    if (!wm || peer_view_hex.isEmpty() || peer_spend_hex.isEmpty()) return {};
+    const QString wallet_name = wm->getWalletName();
+    std::string uri;
+    if (!wallet_name.isEmpty()) {
+        uri = "/wallet/" + std::string(
+            QUrl::toPercentEncoding(wallet_name).constData());
+    }
+    UniValue p{UniValue::VARR};
+    p.push_back(peer_view_hex.toStdString());
+    p.push_back(peer_spend_hex.toStdString());
+    UniValue r;
+    try {
+        r = wm->node().executeRpc("pricoin_buildjointstealthaddress", p, uri);
+    } catch (const UniValue&) {
+        return {};
+    } catch (const std::exception&) {
+        return {};
+    }
+    if (!r.isObject() || !r.exists("address")) return {};
+    return QString::fromStdString(r["address"].get_str());
+}
+
 } // namespace
 
 PricoinOrderbookPage::PricoinOrderbookPage(const PlatformStyle* platformStyle, QWidget* parent)
@@ -821,6 +877,14 @@ void PricoinOrderbookPage::onStartSwapClicked()
 
     auto* joint_edit = new QLineEdit(&dlg);
     joint_edit->setPlaceholderText(tr("output of pricoin_buildjointstealthaddress"));
+    // Pre-fill the joint stealth address if it was computed at
+    // swap_addrs DM-receive time (peer's view+spend pubkeys arrived).
+    {
+        auto it = m_peer_swap_addrs.find(QString::fromStdString(mine->order_id));
+        if (it != m_peer_swap_addrs.end() && !it->joint_address.isEmpty()) {
+            joint_edit->setText(it->joint_address);
+        }
+    }
     auto* joint_row = new QHBoxLayout();
     joint_row->addWidget(joint_edit, /*stretch=*/1);
     auto* btn_joint_wizard = new QPushButton(tr("Build…"), &dlg);
@@ -1465,17 +1529,35 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
         setStatus(tr("Counterparty started the swap; mirror record "
                       "created on this side. Switch to the Swaps tab."));
     } else if (is_swap_addrs) {
-        // Peer sent their BTC P2TR xonly + PRIC stealth so our
-        // Start-swap dialog can pre-fill the four address fields.
-        // Stash keyed by our local order id so Start-swap can look it
-        // up.
+        // Peer sent their BTC P2TR xonly + PRIC stealth (and raw
+        // view+spend pubkeys) so our Start-swap dialog can pre-fill
+        // every address field — including the joint stealth address,
+        // computed locally from my privs + peer's pubkeys.
         PeerSwapAddrs pair;
-        pair.btc_xonly = obj.value(QStringLiteral("btc_xonly")).toString();
+        pair.btc_xonly    = obj.value(QStringLiteral("btc_xonly")).toString();
         pair.pric_stealth = obj.value(QStringLiteral("pric_stealth")).toString();
+        pair.view_pubkey  = obj.value(QStringLiteral("view_pubkey")).toString();
+        pair.spend_pubkey = obj.value(QStringLiteral("spend_pubkey")).toString();
         if (pair.btc_xonly.isEmpty() || pair.pric_stealth.isEmpty()) return;
+
+        // Pre-compute the joint stealth address if we have the raw
+        // pubkeys. Optional — older builds don't send them, in which
+        // case the user clicks "Build…" the legacy way.
+        if (!pair.view_pubkey.isEmpty() && !pair.spend_pubkey.isEmpty()) {
+            pair.joint_address = BuildJointStealthAddr(
+                m_model, pair.view_pubkey, pair.spend_pubkey);
+        }
+
         m_peer_swap_addrs[QString::fromStdString(my_oid)] = pair;
-        setStatus(tr("Counterparty sent swap addresses for order %1 — Start swap will be pre-filled.")
-            .arg(QString::fromStdString(my_oid).left(12) + "…"));
+        if (!pair.joint_address.isEmpty()) {
+            setStatus(tr("Counterparty addresses received — Start swap is fully pre-filled "
+                          "(joint stealth: %1…)")
+                .arg(pair.joint_address.left(16)));
+        } else {
+            setStatus(tr("Counterparty addresses received — Start swap pre-filled "
+                          "(joint stealth still needs manual Build).")
+                );
+        }
     }
 }
 
@@ -1604,7 +1686,9 @@ void PricoinOrderbookPage::sendSwapAddrs(
     const QString my_btc_xonly = getMyBtcXOnly(
         QString::fromStdString(foreign_chain));
     const QString my_stealth   = getMyPricStealth();
-    if (my_btc_xonly.isEmpty() || my_stealth.isEmpty()) {
+    const auto    my_pubkeys   = GetMyStealthPubkeys(m_model);
+    if (my_btc_xonly.isEmpty() || my_stealth.isEmpty() ||
+        my_pubkeys.view_hex.isEmpty() || my_pubkeys.spend_hex.isEmpty()) {
         // Wallet probably locked, or holding-wallet identity not
         // derivable. Skip — the Start-swap dialog will fall back to
         // manual paste for the missing slots.
@@ -1622,6 +1706,11 @@ void PricoinOrderbookPage::sendSwapAddrs(
         QString::fromStdString(foreign_chain));
     msg.insert(QStringLiteral("btc_xonly"),    my_btc_xonly);
     msg.insert(QStringLiteral("pric_stealth"), my_stealth);
+    // Raw view + spend pubkeys so the receiver can pre-compute the
+    // joint stealth address client-side without a separate dialog
+    // round-trip. Both 33-byte compressed hex (66 chars).
+    msg.insert(QStringLiteral("view_pubkey"),  my_pubkeys.view_hex);
+    msg.insert(QStringLiteral("spend_pubkey"), my_pubkeys.spend_hex);
     const QString plaintext = QString::fromUtf8(
         QJsonDocument(msg).toJson(QJsonDocument::Compact));
     m_next_dm_label = tr("Swap-address exchange for order %1…")

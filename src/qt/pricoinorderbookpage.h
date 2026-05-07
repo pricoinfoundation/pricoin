@@ -136,7 +136,18 @@ private:
     // consumed when the user opens Start-swap so they don't have to
     // paste the peer's BTC P2TR xonly + PRIC stealth manually. Both
     // sides exchange these automatically right after a match.
-    struct PeerSwapAddrs { QString btc_xonly; QString pric_stealth; };
+    //
+    // view_pubkey + spend_pubkey are the peer's raw PRIC stealth
+    // pubkeys (33-byte hex each). The dialog uses them to pre-compute
+    // the joint stealth address client-side instead of requiring the
+    // separate joint-stealth-dialog handshake.
+    struct PeerSwapAddrs {
+        QString btc_xonly;
+        QString pric_stealth;
+        QString view_pubkey;
+        QString spend_pubkey;
+        QString joint_address;     // computed on receive, cached
+    };
     QHash<QString, PeerSwapAddrs> m_peer_swap_addrs;
 
     void rebuildNostrClient();
