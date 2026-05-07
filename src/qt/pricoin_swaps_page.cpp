@@ -6,6 +6,7 @@
 
 #include <interfaces/node.h>
 #include <qt/pricoin_coopsign_dialog.h>
+#include <qt/pricoin_nostr_client.h>
 #include <qt/pricoin_pric_coopsign_dialog.h>
 #include <qt/walletmodel.h>
 #include <random.h>
@@ -13,6 +14,9 @@
 #include <univalue.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
+
+#include <QJsonDocument>
+#include <QJsonObject>
 
 #include <QBrush>
 #include <QColor>
@@ -565,25 +569,52 @@ void PricoinSwapsPage::onAdvanceClicked()
         AddOkCancel(form, &dlg);
 
         if (dlg.exec() != QDialog::Accepted) return;
+        const std::string T_G_str = T_G->text().trimmed().toStdString();
+        const std::string T_H_str = T_H->text().trimmed().toStdString();
+        const std::string dleq_str = dleq->toPlainText().trimmed().toStdString();
         auto r1 = m_model->wallet().adaptorSwapSetAdaptorMaterials(
-            sid, T_G->text().trimmed().toStdString(),
-            T_H->text().trimmed().toStdString(),
-            dleq->toPlainText().trimmed().toStdString(),
+            sid, T_G_str, T_H_str, dleq_str,
             t_secret->text().trimmed().toStdString());
         if (!r1) {
             setStatus(tr("Set adaptor failed: %1")
                 .arg(QString::fromStdString(util::ErrorString(r1).original)), true);
             return;
         }
+        const int p_h_v = p_h->value();
+        const int f_h_v = f_h->value();
+        const int d_m_v = d_m->value();
         auto r2 = m_model->wallet().adaptorSwapSetRefundTimelocks(
-            sid, p_h->value(), f_h->value(), d_m->value());
+            sid, p_h_v, f_h_v, d_m_v);
         if (!r2) {
             setStatus(tr("Set timelocks failed: %1")
                 .arg(QString::fromStdString(util::ErrorString(r2).original)), true);
             return;
         }
         refreshTable();
-        setStatus(tr("Advanced to AdaptorReady."));
+
+        // Auto-coordination: PRIC buyer (Bob) pushes the adaptor
+        // materials + refund timelocks to PRIC seller (Alice) so her
+        // wallet auto-advances to AdaptorReady without manual paste.
+        // t_secret is intentionally NOT shipped — Alice extracts it
+        // from Bob's PRIC claim tx later.
+        bool dm_sent = false;
+        if (snap.role == "bob") {
+            QJsonObject m;
+            m.insert(QStringLiteral("type"),
+                QStringLiteral("pricoin:adaptor_setup/v1"));
+            m.insert(QStringLiteral("T_G"),  QString::fromStdString(T_G_str));
+            m.insert(QStringLiteral("T_H"),  QString::fromStdString(T_H_str));
+            m.insert(QStringLiteral("dleq"), QString::fromStdString(dleq_str));
+            m.insert(QStringLiteral("pric_refund_height"),    p_h_v);
+            m.insert(QStringLiteral("foreign_refund_height"), f_h_v);
+            m.insert(QStringLiteral("delta_min"),             d_m_v);
+            dm_sent = sendSwapCoordDM(sid, m);
+        }
+        setStatus(snap.role == "bob"
+            ? (dm_sent
+                ? tr("Advanced to AdaptorReady. Counterparty notified.")
+                : tr("Advanced to AdaptorReady. (counterparty notification failed — they may need to paste manually)"))
+            : tr("Advanced to AdaptorReady."));
         return;
     }
 
@@ -786,6 +817,28 @@ void PricoinSwapsPage::onRefundClicked()
     setStatus(tr("Swap moved to Refunded."));
 }
 
+bool PricoinSwapsPage::sendSwapCoordDM(const std::string& swap_id,
+                                         const QJsonObject& msg)
+{
+    if (!m_model) return false;
+    auto snap = m_model->wallet().adaptorSwapGet(swap_id);
+    if (!snap) return false;
+    // counterparty_pubkey_hex is 33-byte compressed (66 hex chars).
+    // NIP-04 expects 32-byte xonly (64 hex chars) — strip the parity.
+    if (snap->counterparty_pubkey_hex.size() < 66) return false;
+    const QString peer_xonly = QString::fromStdString(
+        snap->counterparty_pubkey_hex.substr(2));
+    auto* nostr = m_model->getOrCreateNostrClient();
+    if (!nostr) return false;
+    QJsonObject m = msg;
+    if (!m.contains(QStringLiteral("swap_id"))) {
+        m.insert(QStringLiteral("swap_id"), QString::fromStdString(swap_id));
+    }
+    const QString plaintext = QString::fromUtf8(
+        QJsonDocument(m).toJson(QJsonDocument::Compact));
+    return nostr->publishDirectMessage(peer_xonly, plaintext);
+}
+
 void PricoinSwapsPage::onAbortClicked()
 {
     if (!m_model) return;
@@ -804,7 +857,18 @@ void PricoinSwapsPage::onAbortClicked()
         return;
     }
     refreshTable();
-    setStatus(tr("Swap aborted."));
+    // Notify the counterparty so their wallet mirrors the abort. This
+    // completes the "two strangers, no other channel" story for the
+    // swap state machine — same pattern as match/unmatch DMs in the
+    // orderbook.
+    QJsonObject msg;
+    msg.insert(QStringLiteral("type"),    QStringLiteral("pricoin:swap_abort/v1"));
+    msg.insert(QStringLiteral("swap_id"), QString::fromStdString(sid));
+    msg.insert(QStringLiteral("reason"),  reason);
+    const bool sent = sendSwapCoordDM(sid, msg);
+    setStatus(sent
+        ? tr("Swap aborted. Counterparty notified.")
+        : tr("Swap aborted. (counterparty notification failed — they may need to abort manually)"));
 }
 
 // ─── Tier-3 swap-watcher panel ──────────────────────────────────

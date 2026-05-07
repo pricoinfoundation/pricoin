@@ -21,6 +21,7 @@ class QPushButton;
 class QLabel;
 class QTextEdit;
 class QTimer;
+class QJsonObject;
 QT_END_NAMESPACE
 
 // Phase 5/6 cross-track UI: read-only view of `pricoin_adaptor_swap`
@@ -101,6 +102,13 @@ private:
     std::string selectedSwapId() const;
     std::string selectedSwapwatchSwapId() const;
     std::string selectedSwapwatchKind()   const;
+
+    // Send a DM to a swap's counterparty. Used to mirror state changes
+    // that the protocol layer doesn't observe on chain (abort,
+    // adaptor-setup payload). Returns true if at least one relay
+    // accepted the event.
+    bool sendSwapCoordDM(const std::string& swap_id,
+                          const QJsonObject& msg);
 };
 
 #endif // BITCOIN_QT_PRICOIN_SWAPS_PAGE_H

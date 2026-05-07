@@ -610,49 +610,81 @@ void WalletModel::onAutoSwapwatchDM(const QString& from_xonly_hex,
 {
     UniValue env;
     if (!env.read(plaintext.toStdString()) || !env.isObject()) return;
-    if (!env.exists("type") || env["type"].get_str() != "tx_announce") return;
-    if (!env.exists("swap_id") || !env.exists("kind") || !env.exists("txid")) return;
-
+    if (!env.exists("type") || !env["type"].isStr()) return;
+    const std::string type = env["type"].get_str();
+    if (!env.exists("swap_id") || !env["swap_id"].isStr()) return;
     const std::string swap_id = env["swap_id"].get_str();
-    const std::string kind    = env["kind"].get_str();
-    const std::string txid    = env["txid"].get_str();
-    if (txid.size() != 64) return;
 
-    // Cross-check sender against the swap's counterparty. Without
-    // this, a stranger could DM us a forged announcement and we'd
-    // happily watch their tx. The Nostr layer already verifies the
-    // BIP340 sig, so from_xonly is authentic — we just need to
-    // ensure that pubkey matches the swap's counterparty.
+    // Sender authentication: the DM must come from the swap's
+    // counterparty. Otherwise a stranger could DM us a forged
+    // announcement / abort / setup payload and corrupt our state.
+    // The Nostr layer already verifies the BIP340 sig — we just
+    // need to ensure that pubkey matches the swap's counterparty.
     auto snap = wallet().adaptorSwapGet(swap_id);
     if (!snap) return;
     const std::string& cp = snap->counterparty_pubkey_hex;
-    // counterparty_pubkey is 33-byte compressed; strip the parity
-    // prefix to compare with xonly (32 bytes).
     if (cp.size() < 66 || cp.substr(2) != from_xonly_hex.toStdString()) return;
 
-    const int32_t vout = env.exists("vout") ? env["vout"].getInt<int32_t>() : -1;
-    const int32_t min_conf = env.exists("min_confirmations")
-        ? env["min_confirmations"].getInt<int32_t>() : 1;
-
-    // Dispatch via wallet RPC so we go through the same input
-    // validation + persistence as a manual swapwatch_add.
-    UniValue params{UniValue::VARR};
-    params.push_back(swap_id);
-    params.push_back(kind);
-    params.push_back(txid);
-    params.push_back(vout);
-    params.push_back(min_conf);
     const std::string uri = "/wallet/" + getWalletName().toStdString();
-    try {
-        node().executeRpc("pricoin_swapwatch_add", params, uri);
-        // No UI feedback — this happens silently in the background.
-        // The Swaps page panel will pick it up on its next refresh.
-    } catch (const UniValue&) {
-        // Duplicate entry is fine (idempotent peer announcements);
-        // bad input is rare and silently dropped — the Nostr DM
-        // sender is trusted by sig but may have malformed payload.
-    } catch (const std::exception&) {
-        // Same — silent.
+
+    if (type == "tx_announce") {
+        if (!env.exists("kind") || !env.exists("txid")) return;
+        const std::string kind = env["kind"].get_str();
+        const std::string txid = env["txid"].get_str();
+        if (txid.size() != 64) return;
+        const int32_t vout = env.exists("vout") ? env["vout"].getInt<int32_t>() : -1;
+        const int32_t min_conf = env.exists("min_confirmations")
+            ? env["min_confirmations"].getInt<int32_t>() : 1;
+        UniValue params{UniValue::VARR};
+        params.push_back(swap_id);
+        params.push_back(kind);
+        params.push_back(txid);
+        params.push_back(vout);
+        params.push_back(min_conf);
+        try {
+            node().executeRpc("pricoin_swapwatch_add", params, uri);
+        } catch (const UniValue&) {
+        } catch (const std::exception&) {
+        }
+        return;
+    }
+
+    if (type == "pricoin:swap_abort/v1") {
+        // Counterparty aborted on their side — mirror locally.
+        if (snap->state == "complete" || snap->state == "refunded" ||
+            snap->state == "aborted") {
+            return;  // already terminal
+        }
+        const std::string reason = env.exists("reason") && env["reason"].isStr()
+            ? env["reason"].get_str()
+            : std::string{"counterparty aborted"};
+        wallet().adaptorSwapAbort(swap_id, reason);
+        return;
+    }
+
+    if (type == "pricoin:adaptor_setup/v1") {
+        // PRIC buyer (Bob) sent us the adaptor materials + refund
+        // timelocks. We're PRIC seller (Alice); mirror them locally
+        // so our state advances to AdaptorReady without manual paste.
+        // t_secret is intentionally not shipped — Alice extracts it
+        // later from Bob's PRIC claim tx.
+        if (snap->state != "setup") return;  // idempotent / late-arriving
+        if (snap->role != "alice") return;   // safety: only Alice consumes
+        if (!env.exists("T_G") || !env.exists("T_H") || !env.exists("dleq")) return;
+        const std::string T_G  = env["T_G"].get_str();
+        const std::string T_H  = env["T_H"].get_str();
+        const std::string dleq = env["dleq"].get_str();
+        const auto r1 = wallet().adaptorSwapSetAdaptorMaterials(
+            swap_id, T_G, T_H, dleq, /*t_secret_hex=*/"");
+        if (!r1) return;
+        const int p_h = env.exists("pric_refund_height")
+            ? env["pric_refund_height"].getInt<int>() : 100000;
+        const int f_h = env.exists("foreign_refund_height")
+            ? env["foreign_refund_height"].getInt<int>() : 100200;
+        const int d_m = env.exists("delta_min")
+            ? env["delta_min"].getInt<int>() : 144;
+        wallet().adaptorSwapSetRefundTimelocks(swap_id, p_h, f_h, d_m);
+        return;
     }
 }
 
