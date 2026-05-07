@@ -432,6 +432,121 @@ void PricoinSwapsPage::onAdvanceClicked()
     // Each branch: build state-specific form, exec, then call wallet.
     // ─── Setup → AdaptorReady (combined) ───
     if (snap.state == "setup") {
+        // Hands-free path. Two strangers can't paste pubkeys to each
+        // other, so the dialog-with-fields flow doesn't fit the
+        // orderbook discovery model. Instead:
+        //   * Alice (PRIC seller): waits. Her wallet's DM handler
+        //     will auto-apply the materials when Bob's
+        //     pricoin:adaptor_setup/v1 DM lands.
+        //   * Bob (PRIC buyer): derives r/t/P_pi/T_G/T_H/DLEQ in-line
+        //     using the same RPCs the old dialog's Generate button
+        //     used, sets materials + default refund timelocks, then
+        //     DM-notifies Alice. No dialog needed.
+        // The fallback dialog further down stays as a safety net for
+        // unusual inputs / future protocol variants.
+        if (snap.role == "alice") {
+            setStatus(tr("Waiting for PRIC buyer to commit adaptor materials. "
+                          "Your wallet will auto-advance when their DM arrives."));
+            return;
+        }
+        if (snap.role == "bob") {
+            const std::string joint_addr = snap.pric_joint_stealth_address;
+            if (joint_addr.empty()) {
+                setStatus(tr("Cannot auto-advance: swap has no joint stealth address."), true);
+                return;
+            }
+            // Fresh ephemeral r + fresh secret t.
+            unsigned char r_raw[32]; unsigned char t_raw[32];
+            GetStrongRandBytes(r_raw); GetStrongRandBytes(t_raw);
+            const std::string r_hex = HexStr(std::span<const unsigned char>{r_raw, 32});
+            const std::string t_hex = HexStr(std::span<const unsigned char>{t_raw, 32});
+            memory_cleanse(r_raw, 32); memory_cleanse(t_raw, 32);
+
+            auto p_pi_or = m_model->wallet().computeStealthOneTimePubkey(
+                joint_addr, r_hex, /*output_index=*/0);
+            if (!p_pi_or) {
+                setStatus(tr("Auto-advance failed (computeStealthOneTimePubkey): %1")
+                    .arg(QString::fromStdString(util::ErrorString(p_pi_or).original)), true);
+                return;
+            }
+            const std::string p_pi_hex = *p_pi_or;
+
+            UniValue p1{UniValue::VARR};
+            p1.push_back(t_hex);
+            p1.push_back(p_pi_hex);
+            UniValue r1; std::string T_G_hex, T_H_hex;
+            try {
+                r1 = m_model->node().executeRpc("pricoin_adaptor_compute_points", p1, "");
+                T_G_hex = r1["T_G"].get_str();
+                T_H_hex = r1["T_H"].get_str();
+            } catch (const UniValue& e) {
+                setStatus(tr("Auto-advance failed (compute_points): %1")
+                    .arg(QString::fromStdString(e.write())), true);
+                return;
+            } catch (const std::exception& e) {
+                setStatus(tr("Auto-advance failed (compute_points): %1").arg(e.what()), true);
+                return;
+            }
+
+            UniValue p2{UniValue::VARR};
+            p2.push_back(t_hex); p2.push_back(p_pi_hex);
+            p2.push_back(T_G_hex); p2.push_back(T_H_hex);
+            p2.push_back(sid); p2.push_back(sid);
+            UniValue r2; std::string dleq_hex;
+            try {
+                r2 = m_model->node().executeRpc("pricoin_adaptor_dleq_prove", p2, "");
+                dleq_hex = r2["dleq"].get_str();
+            } catch (const UniValue& e) {
+                setStatus(tr("Auto-advance failed (dleq_prove): %1")
+                    .arg(QString::fromStdString(e.write())), true);
+                return;
+            } catch (const std::exception& e) {
+                setStatus(tr("Auto-advance failed (dleq_prove): %1").arg(e.what()), true);
+                return;
+            }
+
+            // Apply locally: set materials (with t_secret) + refund timelocks (defaults).
+            const auto sm = m_model->wallet().adaptorSwapSetAdaptorMaterials(
+                sid, T_G_hex, T_H_hex, dleq_hex, t_hex);
+            if (!sm) {
+                setStatus(tr("Set adaptor failed: %1")
+                    .arg(QString::fromStdString(util::ErrorString(sm).original)), true);
+                return;
+            }
+            // Default refund timelocks — suggested values that match the
+            // legacy dialog's defaults. Future revision: derive from
+            // chain heights + spec-mandated minimums.
+            constexpr int kDefaultPricRefundHeight    = 100000;
+            constexpr int kDefaultForeignRefundHeight = 100200;
+            constexpr int kDefaultDeltaMin            = 144;
+            const auto rt = m_model->wallet().adaptorSwapSetRefundTimelocks(
+                sid, kDefaultPricRefundHeight, kDefaultForeignRefundHeight,
+                kDefaultDeltaMin);
+            if (!rt) {
+                setStatus(tr("Set timelocks failed: %1")
+                    .arg(QString::fromStdString(util::ErrorString(rt).original)), true);
+                return;
+            }
+            refreshTable();
+
+            // Push the materials to Alice via DM so her side auto-advances too.
+            QJsonObject m;
+            m.insert(QStringLiteral("type"),
+                QStringLiteral("pricoin:adaptor_setup/v1"));
+            m.insert(QStringLiteral("T_G"),  QString::fromStdString(T_G_hex));
+            m.insert(QStringLiteral("T_H"),  QString::fromStdString(T_H_hex));
+            m.insert(QStringLiteral("dleq"), QString::fromStdString(dleq_hex));
+            m.insert(QStringLiteral("pric_refund_height"),    kDefaultPricRefundHeight);
+            m.insert(QStringLiteral("foreign_refund_height"), kDefaultForeignRefundHeight);
+            m.insert(QStringLiteral("delta_min"),             kDefaultDeltaMin);
+            const bool dm_sent = sendSwapCoordDM(sid, m);
+            setStatus(dm_sent
+                ? tr("Advanced to AdaptorReady. Counterparty notified.")
+                : tr("Advanced to AdaptorReady. (counterparty notification failed — they may need to retry)"));
+            return;
+        }
+
+        // Fallback: unknown role — show the legacy dialog as a safety net.
         dlg.setWindowTitle(tr("Set adaptor materials + refund timelocks"));
         form->addRow(new QLabel(tr("Both adaptor materials and refund timelocks "
                                     "must be set to advance to AdaptorReady."), &dlg));
