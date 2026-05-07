@@ -9,6 +9,7 @@
 
 #include <crypto/sha256.h>
 #include <interfaces/wallet.h>
+#include <logging.h>
 #include <random.h>
 #include <pubkey.h>
 #include <uint256.h>
@@ -472,15 +473,25 @@ bool PricoinNostrClient::publishDirectMessage(const QString& peer_xonly_hex,
         QJsonDocument(msg).toJson(QJsonDocument::Compact));
 
     int sent = 0;
+    int connected_count = 0;
     for (auto it = m_socket_by_url.constBegin();
          it != m_socket_by_url.constEnd(); ++it) {
         QWebSocket* sock = it.value();
         if (sock->state() != QAbstractSocket::ConnectedState) continue;
+        ++connected_count;
         sock->sendTextMessage(frame);
         ++sent;
     }
     Q_EMIT log(tr("Published DM to %1 → %2 relay(s).")
         .arg(peer_xonly_hex.left(12) + "…").arg(sent));
+    // Mirror to debug.log so a Mac/Linux operator can grep for DM
+    // activity without watching the GUI status line.
+    LogInfo("Pricoin DM publish: peer=%s relays_total=%d connected=%d sent=%d "
+            "plaintext_bytes=%d dm_id=%s\n",
+            peer_xonly_hex.left(12).toStdString(),
+            m_socket_by_url.size(), connected_count, sent,
+            (int)plaintext.size(),
+            dm_id.toStdString());
     if (sent > 0 && !dm_id.isEmpty()) {
         Q_EMIT dmSent(dm_id, peer_xonly_hex);
     }
@@ -658,6 +669,15 @@ void PricoinNostrClient::onTextMessage(const QString& message)
                     QJsonDocument(ack).toJson(QJsonDocument::Compact));
                 publishDirectMessage(pubkey_hex, ack_json);
             }
+            // Mirror inbound DM to debug.log for diagnosing
+            // auto-coord flows (swap_addrs, swap_abort, adaptor_setup,
+            // tx_announce). Plaintext is JSON in those cases — log a
+            // length + leading bytes so the operator can identify
+            // what type was received without leaking message body.
+            LogInfo("Pricoin DM received: from=%s plaintext_bytes=%d head=%s\n",
+                    pubkey_hex.left(12).toStdString(),
+                    (int)pt_qstr.size(),
+                    pt_qstr.left(80).toStdString());
             Q_EMIT directMessageReceived(pubkey_hex, pt_qstr);
         }
     } else if (tag == QStringLiteral("OK")) {
