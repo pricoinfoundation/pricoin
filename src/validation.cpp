@@ -4203,7 +4203,23 @@ bool HasValidProofOfWork(std::span<const CBlockHeader> headers, const Consensus:
                 const int height = it->second.nHeight + 1;
                 pow_hash = pricoin::randomx::TryGetPoWHashOfHeader(header, height, &chainman->ActiveChain());
             } else {
-                pow_hash = pricoin::randomx::GetPoWHashOfHeader(header);
+                // Parent not yet in m_block_index. This routinely happens
+                // mid-batch during header sync: every header after the
+                // first in a getheaders response has its parent only as
+                // an earlier entry in the SAME batch, which the index
+                // doesn't see until after the batch is accepted. Without
+                // a height we can't pick the right seed, so we'd have to
+                // fall back to bootstrap — which gives a stale PoW hash
+                // for any header past the first epoch boundary (height
+                // ≥ EPOCH_LAG + EPOCH_BLOCKS = 2112), causing
+                // CheckProofOfWork to fail and the entire batch to be
+                // rejected. Stalls header sync at 2000 forever.
+                //
+                // Treat as deferred (same as the chain-doesn't-have-the-
+                // seed-block case): nullopt → batch passes → headers
+                // get accepted → full-block validation re-checks PoW
+                // with the correct seed once the parent is indexed.
+                pow_hash = std::nullopt;
             }
         } else {
             pow_hash = pricoin::randomx::GetPoWHashOfHeader(header);
