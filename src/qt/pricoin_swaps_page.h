@@ -21,6 +21,7 @@ class QPushButton;
 class QLabel;
 class QTextEdit;
 class QTimer;
+class QCheckBox;
 class QJsonObject;
 QT_END_NAMESPACE
 
@@ -72,6 +73,7 @@ private:
     QTableView* m_table{nullptr};
     QStandardItemModel* m_table_model{nullptr};
     QPushButton* m_btn_refresh{nullptr};
+    QCheckBox*   m_filter_hide_terminal{nullptr};
     QPushButton* m_btn_advance{nullptr};
     QPushButton* m_btn_refund{nullptr};
     QPushButton* m_btn_abort{nullptr};

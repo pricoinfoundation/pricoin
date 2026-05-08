@@ -1101,6 +1101,13 @@ void PricoinOrderbookPage::onStartSwapClicked()
             QJsonDocument(swap_dm).toJson(QJsonDocument::Compact));
         m_next_dm_label = tr("Swap-start params for %1…")
             .arg(QString::fromStdString(peer->order_id).left(12));
+        // Definitive trace: confirms this build is the one with the
+        // swap_id-share fix. If you don't see this line in debug.log
+        // when clicking Start swap, the binary is older than this code.
+        LogInfo("Pricoin start_swap emit: swap_id=%s peer=%s plaintext_bytes=%d\n",
+                created_swap_id.substr(0, 16),
+                peer_xonly.left(12).toStdString(),
+                (int)plaintext.size());
         m_nostr->publishDirectMessage(peer_xonly, plaintext);
         m_next_dm_label.clear();
     }
@@ -1559,6 +1566,10 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
         // adaptor_setup / future coord DMs.
         ap.swap_id_hex = obj.value(
             QStringLiteral("swap_id")).toString().toStdString();
+        LogInfo("Pricoin start_swap recv: swap_id=%s (empty=%d) from=%s\n",
+                ap.swap_id_hex.substr(0, 16),
+                (int)ap.swap_id_hex.empty(),
+                from_xonly_hex.left(12).toStdString());
 
         auto r = m_model->wallet().adaptorSwapCreate(ap);
         if (!r) {

@@ -19,6 +19,7 @@
 #include <QJsonObject>
 
 #include <QBrush>
+#include <QCheckBox>
 #include <QColor>
 #include <QComboBox>
 #include <QDialog>
@@ -102,6 +103,10 @@ void PricoinSwapsPage::buildLayout()
     auto* top = new QHBoxLayout();
     m_btn_refresh = new QPushButton(tr("Refresh"), this);
     top->addWidget(m_btn_refresh);
+    m_filter_hide_terminal = new QCheckBox(
+        tr("Hide complete / aborted / refunded"), this);
+    m_filter_hide_terminal->setChecked(true);  // default hide noise
+    top->addWidget(m_filter_hide_terminal);
     top->addStretch();
     m_status_label = new QLabel(this);
     m_status_label->setWordWrap(true);
@@ -198,6 +203,8 @@ void PricoinSwapsPage::buildLayout()
     outer->addWidget(sw_box);
 
     connect(m_btn_refresh, &QPushButton::clicked, this, &PricoinSwapsPage::onRefreshClicked);
+    connect(m_filter_hide_terminal, &QCheckBox::toggled, this,
+            [this](bool){ refreshTable(); });
     connect(m_btn_advance, &QPushButton::clicked, this, &PricoinSwapsPage::onAdvanceClicked);
     connect(m_btn_refund,  &QPushButton::clicked, this, &PricoinSwapsPage::onRefundClicked);
     connect(m_btn_abort,   &QPushButton::clicked, this, &PricoinSwapsPage::onAbortClicked);
@@ -260,35 +267,58 @@ void PricoinSwapsPage::refreshTable()
         return;
     }
     m_swaps = m_model->wallet().adaptorSwapList();
-    m_table_model->setRowCount(static_cast<int>(m_swaps.size()));
+    // Apply the "hide terminal" filter so the table doesn't bloat with
+    // completed / aborted / refunded swaps once an operator has run a
+    // few. m_swaps still holds the full list so the row-id↔snapshot
+    // mapping stays correct for handlers that re-look up by sid.
+    const bool hide_terminal = m_filter_hide_terminal &&
+                               m_filter_hide_terminal->isChecked();
+    auto is_terminal = [](const std::string& st) {
+        return st == "complete" || st == "aborted" || st == "refunded";
+    };
+    std::vector<size_t> visible_idx;
+    visible_idx.reserve(m_swaps.size());
     for (size_t i = 0; i < m_swaps.size(); ++i) {
+        if (hide_terminal && is_terminal(m_swaps[i].state)) continue;
+        visible_idx.push_back(i);
+    }
+    m_table_model->setRowCount(static_cast<int>(visible_idx.size()));
+    for (size_t row = 0; row < visible_idx.size(); ++row) {
+        const size_t i = visible_idx[row];
         const auto& s = m_swaps[i];
         int col = 0;
-        m_table_model->setItem(static_cast<int>(i), col++,
+        m_table_model->setItem(static_cast<int>(row), col++,
             new QStandardItem(QString::fromStdString(s.swap_id).left(12) + "…"));
-        m_table_model->setItem(static_cast<int>(i), col++,
+        m_table_model->setItem(static_cast<int>(row), col++,
             new QStandardItem(QString::fromStdString(s.role)));
         auto* state_item = new QStandardItem(StateBadge(s.state));
         state_item->setForeground(QBrush(StateColor(s.state)));
         QFont f = state_item->font();
         f.setBold(true);
         state_item->setFont(f);
-        m_table_model->setItem(static_cast<int>(i), col++, state_item);
+        m_table_model->setItem(static_cast<int>(row), col++, state_item);
+        // Stash the source-vector index in column 0 so the lookup
+        // helpers (selectedSwapId etc.) can recover the snapshot
+        // even when rows are filtered.
+        if (auto* item = m_table_model->item(static_cast<int>(row), 0)) {
+            item->setData(QVariant::fromValue<qulonglong>(static_cast<qulonglong>(i)),
+                          Qt::UserRole + 1);
+        }
         // Show full pubkey + joint stealth address — operators verify
         // these visually against the counterparty (DM exchange, etc.)
         // and truncating with "…" defeats that. The table is set up
         // with horizontal scroll so wide rows are usable.
-        m_table_model->setItem(static_cast<int>(i), col++,
+        m_table_model->setItem(static_cast<int>(row), col++,
             new QStandardItem(QString::fromStdString(s.counterparty_pubkey_hex)));
-        m_table_model->setItem(static_cast<int>(i), col++,
+        m_table_model->setItem(static_cast<int>(row), col++,
             new QStandardItem(QString::fromStdString(s.foreign_chain)));
-        m_table_model->setItem(static_cast<int>(i), col++,
+        m_table_model->setItem(static_cast<int>(row), col++,
             new QStandardItem(QString::number(s.foreign_amount_sat)));
-        m_table_model->setItem(static_cast<int>(i), col++,
+        m_table_model->setItem(static_cast<int>(row), col++,
             new QStandardItem(FormatSat(s.pric_amount_sat)));
-        m_table_model->setItem(static_cast<int>(i), col++,
+        m_table_model->setItem(static_cast<int>(row), col++,
             new QStandardItem(QString::fromStdString(s.pric_joint_stealth_address)));
-        m_table_model->setItem(static_cast<int>(i), col++,
+        m_table_model->setItem(static_cast<int>(row), col++,
             new QStandardItem(QString::number(s.updated_time)));
     }
     m_table->resizeColumnsToContents();
@@ -314,8 +344,20 @@ std::string PricoinSwapsPage::selectedSwapId() const
     const auto sel = sm->selectedRows();
     if (sel.isEmpty()) return {};
     const int row = sel.first().row();
-    if (row < 0 || row >= static_cast<int>(m_swaps.size())) return {};
-    return m_swaps[row].swap_id;
+    if (row < 0) return {};
+    // The "Hide complete/aborted/refunded" filter omits rows from the
+    // table without shrinking m_swaps, so the displayed row index
+    // doesn't directly map to m_swaps. Use the source-index we stashed
+    // in UserRole+1 of column 0 during refreshTable.
+    if (auto* item = m_table_model->item(row, 0)) {
+        const auto v = item->data(Qt::UserRole + 1);
+        if (v.isValid()) {
+            const auto src = static_cast<size_t>(v.toULongLong());
+            if (src < m_swaps.size()) return m_swaps[src].swap_id;
+        }
+    }
+    if (row < static_cast<int>(m_swaps.size())) return m_swaps[row].swap_id;
+    return {};
 }
 
 void PricoinSwapsPage::onSelectionChanged()
