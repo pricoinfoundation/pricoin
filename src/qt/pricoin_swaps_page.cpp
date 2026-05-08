@@ -11,9 +11,12 @@
 #include <qt/walletmodel.h>
 #include <random.h>
 #include <support/cleanse.h>
+#include <tinyformat.h>
 #include <univalue.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
+
+#include <cmath>
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -547,6 +550,17 @@ void PricoinSwapsPage::onAdvanceClicked()
                 return;
             }
 
+            // Persist Bob's ephemeral r BEFORE adaptor materials so a
+            // mid-step crash leaves the swap in a recoverable state
+            // (r without materials is a noop; materials without r is
+            // the bug we just fixed).
+            const auto sr = m_model->wallet().adaptorSwapSetPricEphemeralR(sid, r_hex);
+            if (!sr) {
+                setStatus(tr("Persist ephemeral r failed: %1")
+                    .arg(QString::fromStdString(util::ErrorString(sr).original)), true);
+                return;
+            }
+
             // Apply locally: set materials (with t_secret) + refund timelocks (defaults).
             const auto sm = m_model->wallet().adaptorSwapSetAdaptorMaterials(
                 sid, T_G_hex, T_H_hex, dleq_hex, t_hex);
@@ -571,13 +585,18 @@ void PricoinSwapsPage::onAdvanceClicked()
             }
             refreshTable();
 
-            // Push the materials to Alice via DM so her side auto-advances too.
+            // Push the materials + ephemeral r to Alice via DM so her
+            // side auto-advances. r is required for Alice's PRIC
+            // funding tx to produce an on-chain P_pi that matches the
+            // adaptor binding (T_G/T_H were computed against P_pi
+            // derived from r).
             QJsonObject m;
             m.insert(QStringLiteral("type"),
                 QStringLiteral("pricoin:adaptor_setup/v1"));
             m.insert(QStringLiteral("T_G"),  QString::fromStdString(T_G_hex));
             m.insert(QStringLiteral("T_H"),  QString::fromStdString(T_H_hex));
             m.insert(QStringLiteral("dleq"), QString::fromStdString(dleq_hex));
+            m.insert(QStringLiteral("r"),    QString::fromStdString(r_hex));
             m.insert(QStringLiteral("pric_refund_height"),    kDefaultPricRefundHeight);
             m.insert(QStringLiteral("foreign_refund_height"), kDefaultForeignRefundHeight);
             m.insert(QStringLiteral("delta_min"),             kDefaultDeltaMin);
@@ -792,9 +811,45 @@ void PricoinSwapsPage::onAdvanceClicked()
             return;
         }
         if (snap.role == "bob") {
+            // Estimate the funding-tx fee from the chain backend's
+            // sat/vB targets instead of the old 1000-sat hardcode.
+            // Funding tx is 1-input (key-path P2TR) + 2-output P2TR
+            // (the agg_xonly recipient + change to self) ≈ 155 vbytes.
+            // Picks the 6-block target with sensible fallbacks. If
+            // the backend is unreachable we fall back to a much higher
+            // hardcode (10000 sats) than the old 1000 — better to
+            // overpay slightly than to broadcast a tx that no miner
+            // includes during congestion.
+            int64_t fund_fee_sat = 10000;
+            {
+                UniValue pe{UniValue::VARR};
+                pe.push_back(snap.foreign_chain);
+                try {
+                    UniValue est = m_model->node().executeRpc(
+                        "pricoin_chainwatch_fee_estimates", pe, "");
+                    double sat_per_vb = -1.0;
+                    if (est.isObject()) {
+                        for (int t : {6, 10, 3, 20, 144, 2, 1}) {
+                            const auto v = est[strprintf("%d", t)];
+                            if (v.isNum() && v.get_real() > 0) {
+                                sat_per_vb = v.get_real();
+                                break;
+                            }
+                        }
+                    }
+                    if (sat_per_vb > 0.0) {
+                        // 1-in / 2-out P2TR funding tx ≈ 155 vB. Round up.
+                        const int est_vb = 155;
+                        fund_fee_sat = static_cast<int64_t>(
+                            std::ceil(static_cast<double>(est_vb) * sat_per_vb));
+                    }
+                } catch (...) {
+                    // Backend unreachable — keep the conservative fallback.
+                }
+            }
             UniValue p{UniValue::VARR};
             p.push_back(sid);
-            p.push_back(static_cast<int64_t>(1000));  // default fee_sat
+            p.push_back(fund_fee_sat);
             UniValue r;
             try {
                 r = m_model->node().executeRpc("pricoin_btc_fund_swap", p,
@@ -854,6 +909,65 @@ void PricoinSwapsPage::onAdvanceClicked()
 
     // ─── BtcFunded → BothFunded ───
     if (snap.state == "btc_funded") {
+        // Hands-free PRIC funding for Alice. Sends the swap's
+        // pric_amount_sat into the joint stealth address with a pinned
+        // ephemeral matching Bob's adaptor binding (snap.pric_ephemeral_r),
+        // registers a pric_funding watch (auto via the ScanTxForCTReceives
+        // / wallet machinery), and DMs Bob a tx_announce so his watcher
+        // tracks the same txid.
+        if (snap.role == "bob") {
+            setStatus(tr("Waiting for PRIC seller to fund the joint stealth "
+                          "output. Your wallet will auto-advance when their "
+                          "tx-announce DM arrives and the funding tx confirms."));
+            return;
+        }
+        if (snap.role == "alice") {
+            if (!snap.has_pric_ephemeral_r ||
+                snap.pric_ephemeral_r_hex.size() != 64) {
+                setStatus(tr("Cannot auto-fund PRIC: missing ephemeral r from "
+                              "counterparty. Wait for the adaptor_setup DM, or "
+                              "abort and retry from a fresh match."), true);
+                return;
+            }
+            // Modest fixed fee — Pricoin doesn't have a fee-estimator
+            // yet on a fresh chain. Tx is ~3.5 KB; 10000 sats ≈ 3 sat/B,
+            // safe for an experimental chain at low traffic.
+            const CAmount fee_sats = 10000;
+            auto sendr = m_model->wallet().sendConfidentialPinned(
+                snap.pric_joint_stealth_address,
+                snap.pric_amount_sat,
+                fee_sats,
+                snap.pric_ephemeral_r_hex);
+            if (!sendr) {
+                setStatus(tr("PRIC fund failed: %1")
+                    .arg(QString::fromStdString(util::ErrorString(sendr).original)), true);
+                return;
+            }
+            const std::string txid_hex = sendr->ToString();
+            // DM Bob the txid so his watcher tracks it.
+            const std::string& cp = snap.counterparty_pubkey_hex;
+            if (cp.size() >= 66) {
+                const QString peer_xonly = QString::fromStdString(cp.substr(2));
+                auto* nostr = m_model->getOrCreateNostrClient();
+                if (nostr) {
+                    nostr->publishBroadcastAnnouncement(
+                        peer_xonly,
+                        QString::fromStdString(sid),
+                        QStringLiteral("pric_funding"),
+                        QString::fromStdString(txid_hex),
+                        /*vout=*/0,
+                        /*min_confirmations=*/1);
+                }
+            }
+            setStatus(tr("PRIC funding tx broadcast — txid %1. Your watcher "
+                          "will mark BothFunded once it confirms; counterparty "
+                          "notified to track the same tx.")
+                .arg(QString::fromStdString(txid_hex).left(16) + "…"));
+            refreshTable();
+            return;
+        }
+
+        // Fallback: unknown role → legacy paste dialog.
         dlg.setWindowTitle(tr("Set PRIC funded"));
         auto* txid = AddTextRow(form, tr("PRIC funding txid (32-byte hex):"), &dlg);
         auto* vout = AddIntRow(form, tr("PRIC funding vout:"), &dlg, 0, 65535, 0);

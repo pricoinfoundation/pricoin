@@ -256,6 +256,27 @@ TransitionResult SetAdaptorMaterials(
     });
 }
 
+TransitionResult SetPricEphemeralR(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::array<unsigned char, 32>& r)
+{
+    return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
+        // Bob persists r at adaptor-setup time for himself; Alice
+        // receives it via DM. Either way no state transition — just
+        // a stash. Allowed pre-AdaptorReady (Bob's case) and post-
+        // AdaptorReady (Alice's case if her DM lands after the
+        // SetAdaptorMaterials transition).
+        if (s.state == State::Complete || s.state == State::Refunded ||
+            s.state == State::Aborted) {
+            return TransitionResult::InvalidState;
+        }
+        s.pric_ephemeral_r = r;
+        s.has_pric_ephemeral_r = true;
+        return TransitionResult::Ok;
+    });
+}
+
 TransitionResult SetRefundTimelocks(
     CWallet& wallet,
     const uint256& swap_id,

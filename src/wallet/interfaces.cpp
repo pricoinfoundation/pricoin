@@ -180,6 +180,28 @@ public:
     {
         return ::wallet::SendConfidentialTx(*m_wallet, dest_stealth_address, amount, fee);
     }
+
+    util::Result<uint256> sendConfidentialPinned(
+        const std::string& dest_stealth_address,
+        CAmount amount,
+        CAmount fee,
+        const std::string& r_hex) override
+    {
+        if (amount <= 0) return util::Error{Untranslated("non-positive amount")};
+        if (fee < 0)     return util::Error{Untranslated("negative fee")};
+        std::vector<unsigned char> ephemeral_priv;
+        if (!r_hex.empty()) {
+            const auto bytes = TryParseHex<unsigned char>(r_hex);
+            if (!bytes || bytes->size() != 32) {
+                return util::Error{Untranslated("r_hex must be 32-byte hex")};
+            }
+            ephemeral_priv = *bytes;
+        }
+        ::wallet::PricoinCTRecipient rcpt{dest_stealth_address, amount,
+                                          std::move(ephemeral_priv)};
+        return ::wallet::SendConfidentialTxMulti(
+            *m_wallet, std::span<const ::wallet::PricoinCTRecipient>(&rcpt, 1), fee);
+    }
     CAmount confidentialBalance() override
     {
         try {
@@ -454,6 +476,10 @@ public:
         for (const auto& p : s.pric_claim_ring) {
             o.pric_claim_ring_hex.push_back(HexStr(p));
         }
+        o.has_pric_ephemeral_r = s.has_pric_ephemeral_r;
+        if (s.has_pric_ephemeral_r) {
+            o.pric_ephemeral_r_hex = HexStr(s.pric_ephemeral_r);
+        }
         return o;
     }
 
@@ -605,6 +631,23 @@ public:
         if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
         auto r = ::wallet::pricoin_adaptor_swap::SetRefundTimelocks(
             *m_wallet, *sid, pric_refund_height, foreign_refund_height, delta_min_blocks);
+        return WrapTransition(r, this, *sid);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPricEphemeralR(
+        const std::string& swap_id,
+        const std::string& r_hex) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        const auto bytes = TryParseHex<unsigned char>(r_hex);
+        if (!bytes || bytes->size() != 32) {
+            return util::Error{Untranslated("r_hex must be 32-byte hex")};
+        }
+        std::array<unsigned char, 32> r_arr{};
+        std::copy(bytes->begin(), bytes->end(), r_arr.begin());
+        auto r = ::wallet::pricoin_adaptor_swap::SetPricEphemeralR(
+            *m_wallet, *sid, r_arr);
         return WrapTransition(r, this, *sid);
     }
 

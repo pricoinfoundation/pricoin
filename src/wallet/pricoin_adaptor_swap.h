@@ -245,6 +245,17 @@ struct AdaptorSwap {
     // the signer-index entry which is the joint stealth pub).
     std::vector<std::array<unsigned char, 33>> pric_claim_ring;
 
+    // Pricoin-stealth ephemeral private `r` chosen by Bob at adaptor-
+    // setup. Bob uses it to compute P_pi = shared(r·A_J)·G + B_J;
+    // T_G/T_H/DLEQ are bound to that P_pi. For the on-chain P_pi to
+    // match the binding when Alice broadcasts the PRIC funding tx,
+    // Alice must reuse the SAME r. Bob persists it locally; both
+    // sides ship/store it so Alice's auto-fund step can pin
+    // walletsendct's ephemeral. Empty for the legacy/manual path or
+    // when not yet known on Alice's side. 32 bytes when set.
+    std::array<unsigned char, 32> pric_ephemeral_r{};
+    bool                          has_pric_ephemeral_r{false};
+
     SERIALIZE_METHODS(AdaptorSwap, obj) {
         READWRITE(obj.swap_id);
         uint8_t role_byte = static_cast<uint8_t>(obj.role);
@@ -315,6 +326,13 @@ struct AdaptorSwap {
         // Cooperative ring (appended 2026-05-04). Same experimental/regtest
         // scope caveat — old records will fail to deserialize.
         READWRITE(obj.pric_claim_ring);
+
+        // PRIC stealth ephemeral r (appended 2026-05-08). Same
+        // experimental/regtest caveat as the prior appended fields.
+        READWRITE(obj.pric_ephemeral_r);
+        uint8_t r_byte = obj.has_pric_ephemeral_r ? 1 : 0;
+        READWRITE(r_byte);
+        SER_READ(obj, obj.has_pric_ephemeral_r = (r_byte != 0));
     }
 };
 
@@ -365,6 +383,15 @@ CreateResult Create(
     const std::string& pric_bob_recipient_stealth,
     AdaptorSwap& out,
     const uint256* swap_id_pinned = nullptr);
+
+// Stash the PRIC stealth ephemeral `r`. Bob calls this when he picks
+// `r` at adaptor-setup time; Alice calls it when his ephemeral arrives
+// via the adaptor_setup DM. Required for the auto-fund path so the
+// on-chain P_pi matches the adaptor binding.
+TransitionResult SetPricEphemeralR(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::array<unsigned char, 32>& r);
 
 // Set adaptor materials. For Bob: provide t_secret + T_G + dleq.
 // For Alice: provide T_G + dleq (Bob's t_secret is not given to her).

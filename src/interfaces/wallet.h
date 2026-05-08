@@ -110,6 +110,19 @@ public:
         CAmount amount,
         CAmount fee) = 0;
 
+    //! Pricoin: variant of sendConfidential that pins the per-output
+    //! stealth ephemeral `r` (32-byte hex) instead of letting the wallet
+    //! pick a random one. Required for atomic-swap PRIC funding where
+    //! the adaptor binding committed to a specific `r` (P_pi = h·G+B
+    //! with h = SHA(r·A_J || idx)). Without pinning, the on-chain
+    //! P_pi diverges from the adaptor binding and the swap becomes
+    //! unsignable. Empty `r_hex` falls back to a random ephemeral.
+    virtual util::Result<uint256> sendConfidentialPinned(
+        const std::string& dest_stealth_address,
+        CAmount amount,
+        CAmount fee,
+        const std::string& r_hex) = 0;
+
     //! Pricoin: scan the chain for confidential outputs paid to this
     //! wallet's stealth identity (via rangeproof rewind). Returns the total
     //! recovered value across unspent outputs. Equivalent to
@@ -261,6 +274,14 @@ public:
         // ordered them). Empty before the ceremony stores it. The
         // Qt extract dialog auto-fills its ring field from this.
         std::vector<std::string> pric_claim_ring_hex;
+
+        // PRIC stealth ephemeral r (32-byte hex). Set when Bob has
+        // committed adaptor materials; required for Alice's PRIC
+        // funding-tx auto-build to use a pinned ephemeral so on-chain
+        // P_pi matches the adaptor binding. Empty before the
+        // adaptor_setup step.
+        bool        has_pric_ephemeral_r{false};
+        std::string pric_ephemeral_r_hex;
     };
 
     struct PricoinAdaptorSwapCreateParams {
@@ -310,6 +331,15 @@ public:
         int32_t pric_refund_height,
         int32_t foreign_refund_height,
         int32_t delta_min_blocks) = 0;
+
+    // Stash the PRIC stealth ephemeral r (32-byte hex). Bob calls this
+    // at adaptor-setup time; Alice calls it when she receives Bob's
+    // adaptor_setup DM. Required so Alice's PRIC funding tx can pin
+    // walletsendct to the same r and produce the on-chain P_pi the
+    // adaptor materials are bound to.
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPricEphemeralR(
+        const std::string& swap_id,
+        const std::string& r_hex) = 0;
 
     // AdaptorReady → BtcFunded.
     virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetBtcFunded(

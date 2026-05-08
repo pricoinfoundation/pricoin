@@ -690,16 +690,25 @@ void WalletModel::onAutoSwapwatchDM(const QString& from_xonly_hex,
 
     if (type == "pricoin:adaptor_setup/v1") {
         // PRIC buyer (Bob) sent us the adaptor materials + refund
-        // timelocks. We're PRIC seller (Alice); mirror them locally
-        // so our state advances to AdaptorReady without manual paste.
-        // t_secret is intentionally not shipped — Alice extracts it
-        // later from Bob's PRIC claim tx.
+        // timelocks + the PRIC stealth ephemeral r. We're PRIC seller
+        // (Alice); mirror everything locally so our state advances to
+        // AdaptorReady without manual paste, AND so our subsequent
+        // PRIC funding tx can pin walletsendct to the same r (so the
+        // on-chain P_pi matches Bob's adaptor binding).
         if (snap->state != "setup") return;  // idempotent / late-arriving
         if (snap->role != "alice") return;   // safety: only Alice consumes
         if (!env.exists("T_G") || !env.exists("T_H") || !env.exists("dleq")) return;
         const std::string T_G  = env["T_G"].get_str();
         const std::string T_H  = env["T_H"].get_str();
         const std::string dleq = env["dleq"].get_str();
+        // Persist r FIRST — same ordering as Bob does locally, so a
+        // crash mid-handler leaves us in a recoverable state.
+        if (env.exists("r") && env["r"].isStr()) {
+            const std::string r_hex = env["r"].get_str();
+            if (!r_hex.empty()) {
+                wallet().adaptorSwapSetPricEphemeralR(swap_id, r_hex);
+            }
+        }
         const auto r1 = wallet().adaptorSwapSetAdaptorMaterials(
             swap_id, T_G, T_H, dleq, /*t_secret_hex=*/"");
         if (!r1) return;
