@@ -1004,25 +1004,52 @@ void PricoinOrderbookPage::onStartSwapClicked()
 
     if (dlg.exec() != QDialog::Accepted) return;
 
-    // Defensive re-fetch of the peer's maker_pubkey_hex. The cached
-    // m_orders snapshot has tripped a stale-cache race more than once
-    // — we already refresh m_orders at the top of this function, but
-    // an extra direct offerGet is cheap insurance against any layer
-    // (wallet-side memo, signal ordering, etc.) that could leave the
-    // pubkey under-populated for an instant after a fresh match.
+    // Verbose tracing for the persistent first-click "counterparty_pubkey
+    // must be 33-byte compressed hex" race. Logs:
+    //   * peer->order_id and peer's maker_pubkey_hex from the freshly-
+    //     refreshed m_orders list
+    //   * total offer count to spot ghost duplicates
+    //   * offerGet's response for the same order_id
+    //   * the snapshot's maker_pubkey_hex prefix so we can compare bytes
+    //     between consecutive clicks.
+    LogInfo("Pricoin start_swap CLICK: oid=%s peer.oid=%s peer.maker.size=%d "
+            "peer.maker.head=%s m_orders.count=%d origin=%s\n",
+            oid.substr(0, 12),
+            peer->order_id.substr(0, 12),
+            (int)peer->maker_pubkey_hex.size(),
+            peer->maker_pubkey_hex.substr(0, 16),
+            (int)m_orders.size(),
+            peer->origin);
+
     std::string cp_hex = peer->maker_pubkey_hex;
     if (cp_hex.size() != 66) {
         const auto fresh = m_model->wallet().offerGet(peer->order_id);
+        LogInfo("Pricoin start_swap REFETCH: offerGet(%s) returned %s%s\n",
+                peer->order_id.substr(0, 12),
+                fresh ? "value" : "<empty>",
+                fresh ? (" maker.size=" + std::to_string(fresh->maker_pubkey_hex.size())
+                        + " maker.head=" + fresh->maker_pubkey_hex.substr(0, 16)).c_str()
+                      : "");
         if (fresh && fresh->maker_pubkey_hex.size() == 66) {
             cp_hex = fresh->maker_pubkey_hex;
-            LogInfo("Pricoin start_swap: stale peer maker_pubkey_hex (was %d "
-                    "chars), refetched via offerGet (now %d chars)\n",
-                    (int)peer->maker_pubkey_hex.size(),
-                    (int)cp_hex.size());
-        } else {
-            LogInfo("Pricoin start_swap: peer maker_pubkey_hex still bad after "
-                    "offerGet (size=%d)\n",
-                    fresh ? (int)fresh->maker_pubkey_hex.size() : -1);
+        }
+        // Last-resort: scan the entire offer list for a record whose
+        // matched_with link points to mine. If we find one with a
+        // valid maker_pubkey_hex, use it. This bypasses any subtle
+        // mismatch between peer->order_id (from the cached snapshot)
+        // and what's actually persisted.
+        if (cp_hex.size() != 66 && mine) {
+            for (const auto& o : m_orders) {
+                if (o.matched_with_order_id == mine->order_id &&
+                    o.maker_pubkey_hex.size() == 66) {
+                    cp_hex = o.maker_pubkey_hex;
+                    LogInfo("Pricoin start_swap LAST_RESORT: found peer by "
+                            "matched_with-link; oid=%s maker.head=%s\n",
+                            o.order_id.substr(0, 12),
+                            o.maker_pubkey_hex.substr(0, 16));
+                    break;
+                }
+            }
         }
     }
 

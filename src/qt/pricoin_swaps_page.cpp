@@ -777,6 +777,66 @@ void PricoinSwapsPage::onAdvanceClicked()
 
     // ─── AdaptorReady → BtcFunded ───
     if (snap.state == "adaptor_ready") {
+        // Hands-free funding for the PRIC buyer (Bob): foreign-chain
+        // 2-of-2 funding tx is built, signed, broadcast, and watch-
+        // registered in one shot via pricoin_btc_fund_swap. Then we
+        // DM Alice a tx_announce so her chain watcher tracks the
+        // same txid. Alice doesn't fund foreign — she waits.
+        //
+        // The legacy paste dialog stays as a fallback when role isn't
+        // recognised; that path is what was here before automation.
+        if (snap.role == "alice") {
+            setStatus(tr("Waiting for PRIC buyer to fund the foreign chain. "
+                          "Your wallet will auto-advance when their tx-announce "
+                          "DM arrives and the funding tx confirms."));
+            return;
+        }
+        if (snap.role == "bob") {
+            UniValue p{UniValue::VARR};
+            p.push_back(sid);
+            p.push_back(static_cast<int64_t>(1000));  // default fee_sat
+            UniValue r;
+            try {
+                r = m_model->node().executeRpc("pricoin_btc_fund_swap", p,
+                    "/wallet/" + m_model->getWalletName().toStdString());
+            } catch (const UniValue& e) {
+                setStatus(tr("BTC fund failed: %1").arg(
+                    e.isObject() && e.exists("message")
+                        ? QString::fromStdString(e["message"].get_str())
+                        : QString::fromStdString(e.write())), true);
+                return;
+            } catch (const std::exception& e) {
+                setStatus(tr("BTC fund failed: %1").arg(e.what()), true);
+                return;
+            }
+            const std::string txid_hex = r["txid"].get_str();
+            // The funding RPC just broadcast — local state is still
+            // AdaptorReady until the chain watcher confirms. The
+            // watcher entry was auto-registered by the RPC. We DM
+            // Alice the txid so her watcher tracks it too.
+            const std::string& cp = snap.counterparty_pubkey_hex;
+            if (cp.size() >= 66) {
+                const QString peer_xonly = QString::fromStdString(cp.substr(2));
+                auto* nostr = m_model->getOrCreateNostrClient();
+                if (nostr) {
+                    nostr->publishBroadcastAnnouncement(
+                        peer_xonly,
+                        QString::fromStdString(sid),
+                        QStringLiteral("foreign_funding"),
+                        QString::fromStdString(txid_hex),
+                        /*vout=*/0,
+                        /*min_confirmations=*/1);
+                }
+            }
+            setStatus(tr("BTC funding tx broadcast — txid %1. Your watcher "
+                          "will mark BtcFunded once it confirms; counterparty "
+                          "notified to track the same tx.")
+                .arg(QString::fromStdString(txid_hex).left(16) + "…"));
+            refreshTable();
+            return;
+        }
+
+        // Fallback: unknown role → show the legacy paste dialog.
         dlg.setWindowTitle(tr("Set BTC funded"));
         auto* txid = AddTextRow(form, tr("Foreign funding txid:"), &dlg);
         auto* vout = AddIntRow(form, tr("Foreign funding vout:"), &dlg, 0, 65535, 0);
