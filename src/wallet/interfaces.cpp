@@ -494,14 +494,21 @@ public:
 
         // Optional pinned swap_id (matcher pre-allocates and ships
         // via swap_start DM so receiver's mirror keys match).
+        // CRITICAL: use uint256::FromHex, not TryParseHex+raw-copy.
+        // uint256::ToString returns byte-REVERSED hex (Bitcoin
+        // convention); to round-trip, the receiver must parse via
+        // FromHex which inverts that reversal. A naive byte-copy
+        // here produces a different uint256 than the matcher's, so
+        // every subsequent coord DM (adaptor_setup, abort) carries
+        // a swap_id that doesn't exist on the matcher's side.
         uint256 sid_pinned;
         const uint256* sid_pinned_ptr = nullptr;
         if (!p.swap_id_hex.empty()) {
-            const auto bytes = TryParseHex<unsigned char>(p.swap_id_hex);
-            if (!bytes || bytes->size() != 32) {
+            auto sid_opt = uint256::FromHex(p.swap_id_hex);
+            if (!sid_opt) {
                 return util::Error{Untranslated("swap_id_hex must be 32-byte hex if present")};
             }
-            std::copy(bytes->begin(), bytes->end(), sid_pinned.begin());
+            sid_pinned = *sid_opt;
             sid_pinned_ptr = &sid_pinned;
         }
 
