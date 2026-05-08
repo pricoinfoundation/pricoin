@@ -708,6 +708,19 @@ void PricoinOrderbookPage::onStartSwapClicked()
         }
     }
 
+    // CRITICAL: take value copies before any RPC / dialog yields the
+    // event loop. The auto-refresh timer (or any signal that calls
+    // refreshTable) replaces m_orders, freeing the storage that
+    // `mine` and `peer` point into. Dereferencing those pointers
+    // afterwards reads garbage — and on bad luck crashes the app
+    // with no log, since UB doesn't write to debug.log on its way
+    // out. Switching to copies eliminates the dangling-pointer class
+    // of bug entirely for the rest of this function.
+    const interfaces::Wallet::PricoinOfferSnapshot mine_v = *mine;
+    const interfaces::Wallet::PricoinOfferSnapshot peer_v = *peer;
+    mine = &mine_v;
+    peer = &peer_v;
+
     // Map orderbook side → adaptor-swap role.
     //   sell_pric (giving up PRIC, receiving foreign) → Alice (PRIC seller)
     //   buy_pric  (giving up foreign, receiving PRIC) → Bob   (PRIC buyer)
