@@ -663,6 +663,15 @@ void PricoinOrderbookPage::onStartSwapClicked()
     const std::string oid = selectedOrderId();
     if (oid.empty()) return;
 
+    // Refresh the cached order snapshot at click time. m_orders is
+    // a stale-able copy populated by refreshTable; if the user clicks
+    // Start-swap immediately after matching (before the next refresh
+    // tick), the imported peer's maker_pubkey_hex can still be empty
+    // → adaptorSwapCreate fails with "counterparty_pubkey must be
+    // 33-byte compressed hex". Re-pulling from the wallet here closes
+    // that race without needing to retry-click.
+    m_orders = m_model->wallet().offerList();
+
     // Determine my-vs-peer order based on origin. The local order
     // (origin=local) is "mine"; the imported peer (origin=imported)
     // is the counterparty.
