@@ -1004,9 +1004,31 @@ void PricoinOrderbookPage::onStartSwapClicked()
 
     if (dlg.exec() != QDialog::Accepted) return;
 
+    // Defensive re-fetch of the peer's maker_pubkey_hex. The cached
+    // m_orders snapshot has tripped a stale-cache race more than once
+    // — we already refresh m_orders at the top of this function, but
+    // an extra direct offerGet is cheap insurance against any layer
+    // (wallet-side memo, signal ordering, etc.) that could leave the
+    // pubkey under-populated for an instant after a fresh match.
+    std::string cp_hex = peer->maker_pubkey_hex;
+    if (cp_hex.size() != 66) {
+        const auto fresh = m_model->wallet().offerGet(peer->order_id);
+        if (fresh && fresh->maker_pubkey_hex.size() == 66) {
+            cp_hex = fresh->maker_pubkey_hex;
+            LogInfo("Pricoin start_swap: stale peer maker_pubkey_hex (was %d "
+                    "chars), refetched via offerGet (now %d chars)\n",
+                    (int)peer->maker_pubkey_hex.size(),
+                    (int)cp_hex.size());
+        } else {
+            LogInfo("Pricoin start_swap: peer maker_pubkey_hex still bad after "
+                    "offerGet (size=%d)\n",
+                    fresh ? (int)fresh->maker_pubkey_hex.size() : -1);
+        }
+    }
+
     interfaces::Wallet::PricoinAdaptorSwapCreateParams ap;
     ap.role = my_role;
-    ap.counterparty_pubkey_hex = peer->maker_pubkey_hex;
+    ap.counterparty_pubkey_hex = cp_hex;
     ap.foreign_chain = mine->foreign_chain;
     ap.foreign_amount_sat = foreign_amount;
     ap.pric_joint_stealth_address = joint_edit->text().trimmed().toStdString();

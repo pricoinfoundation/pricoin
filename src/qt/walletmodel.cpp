@@ -19,6 +19,7 @@
 #include <common/args.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
+#include <logging.h>
 #include <univalue.h>
 #include <key_io.h>
 #include <node/interface_ui.h>
@@ -609,10 +610,23 @@ void WalletModel::onAutoSwapwatchDM(const QString& from_xonly_hex,
                                       const QString& plaintext)
 {
     UniValue env;
-    if (!env.read(plaintext.toStdString()) || !env.isObject()) return;
+    if (!env.read(plaintext.toStdString()) || !env.isObject()) {
+        LogInfo("Pricoin coord-DM: dropped (not JSON object) from=%s\n",
+                from_xonly_hex.left(12).toStdString());
+        return;
+    }
     if (!env.exists("type") || !env["type"].isStr()) return;
     const std::string type = env["type"].get_str();
-    if (!env.exists("swap_id") || !env["swap_id"].isStr()) return;
+    // Skip non-coord DM types silently (orderbook handlers see them).
+    if (type != "tx_announce" && type != "pricoin:swap_abort/v1" &&
+        type != "pricoin:adaptor_setup/v1") {
+        return;
+    }
+    if (!env.exists("swap_id") || !env["swap_id"].isStr()) {
+        LogInfo("Pricoin coord-DM: type=%s missing swap_id from=%s\n",
+                type, from_xonly_hex.left(12).toStdString());
+        return;
+    }
     const std::string swap_id = env["swap_id"].get_str();
 
     // Sender authentication: the DM must come from the swap's
@@ -621,9 +635,21 @@ void WalletModel::onAutoSwapwatchDM(const QString& from_xonly_hex,
     // The Nostr layer already verifies the BIP340 sig — we just
     // need to ensure that pubkey matches the swap's counterparty.
     auto snap = wallet().adaptorSwapGet(swap_id);
-    if (!snap) return;
+    if (!snap) {
+        LogInfo("Pricoin coord-DM: type=%s swap_id=%s not found locally "
+                "(matcher's swap_id_hex didn't propagate?) from=%s\n",
+                type, swap_id.substr(0, 12), from_xonly_hex.left(12).toStdString());
+        return;
+    }
     const std::string& cp = snap->counterparty_pubkey_hex;
-    if (cp.size() < 66 || cp.substr(2) != from_xonly_hex.toStdString()) return;
+    if (cp.size() < 66 || cp.substr(2) != from_xonly_hex.toStdString()) {
+        LogInfo("Pricoin coord-DM: type=%s swap_id=%s sender %s ≠ counterparty %s — rejected\n",
+                type, swap_id.substr(0, 12), from_xonly_hex.left(12).toStdString(),
+                cp.size() >= 66 ? cp.substr(2, 12) : std::string("<empty>"));
+        return;
+    }
+    LogInfo("Pricoin coord-DM: handling type=%s swap_id=%s state=%s role=%s\n",
+            type, swap_id.substr(0, 12), snap->state, snap->role);
 
     const std::string uri = "/wallet/" + getWalletName().toStdString();
 
