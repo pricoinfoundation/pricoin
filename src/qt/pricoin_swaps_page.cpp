@@ -1175,6 +1175,62 @@ void PricoinSwapsPage::onAbortClicked()
     if (!m_model) return;
     const std::string sid = selectedSwapId();
     if (sid.empty()) return;
+
+    // Safety gate: if the swap is past funding and there's no refund
+    // pre-signature in place, aborting STRANDS funds in the 2-of-2
+    // multisig output. The button used to allow this silently — that's
+    // exactly how 0.0002 BTC got locked the first time. Now we surface
+    // the consequence in a dialog the user has to actively confirm,
+    // and only allow proceed via typed confirmation.
+    //
+    // Funded states (per the current state machine ordering):
+    //   * btc_funded  — Bob's BTC in 2-of-2, no refund presig yet.
+    //   * both_funded — Alice's PRIC also locked, still no refund presig.
+    //   * pre_signed  — both refund presigs exchanged → "Refund…" is
+    //                   the right button, NOT Abort.
+    // Pre-funding states (setup, adaptor_ready) are safe to abort.
+    {
+        const auto snap_opt = m_model->wallet().adaptorSwapGet(sid);
+        if (snap_opt) {
+            const std::string& st = snap_opt->state;
+            const bool funded_no_recovery =
+                (st == "btc_funded" || st == "both_funded");
+            if (funded_no_recovery) {
+                QString detail = tr(
+                    "<b>Aborting at this state will permanently strand on-chain funds.</b><br><br>"
+                    "This swap has reached <b>%1</b>. At this stage, neither side has "
+                    "exchanged a refund pre-signature — the funding output is a 2-of-2 "
+                    "multisig with no unilateral exit. Marking the swap aborted only "
+                    "updates the local record; it does NOT broadcast a refund tx, "
+                    "because no refund tx has been built.<br><br>"
+                    "<b>What's actually locked:</b><br>"
+                    "&nbsp;&nbsp;• Foreign-chain funding: %2 sats in the 2-of-2 output.<br>"
+                    "&nbsp;&nbsp;• PRIC funding (if reached): %3 sats in the joint stealth.<br><br>"
+                    "<b>Recovery options:</b><br>"
+                    "&nbsp;&nbsp;• <b>Don't abort.</b> Continue the protocol forward to PreSigned, "
+                    "then click <b>Refund…</b> — that path uses a properly signed refund tx.<br>"
+                    "&nbsp;&nbsp;• If your counterparty has disappeared, the funds are unrecoverable "
+                    "without a cooperative MuSig2 signing ceremony (not yet wired into the GUI).<br><br>"
+                    "Proceeding with Abort means you are knowingly accepting that the funds "
+                    "above will be stuck until either a recovery flow lands or the counterparty "
+                    "agrees to cooperatively sign a recovery tx.<br><br>"
+                    "Type <b>ABANDON FUNDS</b> below to confirm.")
+                        .arg(QString::fromStdString(st))
+                        .arg(QString::number(snap_opt->foreign_amount_sat))
+                        .arg(QString::number(snap_opt->pric_amount_sat));
+                bool ok_typed = false;
+                const QString confirm = QInputDialog::getText(
+                    this, tr("⚠ Abort would strand funds"),
+                    detail, QLineEdit::Normal, QString(), &ok_typed);
+                if (!ok_typed) return;
+                if (confirm.trimmed() != QStringLiteral("ABANDON FUNDS")) {
+                    setStatus(tr("Abort cancelled (confirmation phrase mismatch — funds remain safe in protocol)."));
+                    return;
+                }
+            }
+        }
+    }
+
     bool ok = false;
     const QString reason = QInputDialog::getText(
         this, tr("Abort swap"),
