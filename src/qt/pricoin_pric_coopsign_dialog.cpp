@@ -166,15 +166,14 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
         }
     }
 
-    // Auto-coord kickoff: try once on construction. If preconditions
-    // aren't met (Nostr not yet connected, swap record doesn't have
-    // pric funding info), it's a no-op and Nostr-connect will retry.
-    // ALSO auto-click "Connect Nostr DM" so users don't have to —
-    // the relay client is shared with the wallet and reuses any
-    // existing connection, but the dialog's signal wiring (incl.
-    // directMessageReceived) only happens via onNostrConnectClicked.
+    // Subscribe to the shared Nostr client SYNCHRONOUSLY so we don't
+    // race against incoming DMs that arrive between dialog show and
+    // QueuedConnection delivery. (Observed 2026-05-11: Mac's partial
+    // DM arrived before Linux's deferred subscribe ran, signal fired
+    // with no listeners, DM lost.) The compute step still goes via
+    // QueuedConnection so it doesn't block ctor on RPC calls.
+    if (!m_nostr) onNostrConnectClicked();
     QMetaObject::invokeMethod(this, [this]{
-        if (!m_nostr) onNostrConnectClicked();
         tryAutoComputeJointscanPartial();
     }, Qt::QueuedConnection);
 }
@@ -560,6 +559,13 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
                 m_in_ls_peer_partial->setText(QString::fromStdString(partial));
                 setStatus(tr("Peer scan partial auto-pasted from DM."));
                 tryAutoLoadshare();
+                // Bilateral resend: if I sent my partial before peer's
+                // dialog was subscribed, peer never received it. Now
+                // that peer is clearly online (we just received from
+                // them), re-send our own partial so peer can fill
+                // their side. Drop the idempotent guard for this case.
+                m_auto_partial_sent = false;
+                tryAutoSendJointscanPartial();
             }
             return;
         }
@@ -574,6 +580,9 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
                 m_in_X_pub_peer->setText(QString::fromStdString(xpub));
                 setStatus(tr("Peer X_pub auto-pasted from DM."));
                 tryAutoStep1();
+                // Bilateral resend (see jointscan above).
+                m_auto_xpub_announced = false;
+                tryAutoSendXpubAnnounce();
             }
             return;
         }
@@ -653,15 +662,27 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
     if (!env.exists("round")) return;
     const int round = env["round"].getInt<int>();
     if (round == 1 && env.exists("share") && m_in_peer_share_json) {
-        m_in_peer_share_json->setPlainText(
-            QString::fromStdString(env["share"].write(2)));
-        setStatus(tr("Peer share auto-pasted from DM."));
-        tryAutoStep2();
+        if (m_in_peer_share_json->toPlainText().trimmed().isEmpty()) {
+            m_in_peer_share_json->setPlainText(
+                QString::fromStdString(env["share"].write(2)));
+            setStatus(tr("Peer share auto-pasted from DM."));
+            tryAutoStep2();
+            // Bilateral resend: if my Step 1 share was sent before
+            // peer subscribed, it never landed. Resend now that peer
+            // is clearly online.
+            m_auto_step1_dm_sent = false;
+            tryAutoSendRound1();
+        }
     } else if (round == 3 && env.exists("s_share") && m_in_peer_s_share) {
-        m_in_peer_s_share->setText(
-            QString::fromStdString(env["s_share"].get_str()));
-        setStatus(tr("Peer s_share auto-pasted from DM."));
-        tryAutoStep4();
+        if (m_in_peer_s_share->text().trimmed().isEmpty()) {
+            m_in_peer_s_share->setText(
+                QString::fromStdString(env["s_share"].get_str()));
+            setStatus(tr("Peer s_share auto-pasted from DM."));
+            tryAutoStep4();
+            // Bilateral resend (same reasoning as round 1).
+            m_auto_step3_dm_sent = false;
+            tryAutoSendRound3();
+        }
     }
 }
 
