@@ -77,9 +77,15 @@ bool LoadFromDBLocked(CWallet& wallet, WalletCache& cache)
         WalletBatch batch(wallet.GetDatabase());
         if (!batch.ReadAllPricoinAdaptorSwaps(blobs)) return false;
     }
+    int dropped = 0;
     for (auto& [sid, blob] : blobs) {
         std::vector<unsigned char> plain;
         if (!::wallet::pricoin_stealth::DecryptWalletBlob(wallet, blob, plain)) {
+            // Wallet locked, MAC mismatch, or wrong-key. The latter
+            // shouldn't happen on a non-tampered wallet; the former
+            // (locked) just means we can't see swap state right now,
+            // and we should fail the whole load so the caller can
+            // retry once unlocked. So return false here, NOT skip.
             return false;
         }
         DataStream ds{std::span<const unsigned char>{plain}};
@@ -87,10 +93,28 @@ bool LoadFromDBLocked(CWallet& wallet, WalletCache& cache)
         try {
             ds >> s;
         } catch (const std::exception&) {
-            return false;
+            // Pre-format record (older serialization layout) — the
+            // appended-field convention means new code can fail to
+            // deserialize an old record. Skip it instead of failing
+            // the entire cache load: stale records (typically aborted
+            // from prior test sessions) shouldn't block creation of
+            // new swaps. The user can purge them via a wallet sweep
+            // if they want a clean state.
+            ++dropped;
+            continue;
         }
-        if (s.swap_id != sid) return false;
+        if (s.swap_id != sid) {
+            // Sid mismatch is a corruption indicator — drop, don't fail.
+            ++dropped;
+            continue;
+        }
         cache.by_id[sid] = std::move(s);
+    }
+    if (dropped > 0) {
+        LogInfo("Pricoin adaptor_swap: dropped %d stale/unparseable record(s) "
+                "during cache load (likely from older serialization layout); "
+                "%d valid record(s) loaded\n",
+                dropped, (int)cache.by_id.size());
     }
     return true;
 }
