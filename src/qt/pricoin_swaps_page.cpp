@@ -569,15 +569,59 @@ void PricoinSwapsPage::onAdvanceClicked()
                     .arg(QString::fromStdString(util::ErrorString(sm).original)), true);
                 return;
             }
-            // Default refund timelocks — suggested values that match the
-            // legacy dialog's defaults. Future revision: derive from
-            // chain heights + spec-mandated minimums.
-            constexpr int kDefaultPricRefundHeight    = 100000;
-            constexpr int kDefaultForeignRefundHeight = 100200;
-            constexpr int kDefaultDeltaMin            = 144;
+            // Refund timelocks — derived from CURRENT chain heights plus a
+            // safety delta. Hardcoded absolute heights (the old default of
+            // 100000/100200) are nonsensical on any real chain — the LTC
+            // mainnet tip is in the millions, so 100200 puts the HTLC
+            // refund path immediately spendable on confirmation, racing
+            // with the claim path. Compute relative offsets:
+            //   * foreign delta: 144 blocks. On LTC (2.5min) ≈ 6 hours;
+            //     on BTC (10min) ≈ 24 hours. Plenty of time for a
+            //     happy-path claim to fire before the refund window
+            //     opens.
+            //   * pric delta: foreign delta in seconds × pric_blocks_per_sec
+            //     + delta_min_blocks (144) safety. Pricoin's 150s block
+            //     time means foreign 144 LTC blocks = ~21,600s = 144 PRIC
+            //     blocks; so we need pric refund to be later than that
+            //     plus the delta-min safety gap. Settle on
+            //     pric_delta = foreign_delta * (foreign_block_time / 150)
+            //     + delta_min_blocks.
+            const std::string& chain = snap.foreign_chain;
+            constexpr int kDeltaMin            = 144;
+            constexpr int kForeignDelta        = 144;
+            // Foreign-chain block-time approximations (seconds).
+            const int foreign_block_time = (chain == "btc") ? 600 : 150;  // ltc=150
+            const int pric_delta = static_cast<int>(
+                (static_cast<double>(kForeignDelta) * foreign_block_time) / 150.0)
+                + kDeltaMin;
+
+            int pric_tip = 0;
+            if (auto h = m_model->node().getNumBlocks(); h > 0) pric_tip = static_cast<int>(h);
+            int foreign_tip = 0;
+            try {
+                UniValue p_h{UniValue::VARR};
+                p_h.push_back(chain);
+                UniValue r_h = m_model->node().executeRpc(
+                    "pricoin_chainwatch_height", p_h, "");
+                if (r_h.isObject() && r_h.exists("height") && r_h["height"].isNum()) {
+                    foreign_tip = r_h["height"].getInt<int>();
+                }
+            } catch (...) {
+                // Backend unreachable — fall back to a conservative
+                // far-future value so the HTLC refund path doesn't
+                // open immediately.
+                foreign_tip = 0;
+            }
+            if (foreign_tip <= 0 || pric_tip <= 0) {
+                setStatus(tr("Cannot derive refund timelocks: foreign or PRIC "
+                              "chain tip unavailable. Check %1 backend / wallet sync.")
+                    .arg(QString::fromStdString(chain)), true);
+                return;
+            }
+            const int pric_refund_h    = pric_tip    + pric_delta;
+            const int foreign_refund_h = foreign_tip + kForeignDelta;
             const auto rt = m_model->wallet().adaptorSwapSetRefundTimelocks(
-                sid, kDefaultPricRefundHeight, kDefaultForeignRefundHeight,
-                kDefaultDeltaMin);
+                sid, pric_refund_h, foreign_refund_h, kDeltaMin);
             if (!rt) {
                 setStatus(tr("Set timelocks failed: %1")
                     .arg(QString::fromStdString(util::ErrorString(rt).original)), true);
@@ -585,11 +629,11 @@ void PricoinSwapsPage::onAdvanceClicked()
             }
             refreshTable();
 
-            // Push the materials + ephemeral r to Alice via DM so her
-            // side auto-advances. r is required for Alice's PRIC
-            // funding tx to produce an on-chain P_pi that matches the
-            // adaptor binding (T_G/T_H were computed against P_pi
-            // derived from r).
+            // Push the materials + ephemeral r + the freshly-derived
+            // refund heights to Alice via DM so her side auto-advances
+            // and applies the SAME timelocks (otherwise the two sides'
+            // refund txs would target different heights, breaking the
+            // delta_min safety).
             QJsonObject m;
             m.insert(QStringLiteral("type"),
                 QStringLiteral("pricoin:adaptor_setup/v1"));
@@ -597,9 +641,9 @@ void PricoinSwapsPage::onAdvanceClicked()
             m.insert(QStringLiteral("T_H"),  QString::fromStdString(T_H_hex));
             m.insert(QStringLiteral("dleq"), QString::fromStdString(dleq_hex));
             m.insert(QStringLiteral("r"),    QString::fromStdString(r_hex));
-            m.insert(QStringLiteral("pric_refund_height"),    kDefaultPricRefundHeight);
-            m.insert(QStringLiteral("foreign_refund_height"), kDefaultForeignRefundHeight);
-            m.insert(QStringLiteral("delta_min"),             kDefaultDeltaMin);
+            m.insert(QStringLiteral("pric_refund_height"),    pric_refund_h);
+            m.insert(QStringLiteral("foreign_refund_height"), foreign_refund_h);
+            m.insert(QStringLiteral("delta_min"),             kDeltaMin);
             const bool dm_sent = sendSwapCoordDM(sid, m);
             setStatus(dm_sent
                 ? tr("Advanced to AdaptorReady. Counterparty notified.")
@@ -928,6 +972,48 @@ void PricoinSwapsPage::onAdvanceClicked()
                               "counterparty. Wait for the adaptor_setup DM, or "
                               "abort and retry from a fresh match."), true);
                 return;
+            }
+            // SAFETY GATE: warn loudly if PRIC refund presig isn't in
+            // place. Funding now means: if the swap stalls before the
+            // PreSigned ceremony completes, the PRIC funding output is
+            // stuck in the joint stealth — recoverable only via a
+            // cooperative joint-spend ceremony with the counterparty
+            // (or, soon, the new "Recover PRIC" button). The current
+            // protocol order puts PreSigned AFTER funding, so this
+            // warning will fire on every initial swap until the order
+            // is restructured. Until then, ack the risk explicitly.
+            if (!snap.has_pric_refund_presig) {
+                QString warn = tr(
+                    "<b>PRIC refund pre-signature is NOT in place.</b><br><br>"
+                    "Funding %1 sats now means: if the protocol stalls before "
+                    "the PreSigned ceremony completes, the PRIC funding output "
+                    "will be locked in the joint stealth address. Recovery is "
+                    "only possible via a cooperative signing ceremony with the "
+                    "counterparty.<br><br>"
+                    "<b>Foreign-chain side</b> (%2): "
+                    "%3<br><br>"
+                    "If you're testing on small amounts and your counterparty "
+                    "is online and cooperating, this is acceptable. For real "
+                    "value, complete PreSigned before funding (current "
+                    "protocol order makes this awkward — fix is in progress).<br><br>"
+                    "Type <b>I ACCEPT</b> below to proceed with PRIC funding.")
+                    .arg(QString::number(snap.pric_amount_sat))
+                    .arg(QString::fromStdString(snap.foreign_chain))
+                    .arg(snap.foreign_chain == "ltc"
+                         ? tr("LTC HTLC has built-in CLTV unilateral refund — "
+                              "funder can recover after foreign_refund_height.")
+                         : tr("BTC 2-of-2 has NO unilateral refund — funder is "
+                              "at the mercy of the counterparty until refund "
+                              "presig exists."));
+                bool ok_typed = false;
+                const QString confirm = QInputDialog::getText(
+                    this, tr("⚠ PRIC funding without refund pre-sig"),
+                    warn, QLineEdit::Normal, QString(), &ok_typed);
+                if (!ok_typed) return;
+                if (confirm.trimmed() != QStringLiteral("I ACCEPT")) {
+                    setStatus(tr("PRIC fund cancelled — confirmation phrase mismatch."));
+                    return;
+                }
             }
             // Modest fixed fee — Pricoin doesn't have a fee-estimator
             // yet on a fresh chain. Tx is ~3.5 KB; 10000 sats ≈ 3 sat/B,

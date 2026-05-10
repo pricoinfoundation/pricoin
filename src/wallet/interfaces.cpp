@@ -480,6 +480,8 @@ public:
         if (s.has_pric_ephemeral_r) {
             o.pric_ephemeral_r_hex = HexStr(s.pric_ephemeral_r);
         }
+        o.has_pric_refund_presig = !s.presigs.pric_refund_sig_blob.empty();
+        o.has_btc_refund_presig  = (s.presigs.btc_refund_sig.size() == 64);
         return o;
     }
 

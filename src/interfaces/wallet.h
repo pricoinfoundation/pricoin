@@ -282,6 +282,13 @@ public:
         // adaptor_setup step.
         bool        has_pric_ephemeral_r{false};
         std::string pric_ephemeral_r_hex;
+
+        // Refund pre-signature presence flags. Required to safely
+        // proceed past funding — without a refund pre-sig, funded coins
+        // are stuck if the protocol stalls. The Qt safety gates inspect
+        // these before allowing auto-fund / state advance.
+        bool        has_pric_refund_presig{false};
+        bool        has_btc_refund_presig{false};
     };
 
     struct PricoinAdaptorSwapCreateParams {
