@@ -1047,6 +1047,29 @@ void PricoinSwapsPage::onAdvanceClicked()
                 return;
             }
             const std::string txid_hex = r_send["txid"].get_str();
+            // Register a local pric_funding watch so the chain watcher
+            // ticks the swap forward when this tx confirms — symmetric
+            // with what pricoin_btc_fund_swap does for the foreign leg.
+            // (walletsendct_ring just broadcasts; it doesn't know about
+            // swap state.)
+            try {
+                UniValue p_watch{UniValue::VARR};
+                p_watch.push_back(sid);
+                p_watch.push_back("pric_funding");
+                p_watch.push_back(txid_hex);
+                p_watch.push_back(0);  // vout
+                p_watch.push_back(1);  // min_confirmations
+                m_model->node().executeRpc("pricoin_swapwatch_add", p_watch,
+                    "/wallet/" + m_model->getWalletName().toStdString());
+            } catch (...) {
+                // Watch already exists or other backend issue. Not fatal —
+                // the counterparty's watcher will still flip its side via
+                // the tx_announce, and a manual SetPricFunded works as
+                // fallback. Surface a soft warning.
+                setStatus(tr("PRIC fund broadcast but local watcher entry "
+                              "could not be registered — state may need a "
+                              "manual SetPricFunded after confirmation."), true);
+            }
             // DM Bob the txid so his watcher tracks it.
             const std::string& cp = snap.counterparty_pubkey_hex;
             if (cp.size() >= 66) {

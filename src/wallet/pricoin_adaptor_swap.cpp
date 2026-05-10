@@ -211,6 +211,16 @@ CreateResult Create(
         LOCK(g_mutex);
         auto& cache = EnsureCache(wallet);
         if (!EnsureLoadedLocked(wallet, cache)) return CreateResult::WriteFailed;
+        // Idempotent re-create guard. A pinned swap_id can be triggered
+        // by a replayed swap_start DM on relay reconnect; without this,
+        // Create would clobber a live swap's state (funding metadata,
+        // adaptor secret t, presigs) back to Setup. If a record already
+        // exists for this swap_id, return the existing record unchanged.
+        auto existing = cache.by_id.find(s.swap_id);
+        if (existing != cache.by_id.end()) {
+            out = existing->second;
+            return CreateResult::Ok;
+        }
         if (!WriteToDB(wallet, s)) return CreateResult::WriteFailed;
         cache.by_id[s.swap_id] = s;
     }
