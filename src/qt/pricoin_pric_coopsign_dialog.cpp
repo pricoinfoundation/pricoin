@@ -153,16 +153,28 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
     // PricAdaptor (claim) → spender is Bob. PricPlain (refund) →
     // spender is Alice. Set the combobox so the user doesn't have
     // to think about it.
-    if (m_in_role && m_wm && !swap_id.empty()) {
+    //
+    // Also set absorb_shared_secret deterministically: Alice = true,
+    // Bob = false. EXACTLY ONE party must absorb so the two x_shares
+    // sum to the joint one-time priv. Default-to-true on both was
+    // producing two-true → invalid x_share sum.
+    if (m_wm && !swap_id.empty()) {
         auto snap = m_wm->wallet().adaptorSwapGet(swap_id);
         if (snap) {
             const bool i_am_alice = (snap->role == "alice");
             const bool i_am_spender =
                 (m_mode == Mode::PricAdaptor && !i_am_alice) ||
                 (m_mode == Mode::PricPlain   &&  i_am_alice);
-            m_in_role->setCurrentText(i_am_spender
-                ? QStringLiteral("initiator")
-                : QStringLiteral("responder"));
+            if (m_in_role) {
+                m_in_role->setCurrentText(i_am_spender
+                    ? QStringLiteral("initiator")
+                    : QStringLiteral("responder"));
+            }
+            if (m_in_ls_absorb) {
+                m_in_ls_absorb->setCurrentText(i_am_alice
+                    ? QStringLiteral("true")
+                    : QStringLiteral("false"));
+            }
         }
     }
 
@@ -200,13 +212,28 @@ void PricCoopSignDialog::onRunLoadshare()
     }
     const std::string absorb = m_in_ls_absorb->currentText().toStdString();
 
-    // Need the joint tx_hex; loadshare reads the chain. The RPC
-    // takes (joint_tx_hex, joint_vout, my_partial, peer_partial,
-    // absorb_h_s) — but the user pasted partials, not the tx_hex.
-    // For simplicity here, the RPC requires joint_tx_hex; we ask
-    // the chain to give it up via getrawtransaction.
-    std::string params_get = std::string("[\"") + joint_txid.toStdString() + "\",1]";
-    auto rg = callRpc("getrawtransaction", params_get);
+    // The RPC takes 6 params: (tx_hex, vout, my_partial, other_partial,
+    // other_spend_pubkey, absorb_shared_secret). other_spend_pubkey is
+    // the counterparty's 33-byte spend pubkey, which lives on the swap
+    // record as `counterparty_pubkey_hex`.
+    std::string other_spend_hex;
+    if (m_wm && !m_swap_id.isEmpty()) {
+        auto snap = m_wm->wallet().adaptorSwapGet(m_swap_id.toStdString());
+        if (snap && snap->counterparty_pubkey_hex.size() == 66) {
+            other_spend_hex = snap->counterparty_pubkey_hex;
+        }
+    }
+    if (other_spend_hex.size() != 66) {
+        setStatus(tr("Counterparty spend pubkey unavailable (swap record incomplete)"), true);
+        return;
+    }
+
+    // Need the joint tx_hex. Fetch via getrawtransaction; works with
+    // -txindex=1 (now defaulted) for any historical tx.
+    UniValue params_get_v{UniValue::VARR};
+    params_get_v.push_back(joint_txid.toStdString());
+    params_get_v.push_back(1);
+    auto rg = callRpc("getrawtransaction", params_get_v.write(0));
     if (!rg.ok) {
         setStatus(tr("getrawtransaction failed: %1").arg(QString::fromStdString(rg.error_msg)), true);
         return;
@@ -215,12 +242,14 @@ void PricCoopSignDialog::onRunLoadshare()
     gv.read(rg.json);
     const std::string tx_hex = gv["hex"].get_str();
 
-    std::string params = std::string("[\"") + tx_hex + "\","
-        + std::to_string(vout) + ",\""
-        + my_p.toStdString() + "\",\""
-        + peer_p.toStdString() + "\","
-        + absorb + "]";
-    auto r = callRpc("pricoin_jointspend_loadshare", params);
+    UniValue params_v{UniValue::VARR};
+    params_v.push_back(tx_hex);
+    params_v.push_back(vout);
+    params_v.push_back(my_p.toStdString());
+    params_v.push_back(peer_p.toStdString());
+    params_v.push_back(other_spend_hex);
+    params_v.push_back(absorb == std::string{"true"});  // bool
+    auto r = callRpc("pricoin_jointspend_loadshare", params_v.write(0));
     if (!r.ok) {
         setStatus(tr("loadshare failed: %1").arg(QString::fromStdString(r.error_msg)), true);
         return;
