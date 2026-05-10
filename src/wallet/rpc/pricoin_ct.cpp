@@ -1281,6 +1281,10 @@ RPCMethod walletsendct_ring()
             {"dest_amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Amount in PRIC"},
             {"fee", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Transparent fee in PRIC"},
             {"ring_size", RPCArg::Type::NUM, RPCArg::Default{4}, "Total ring size (must have ring_size-1 decoys available)"},
+            {"pinned_ephemeral_priv", RPCArg::Type::STR_HEX, RPCArg::Default{""},
+                "Optional 32-byte hex secp256k1 priv to use as the per-output ephemeral r "
+                "for the recipient (NOT change/decoys). Required for atomic-swap PRIC "
+                "funding so on-chain P_pi matches the adaptor binding. Empty/omitted = random."},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -1304,6 +1308,19 @@ RPCMethod walletsendct_ring()
             const CAmount fee = AmountFromValue(request.params[2]);
             const int ring_size = request.params[3].isNull() ? 4 : request.params[3].getInt<int>();
             if (ring_size < 2) throw JSONRPCError(RPC_INVALID_PARAMETER, "ring_size must be >= 2");
+
+            // Optional pinned ephemeral for the recipient output.
+            std::vector<unsigned char> pinned_eph_priv;
+            if (!request.params[4].isNull()) {
+                const std::string h = request.params[4].get_str();
+                if (!h.empty()) {
+                    if (!IsHex(h) || h.size() != 64) {
+                        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                            "pinned_ephemeral_priv must be 32-byte hex (64 chars)");
+                    }
+                    pinned_eph_priv = ParseHex(h);
+                }
+            }
 
             const auto parsed_dest = ::pricoin::stealth::ParseStealthAddress(dest_addr_str);
             if (!parsed_dest) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "dest_address must be a stealth address");
@@ -1408,15 +1425,16 @@ RPCMethod walletsendct_ring()
                 const ::pricoin::stealth::StealthAddress* stealth;
                 CAmount amount;
                 ::pricoin::stealth::AddressKind kind;
+                bool is_recipient;  // true → use pinned_eph_priv if set
             };
             std::vector<PendingOut> pending;
             pending.reserve(3);
-            pending.push_back({stealth_dest, dest_amount, dest_kind});
+            pending.push_back({stealth_dest, dest_amount, dest_kind, /*is_recipient=*/true});
             pending.push_back({&id.public_address, change_value,
-                               ::pricoin::stealth::AddressKind::Main});
+                               ::pricoin::stealth::AddressKind::Main, false});
             while (pending.size() < 3) {
                 pending.push_back({&id.public_address, 0,
-                                   ::pricoin::stealth::AddressKind::Main});
+                                   ::pricoin::stealth::AddressKind::Main, false});
             }
             FastRandomContext shuffle_rng;
             std::shuffle(pending.begin(), pending.end(), shuffle_rng);
@@ -1433,7 +1451,17 @@ RPCMethod walletsendct_ring()
             std::vector<ResolvedOut> outs;
             outs.reserve(pending.size());
             for (size_t i = 0; i < pending.size(); ++i) {
-                CKey r; r.MakeNewKey(true);
+                CKey r;
+                if (pending[i].is_recipient && !pinned_eph_priv.empty()) {
+                    r.Set(pinned_eph_priv.begin(), pinned_eph_priv.end(),
+                          /*fCompressed=*/true);
+                    if (!r.IsValid()) {
+                        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                            "pinned_ephemeral_priv is not a valid secp256k1 scalar");
+                    }
+                } else {
+                    r.MakeNewKey(true);
+                }
                 ResolvedOut ro;
                 ro.amount = pending[i].amount;
                 const auto R_bytes = ::pricoin::stealth::ComputeStealthR(

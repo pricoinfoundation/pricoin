@@ -4,6 +4,7 @@
 
 #include <qt/pricoin_swaps_page.h>
 
+#include <core_io.h>
 #include <interfaces/node.h>
 #include <qt/pricoin_coopsign_dialog.h>
 #include <qt/pricoin_nostr_client.h>
@@ -1019,17 +1020,33 @@ void PricoinSwapsPage::onAdvanceClicked()
             // yet on a fresh chain. Tx is ~3.5 KB; 10000 sats ≈ 3 sat/B,
             // safe for an experimental chain at low traffic.
             const CAmount fee_sats = 10000;
-            auto sendr = m_model->wallet().sendConfidentialPinned(
-                snap.pric_joint_stealth_address,
-                snap.pric_amount_sat,
-                fee_sats,
-                snap.pric_ephemeral_r_hex);
-            if (!sendr) {
-                setStatus(tr("PRIC fund failed: %1")
-                    .arg(QString::fromStdString(util::ErrorString(sendr).original)), true);
+            // Use walletsendct_ring (CT inputs + ring sig) rather than
+            // the transparent-input variant — production Pricoin users
+            // hold confidential outputs, not P2WPKH. The pinned_eph_priv
+            // param threads the swap's ephemeral r through to the
+            // recipient output's stealth derivation so on-chain P_pi
+            // matches the adaptor binding.
+            UniValue p_send{UniValue::VARR};
+            p_send.push_back(snap.pric_joint_stealth_address);
+            p_send.push_back(ValueFromAmount(snap.pric_amount_sat));
+            p_send.push_back(ValueFromAmount(fee_sats));
+            p_send.push_back(/*ring_size=*/4);
+            p_send.push_back(snap.pric_ephemeral_r_hex);
+            UniValue r_send;
+            try {
+                r_send = m_model->node().executeRpc("walletsendct_ring", p_send,
+                    "/wallet/" + m_model->getWalletName().toStdString());
+            } catch (const UniValue& e) {
+                setStatus(tr("PRIC fund failed: %1").arg(
+                    e.isObject() && e.exists("message")
+                        ? QString::fromStdString(e["message"].get_str())
+                        : QString::fromStdString(e.write())), true);
+                return;
+            } catch (const std::exception& e) {
+                setStatus(tr("PRIC fund failed: %1").arg(e.what()), true);
                 return;
             }
-            const std::string txid_hex = sendr->ToString();
+            const std::string txid_hex = r_send["txid"].get_str();
             // DM Bob the txid so his watcher tracks it.
             const std::string& cp = snap.counterparty_pubkey_hex;
             if (cp.size() >= 66) {
