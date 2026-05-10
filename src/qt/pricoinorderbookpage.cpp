@@ -4,6 +4,7 @@
 
 #include <qt/pricoinorderbookpage.h>
 
+#include <common/args.h>
 #include <qt/pricoin_joint_stealth_dialog.h>
 #include <qt/pricoin_match_dialog.h>
 #include <qt/pricoin_nostr_client.h>
@@ -192,6 +193,26 @@ public:
                     .arg(QString::fromStdString(out.foreign_chain).toUpper())
                     .arg(QString::number(static_cast<double>(out.foreign_amount_at_max_sat)/1e8, 'f', 8))
                     .arg(QString::number(static_cast<double>(min_foreign_sat)/1e8, 'f', 8));
+            return false;
+        }
+        // Buy-PRIC orders require txindex=1 on this node. Reason: the
+        // PRIC funding tx is broadcast by the seller (Alice) into a
+        // joint-stealth output that the buyer's (Bob's) wallet can't
+        // see in mapWallet (cooperative output, requires both view
+        // shares). The chain watcher's PricTxStatus falls back to
+        // node::GetTransaction(nullptr, mempool, ...) which only finds
+        // confirmed-but-not-mempool txs via g_txindex. Without
+        // txindex, the buyer's swap stalls at BtcFunded waiting for
+        // a confirmation that never auto-detects.
+        if (out.side == "buy_pric" && !gArgs.GetBoolArg("-txindex", false)) {
+            err = tr("Buy-PRIC orders require txindex=1 on this node.\n\n"
+                     "Without it, your wallet can't auto-confirm the seller's "
+                     "PRIC funding tx (it's a joint-stealth output your wallet "
+                     "doesn't track on its own), and the swap will stall at "
+                     "BtcFunded.\n\nTo enable: add `txindex=1` to your "
+                     "pricoin.conf, restart pricoind/qt, and wait for the "
+                     "txindex to build (seconds to minutes for the current "
+                     "chain). Then re-create this order.");
             return false;
         }
         out.expiry_unix_sec = QDateTime::currentSecsSinceEpoch()

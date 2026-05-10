@@ -169,7 +169,12 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
     // Auto-coord kickoff: try once on construction. If preconditions
     // aren't met (Nostr not yet connected, swap record doesn't have
     // pric funding info), it's a no-op and Nostr-connect will retry.
+    // ALSO auto-click "Connect Nostr DM" so users don't have to —
+    // the relay client is shared with the wallet and reuses any
+    // existing connection, but the dialog's signal wiring (incl.
+    // directMessageReceived) only happens via onNostrConnectClicked.
     QMetaObject::invokeMethod(this, [this]{
+        if (!m_nostr) onNostrConnectClicked();
         tryAutoComputeJointscanPartial();
     }, Qt::QueuedConnection);
 }
@@ -436,6 +441,15 @@ void PricCoopSignDialog::onNostrConnectClicked()
         m_relay_connected_count = m_nostr->connectedCount();
     }
     updateNostrStatus();
+    // Auto-coord kickoff: when this dialog hooks into an already-
+    // connected shared client, no relayStatusChanged signal fires
+    // (the relays were connected before we subscribed), so the
+    // auto-coord chain never starts. Drive it here too.
+    if (m_relay_connected_count > 0) {
+        tryAutoComputeJointscanPartial();
+        tryAutoSendJointscanPartial();
+        tryAutoSendXpubAnnounce();
+    }
 }
 
 void PricCoopSignDialog::onNostrRelayStatus(const QString& url, bool connected)

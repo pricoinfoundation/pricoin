@@ -16,7 +16,14 @@ namespace interfaces {
 class Chain;
 }
 
-static constexpr bool DEFAULT_TXINDEX{false};
+// Pricoin: defaults to true. The chain watcher's PRIC funding tx
+// auto-detection routes through node::GetTransaction(nullptr,
+// mempool, ...) which only finds confirmed-but-not-mempool txs via
+// g_txindex. Without it, the buyer (Bob, the cosigner of a joint-
+// stealth output) can't auto-confirm the seller's PRIC funding tx
+// and the swap stalls at BtcFunded. Bitcoin's upstream default is
+// false; we flip it on for Pricoin's swap UX.
+static constexpr bool DEFAULT_TXINDEX{true};
 
 /**
  * TxIndex is used to look up transactions included in the blockchain by hash.
