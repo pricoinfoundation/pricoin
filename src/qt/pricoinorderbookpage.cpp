@@ -166,6 +166,34 @@ public:
             err = tr("computed amount underflowed to zero — increase qty or price");
             return false;
         }
+        // Min-trade gate. Trading amounts smaller than typical fees on
+        // the foreign chain quickly turns into a fee-only loss when
+        // anything goes wrong (and on the user's first tests, things
+        // tend to). Conservative per-chain floors here; tune later.
+        // PRIC floor stays uniform since on-chain footprint per swap
+        // is similar regardless of chain.
+        constexpr int64_t kMinPricSat = 100'000'000;          // 1 PRIC
+        const int64_t min_foreign_sat = [&]() -> int64_t {
+            if (out.foreign_chain == "btc")     return    50'000;  // 0.0005 BTC
+            if (out.foreign_chain == "ltc")     return   500'000;  // 0.005 LTC
+            if (out.foreign_chain == "regtest") return         1;  // tests
+            return                                          50'000;
+        }();
+        if (out.max_pric_amount_sat < kMinPricSat) {
+            err = tr("PRIC amount %1 is below the minimum %2 — small trades are "
+                     "fee-loss-prone and not allowed.")
+                    .arg(QString::number(static_cast<double>(out.max_pric_amount_sat)/1e8, 'f', 8))
+                    .arg(QString::number(static_cast<double>(kMinPricSat)/1e8, 'f', 8));
+            return false;
+        }
+        if (out.foreign_amount_at_max_sat < min_foreign_sat) {
+            err = tr("Foreign (%1) amount %2 is below the minimum %3 — small "
+                     "trades are fee-loss-prone and not allowed.")
+                    .arg(QString::fromStdString(out.foreign_chain).toUpper())
+                    .arg(QString::number(static_cast<double>(out.foreign_amount_at_max_sat)/1e8, 'f', 8))
+                    .arg(QString::number(static_cast<double>(min_foreign_sat)/1e8, 'f', 8));
+            return false;
+        }
         out.expiry_unix_sec = QDateTime::currentSecsSinceEpoch()
                               + static_cast<int64_t>(m_expiry_hours->value()) * 3600;
         out.notes = m_notes->text().toStdString();

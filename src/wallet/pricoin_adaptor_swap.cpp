@@ -453,6 +453,35 @@ TransitionResult SetPricClaimRing(
     });
 }
 
+TransitionResult SetPricRefundTx(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::string& unsigned_tx_hex)
+{
+    if (unsigned_tx_hex.empty()) return TransitionResult::InvalidInput;
+    // Be liberal in what we accept here — the buildtx output is the
+    // authoritative source. Just sanity-check it's hex-shaped and
+    // non-tiny.
+    if (unsigned_tx_hex.size() < 20) return TransitionResult::InvalidInput;
+    return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
+        if (s.state == State::Setup) return TransitionResult::InvalidState;
+        if (s.state == State::Complete || s.state == State::Refunded
+            || s.state == State::Aborted) {
+            return TransitionResult::InvalidState;
+        }
+        if (!s.pric_refund_unsigned_tx_hex.empty()) {
+            // Idempotent re-set with same value is OK; re-set with
+            // different value isn't (don't clobber a captured refund).
+            if (s.pric_refund_unsigned_tx_hex == unsigned_tx_hex) {
+                return TransitionResult::Ok;
+            }
+            return TransitionResult::InvalidInput;
+        }
+        s.pric_refund_unsigned_tx_hex = unsigned_tx_hex;
+        return TransitionResult::Ok;
+    });
+}
+
 TransitionResult SetComplete(
     CWallet& wallet,
     const uint256& swap_id,

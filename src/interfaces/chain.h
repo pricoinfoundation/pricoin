@@ -191,6 +191,15 @@ public:
     //! Check if transaction is in mempool.
     virtual bool isInMempool(const Txid& txid) = 0;
 
+    //! Look up a transaction anywhere on chain or in mempool. Returns
+    //! the transaction along with the containing block hash (null if
+    //! mempool-only) when found, std::nullopt when not. Used by the
+    //! adaptor-swap chain watcher to confirm PRIC funding txs that the
+    //! local wallet did NOT broadcast (cooperative joint-stealth outputs
+    //! never enter mapWallet).
+    virtual std::optional<std::pair<CTransactionRef, uint256>>
+        findOnChainOrInMempool(const Txid& txid) = 0;
+
     //! Check if transaction has descendants in mempool.
     virtual bool hasDescendantsInMempool(const Txid& txid) = 0;
 

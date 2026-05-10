@@ -4,6 +4,7 @@
 
 #include <wallet/pricoin_chain_watcher.h>
 
+#include <common/args.h>
 #include <crypto/sha256.h>
 #include <interfaces/chain.h>
 #include <logging.h>
@@ -13,6 +14,7 @@
 #include <streams.h>
 #include <util/strencodings.h>
 #include <util/time.h>
+#include <wallet/pricoin_swap_refund.h>
 #include <wallet/pricoin_adaptor_swap.h>
 #include <wallet/pricoin_stealth.h>
 #include <wallet/wallet.h>
@@ -401,6 +403,145 @@ void ChainWatcher::TickOnce()
     Tick();
 }
 
+// Auto-refund sweep — gated on `-pricoinautorefund=1`. Iterates all
+// non-terminal swaps where I'm Bob (LTC funder) and the LTC chain
+// tip is past the refund timelock. Calls AutoBroadcastLtcRefund()
+// which builds + broadcasts the LTC HTLC's CLTV refund branch and
+// registers a foreign_refund watch entry to drive SetRefunded on
+// confirmation.
+//
+// Conservative defaults: opt-in, dest must be configured, in-memory
+// dedup so repeated ticks don't re-broadcast a successful submission
+// (the foreign_refund watch entry will eventually drive state to
+// Refunded; until then we trust the dedup map). On failure (e.g.
+// LTC backend unreachable), the swap_id is NOT added to the dedup
+// map so the next tick will retry.
+void ChainWatcher::TryAutoRefundLtc()
+{
+    if (!gArgs.GetBoolArg("-pricoinautorefund", false)) return;
+    const std::string dest = gArgs.GetArg("-pricoinltcrefundaddr", "");
+    if (dest.empty()) {
+        // Once-per-process warning would be nicer; for now log
+        // every tick (interval is 30s default — noisy but visible).
+        // Keep this terse so the log doesn't drown.
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            LogInfo("Pricoin auto-refund: enabled but no "
+                    "-pricoinltcrefundaddr configured; refund will "
+                    "be skipped until set\n");
+        }
+        return;
+    }
+
+    using namespace ::wallet::pricoin_adaptor_swap;
+    std::vector<AdaptorSwap> swaps;
+    if (List(m_wallet, swaps) != LookupResult::Ok) return;
+
+    for (const auto& s : swaps) {
+        if (m_stopping.load()) return;
+        if (s.role != Role::Bob) continue;
+        if (s.foreign_chain != "ltc") continue;
+        // Refund only meaningful for states where on-chain LTC
+        // exists but the swap hasn't completed/refunded already.
+        if (s.state != State::BtcFunded
+            && s.state != State::BothFunded
+            && s.state != State::PreSigned
+            && s.state != State::PricClaimed) continue;
+        if (s.foreign_funding_txid.empty()) continue;
+        if (!s.foreign_refund_txid.empty()) continue;  // already refunded
+        if (s.foreign_refund_height <= 0) continue;
+        if (m_refund_attempted.count(s.swap_id)) continue;
+
+        // LTC tip check via the chain client. Use the same client
+        // resolution logic as the watch-entry path.
+        std::shared_ptr<IForeignChainClient> client;
+        auto it = m_clients.find("ltc");
+        if (it != m_clients.end()) client = it->second;
+        else client = MakeForeignClientFromRegistry("ltc");
+        if (!client) continue;
+        if (IsChainCoolingDown("ltc")) continue;
+        const auto tip = client->TipHeight();
+        if (!tip) {
+            RecordChainError("ltc");
+            continue;
+        }
+        if (*tip < static_cast<int>(s.foreign_refund_height)) continue;
+
+        LogInfo("Pricoin auto-refund: LTC tip %d ≥ refund height %d for "
+                "swap %s — broadcasting refund\n",
+                *tip, s.foreign_refund_height,
+                s.swap_id.ToString().substr(0, 12));
+
+        auto r = ::wallet::pricoin_swap_refund::AutoBroadcastLtcRefund(
+            m_wallet, s.swap_id, dest, /*fee_sat=*/1000);
+        if (r.ok) {
+            LogInfo("Pricoin auto-refund: LTC refund broadcast for swap %s, "
+                    "txid %s\n",
+                    s.swap_id.ToString().substr(0, 12), r.txid);
+            m_refund_attempted.insert(s.swap_id);
+        } else {
+            LogInfo("Pricoin auto-refund: LTC refund failed for swap %s: %s "
+                    "(will retry next tick)\n",
+                    s.swap_id.ToString().substr(0, 12), r.error);
+        }
+    }
+}
+
+// PRIC auto-refund — Alice's safety net. Broadcasts the cooperative
+// presigned refund tx once the PRIC chain tip reaches the PRIC refund
+// timelock. Requires the spender (Alice) to have run buildtx during
+// the PreSigned ceremony so `pric_refund_unsigned_tx_hex` is on the
+// swap record. Same gArgs gate as LTC refund.
+//
+// Either party's wallet COULD broadcast a fully-cooperative-signed
+// PRIC refund. In MVP only the spender's wallet has the unsigned tx
+// hex persisted (cosigner doesn't currently receive it via DM), so
+// only Alice's wallet auto-broadcasts. Bob's wallet is a no-op for
+// PRIC refund — his auto-refund path is the LTC unilateral CLTV.
+void ChainWatcher::TryAutoRefundPric()
+{
+    if (!gArgs.GetBoolArg("-pricoinautorefund", false)) return;
+
+    using namespace ::wallet::pricoin_adaptor_swap;
+    std::vector<AdaptorSwap> swaps;
+    if (List(m_wallet, swaps) != LookupResult::Ok) return;
+
+    const std::optional<int> pric_tip = m_wallet.chain().getHeight();
+    if (!pric_tip) return;
+
+    for (const auto& s : swaps) {
+        if (m_stopping.load()) return;
+        if (s.role != Role::Alice) continue;
+        if (s.state != State::PreSigned
+            && s.state != State::PricClaimed
+            && s.state != State::BothFunded) continue;
+        if (s.pric_refund_unsigned_tx_hex.empty()) continue;
+        if (s.presigs.pric_refund_sig_blob.empty()) continue;
+        if (!s.pric_refund_txid.IsNull()) continue;
+        if (s.pric_refund_height <= 0) continue;
+        if (m_pric_refund_attempted.count(s.swap_id)) continue;
+        if (*pric_tip < s.pric_refund_height) continue;
+
+        LogInfo("Pricoin auto-refund: PRIC tip %d ≥ refund height %d for "
+                "swap %s — broadcasting presigned refund\n",
+                *pric_tip, s.pric_refund_height,
+                s.swap_id.ToString().substr(0, 12));
+
+        auto r = ::wallet::pricoin_swap_refund::AutoBroadcastPricRefund(
+            m_wallet, s.swap_id);
+        if (r.ok) {
+            LogInfo("Pricoin auto-refund: PRIC refund broadcast for swap %s, "
+                    "txid %s\n",
+                    s.swap_id.ToString().substr(0, 12), r.txid);
+            m_pric_refund_attempted.insert(s.swap_id);
+        } else {
+            LogInfo("Pricoin auto-refund: PRIC refund failed for swap %s: %s "
+                    "(will retry next tick)\n",
+                    s.swap_id.ToString().substr(0, 12), r.error);
+        }
+    }
+}
+
 void ChainWatcher::Tick()
 {
     std::vector<WatchEntry> entries;
@@ -414,6 +555,10 @@ void ChainWatcher::Tick()
             ++m_transitions_applied;
         }
     }
+    if (m_stopping.load()) return;
+    TryAutoRefundLtc();
+    if (m_stopping.load()) return;
+    TryAutoRefundPric();
 }
 
 // PRIC-leg confirmation lookup via interfaces::Chain. Equivalent
@@ -435,25 +580,49 @@ std::optional<ForeignTxStatus> ChainWatcher::PricTxStatus(const std::string& txi
 {
     auto txid = uint256::FromHex(txid_hex);
     if (!txid) return std::nullopt;
-    LOCK(m_wallet.cs_wallet);
-    auto it = m_wallet.mapWallet.find(Txid::FromUint256(*txid));
-    if (it == m_wallet.mapWallet.end()) {
+
+    // Fast path: txs the wallet sent or received are in mapWallet,
+    // GetTxDepthInMainChain handles confirmation depth correctly.
+    {
+        LOCK(m_wallet.cs_wallet);
+        auto it = m_wallet.mapWallet.find(Txid::FromUint256(*txid));
+        if (it != m_wallet.mapWallet.end()) {
+            const ::wallet::CWalletTx& wtx = it->second;
+            ForeignTxStatus s;
+            s.found = true;
+            s.confirmations = m_wallet.GetTxDepthInMainChain(wtx);
+            if (s.confirmations > 0) {
+                const std::optional<int> tip = m_wallet.chain().getHeight();
+                if (tip) s.block_height = *tip - s.confirmations + 1;
+            }
+            return s;
+        }
+    }
+
+    // Slow path: cooperative joint-stealth funding txs aren't in
+    // mapWallet for the non-broadcasting party (the joint output's
+    // one-time pubkey requires both wallets' view shares to recover).
+    // Fall back to the chain interface, which sees any tx that's in
+    // mempool or in a block on disk.
+    auto found = m_wallet.chain().findOnChainOrInMempool(Txid::FromUint256(*txid));
+    if (!found) {
         ForeignTxStatus s;
         s.found = false;
         return s;
     }
-    const ::wallet::CWalletTx& wtx = it->second;
     ForeignTxStatus s;
     s.found = true;
-    // GetDepthInMainChain returns 0 for unconfirmed, ≥1 for confirmed.
-    s.confirmations = m_wallet.GetTxDepthInMainChain(wtx);
-    if (s.confirmations > 0) {
-        // Best-effort block height — interfaces::Chain has it but
-        // wtx itself doesn't expose it cleanly. The watcher's
-        // SetX calls accept height; passing the wallet's chain tip
-        // minus depth as a reasonable approximation.
+    const uint256& hash_block = found->second;
+    if (hash_block.IsNull()) {
+        // Mempool only — unconfirmed.
+        s.confirmations = 0;
+        return s;
+    }
+    int block_height = 0;
+    if (m_wallet.chain().findBlock(hash_block, ::interfaces::FoundBlock().height(block_height))) {
+        s.block_height = block_height;
         const std::optional<int> tip = m_wallet.chain().getHeight();
-        if (tip) s.block_height = *tip - s.confirmations + 1;
+        if (tip && *tip >= block_height) s.confirmations = *tip - block_height + 1;
     }
     return s;
 }

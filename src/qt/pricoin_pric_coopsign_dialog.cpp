@@ -5,12 +5,15 @@
 #include <qt/pricoin_pric_coopsign_dialog.h>
 
 #include <interfaces/node.h>
+#include <interfaces/wallet.h>
 #include <qt/pricoin_nostr_client.h>
 #include <qt/pricoin_relay_settings_dialog.h>
 #include <qt/walletmodel.h>
 #include <random.h>
 #include <univalue.h>
+#include <util/result.h>
 #include <util/strencodings.h>
+#include <util/translation.h>
 
 #include <QApplication>
 #include <QCheckBox>
@@ -144,6 +147,31 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
             }
         }
     }
+
+    // Auto-coord: derive role (initiator/responder) from swap role
+    // + leg. Convention: spender = initiator, cosigner = responder.
+    // PricAdaptor (claim) → spender is Bob. PricPlain (refund) →
+    // spender is Alice. Set the combobox so the user doesn't have
+    // to think about it.
+    if (m_in_role && m_wm && !swap_id.empty()) {
+        auto snap = m_wm->wallet().adaptorSwapGet(swap_id);
+        if (snap) {
+            const bool i_am_alice = (snap->role == "alice");
+            const bool i_am_spender =
+                (m_mode == Mode::PricAdaptor && !i_am_alice) ||
+                (m_mode == Mode::PricPlain   &&  i_am_alice);
+            m_in_role->setCurrentText(i_am_spender
+                ? QStringLiteral("initiator")
+                : QStringLiteral("responder"));
+        }
+    }
+
+    // Auto-coord kickoff: try once on construction. If preconditions
+    // aren't met (Nostr not yet connected, swap record doesn't have
+    // pric funding info), it's a no-op and Nostr-connect will retry.
+    QMetaObject::invokeMethod(this, [this]{
+        tryAutoComputeJointscanPartial();
+    }, Qt::QueuedConnection);
 }
 
 void PricCoopSignDialog::onRunLoadshare()
@@ -196,24 +224,42 @@ void PricCoopSignDialog::onRunLoadshare()
     UniValue v;
     v.read(r.json);
     const std::string x_share        = v["x_share"].get_str();
-    const std::string b_prev_hex     = v.exists("b_prev")     ? v["b_prev"].get_str()     : "";
+    // RPC returns the field as "blind" — older code here read
+    // "b_prev" and silently fell back to empty, which then failed
+    // buildtx with "joint_blind must be 32-byte hex". Fixed.
+    const std::string blind_hex      = v.exists("blind")      ? v["blind"].get_str()      : "";
     const std::string joint_pub_hex  = v.exists("joint_pubkey") ? v["joint_pubkey"].get_str() : "";
     const std::string value_str      = v.exists("value")      ? v["value"].getValStr()    : "";
+    const std::string x_pub_hex      = v.exists("x_pub")      ? v["x_pub"].get_str()      : "";
     if (m_in_x_share)         m_in_x_share->setText(QString::fromStdString(x_share));
-    if (m_in_bt_joint_blind && !b_prev_hex.empty()) {
-        m_in_bt_joint_blind->setText(QString::fromStdString(b_prev_hex));
+    if (m_in_bt_joint_blind && !blind_hex.empty()) {
+        m_in_bt_joint_blind->setText(QString::fromStdString(blind_hex));
     }
     if (m_in_joint_pubkey && !joint_pub_hex.empty()) {
         m_in_joint_pubkey->setText(QString::fromStdString(joint_pub_hex));
     }
-    // Show the loadshare echo (excluding x_share since it's password-
-    // masked above and shouldn't be screen-pasted again).
+    // Adaptor-mode helper: x_pub = x_share · G is needed at Step 1.
+    // Today the user pastes it manually; loadshare now returns it
+    // so we can just auto-fill.
+    if (m_in_X_pub_X && !x_pub_hex.empty()
+        && m_in_X_pub_X->text().trimmed().isEmpty()) {
+        m_in_X_pub_X->setText(QString::fromStdString(x_pub_hex));
+    }
+    // Show the loadshare echo (excluding x_share since it's a
+    // long-lived secret and shouldn't be screen-pasted).
     UniValue echo{UniValue::VOBJ};
-    if (!b_prev_hex.empty())    echo.pushKV("b_prev",      b_prev_hex);
+    if (!blind_hex.empty())     echo.pushKV("blind",        blind_hex);
     if (!joint_pub_hex.empty()) echo.pushKV("joint_pubkey", joint_pub_hex);
     if (!value_str.empty())     echo.pushKV("value",        value_str);
+    if (!x_pub_hex.empty())     echo.pushKV("x_pub",        x_pub_hex);
     m_out_loadshare->setPlainText(QString::fromStdString(echo.write(2)));
     setStatus(tr("Loadshare OK. x_share + joint_blind + joint_pubkey filled."));
+
+    // Auto-coord chain: Phase 2 (xpub announce + auto-buildtx if I'm
+    // spender) and Phase 3 (Step 1+ chain).
+    tryAutoSendXpubAnnounce();
+    tryAutoBuildtx();
+    tryAutoStep1();
 }
 
 void PricCoopSignDialog::onRunBuildtx()
@@ -305,6 +351,27 @@ void PricCoopSignDialog::onRunBuildtx()
     out.pushKV("joint_pubkey", v["joint_pubkey"]);
     m_out_buildtx->setPlainText(QString::fromStdString(out.write(2)));
     setStatus(tr("Buildtx OK. msg / ring_ml / pi / z_self auto-filled. Send `z_other_for_peer` + ring + pi + msg + joint_pubkey to peer."));
+
+    // Persist the unsigned PRIC refund tx for the auto-refund
+    // watcher. Plain mode only (PricPlain == refund leg). Best-
+    // effort — failure here just means auto-refund won't trigger
+    // for this swap; manual refund still works.
+    if (m_mode == Mode::PricPlain && m_wm && !m_swap_id.isEmpty()
+        && !m_unsigned_tx_hex.isEmpty()) {
+        auto rr = m_wm->wallet().adaptorSwapSetPricRefundTx(
+            m_swap_id.toStdString(), m_unsigned_tx_hex.toStdString());
+        if (!rr) {
+            // Surface but don't block.
+            setStatus(tr("Buildtx OK; persisting refund tx for auto-refund "
+                         "failed: %1")
+                .arg(QString::fromStdString(util::ErrorString(rr).original)),
+                /*error=*/false);
+        }
+    }
+    // Auto-DM the buildtx output to the cosigner so they don't have
+    // to copy-paste msg/pi/ring/etc. Idempotent guard.
+    tryAutoSendBuildtx();
+    tryAutoStep1();
 }
 
 // ─── Nostr DM transport ──────────────────────────────────────────
@@ -378,6 +445,13 @@ void PricCoopSignDialog::onNostrRelayStatus(const QString& url, bool connected)
     else --m_relay_connected_count;
     if (m_relay_connected_count < 0) m_relay_connected_count = 0;
     updateNostrStatus();
+    // Auto-coord retry: now that we're connected, try the jointscan
+    // partial path again. Either the partial wasn't yet computed (will
+    // compute now) or was computed but not sent (will send now).
+    if (connected && m_relay_connected_count > 0) {
+        tryAutoComputeJointscanPartial();
+        tryAutoSendJointscanPartial();
+    }
 }
 
 void PricCoopSignDialog::onNostrLog(const QString& msg)
@@ -450,17 +524,480 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
         setStatus(tr("Peer DM received (auto-paste disabled — use Paste buttons)."));
         return;
     }
+
+    // Auto-coord: jointscan partial exchange. Envelope shape:
+    //   { v:1, leg:"...", swap_id:"...", kind:"jointscan",
+    //     partial:"<33-byte hex>" }
+    // Filter to this leg so a refund-leg DM doesn't cross-fill the
+    // claim-leg dialog.
+    const std::string my_leg = (m_mode == Mode::PricAdaptor)
+        ? "pric_claim_adaptor" : "pric_refund";
+    if (env.exists("kind") && env["kind"].isStr()) {
+        const std::string env_leg = env.exists("leg") && env["leg"].isStr()
+            ? env["leg"].get_str() : std::string{};
+        if (!env_leg.empty() && env_leg != my_leg) return;
+        const std::string kind = env["kind"].get_str();
+
+        if (kind == "jointscan") {
+            if (!env.exists("partial") || !env["partial"].isStr()) return;
+            const std::string partial = env["partial"].get_str();
+            if (partial.size() != 66) return;  // 33-byte hex
+            if (m_in_ls_peer_partial && m_in_ls_peer_partial->text().trimmed().isEmpty()) {
+                m_in_ls_peer_partial->setText(QString::fromStdString(partial));
+                setStatus(tr("Peer scan partial auto-pasted from DM."));
+                tryAutoLoadshare();
+            }
+            return;
+        }
+
+        if (kind == "xpub_announce") {
+            // Adaptor mode only — plain mode has no X_pub field.
+            if (m_mode != Mode::PricAdaptor) return;
+            if (!env.exists("x_pub") || !env["x_pub"].isStr()) return;
+            const std::string xpub = env["x_pub"].get_str();
+            if (xpub.size() != 66) return;
+            if (m_in_X_pub_peer && m_in_X_pub_peer->text().trimmed().isEmpty()) {
+                m_in_X_pub_peer->setText(QString::fromStdString(xpub));
+                setStatus(tr("Peer X_pub auto-pasted from DM."));
+                tryAutoStep1();
+            }
+            return;
+        }
+
+        if (kind == "buildtx") {
+            // Cosigner-side auto-fill from spender's buildtx output.
+            // Only meaningful if I'm the cosigner — but we can fill
+            // even if I'm spender (idempotent: skip if my fields
+            // already non-empty).
+            if (env.exists("sighash") && env["sighash"].isStr()
+                && m_in_msg && m_in_msg->text().trimmed().isEmpty()) {
+                m_in_msg->setText(QString::fromStdString(env["sighash"].get_str()));
+            }
+            if (env.exists("pi") && m_in_pi && m_in_pi->text().trimmed().isEmpty()) {
+                m_in_pi->setText(QString::number(env["pi"].getInt<int>()));
+            }
+            if (env.exists("ring_or_ml") && m_in_ring_or_ring_ml
+                && m_in_ring_or_ring_ml->toPlainText().trimmed().isEmpty()) {
+                m_in_ring_or_ring_ml->setPlainText(
+                    QString::fromStdString(env["ring_or_ml"].write(2)));
+            }
+            if (env.exists("joint_pubkey") && env["joint_pubkey"].isStr()
+                && m_in_joint_pubkey && m_in_joint_pubkey->text().trimmed().isEmpty()) {
+                m_in_joint_pubkey->setText(
+                    QString::fromStdString(env["joint_pubkey"].get_str()));
+            }
+            if (env.exists("session_id") && env["session_id"].isStr()
+                && m_in_session_id) {
+                // session_id MUST match across both parties — overwrite
+                // even if the user (or the ctor-default RandomHex32)
+                // pre-filled with a different value.
+                m_in_session_id->setText(
+                    QString::fromStdString(env["session_id"].get_str()));
+            }
+            if (env.exists("ring_hash") && env["ring_hash"].isStr()
+                && m_in_ring_hash) {
+                m_in_ring_hash->setText(
+                    QString::fromStdString(env["ring_hash"].get_str()));
+            }
+            if (env.exists("joint_output_id") && env["joint_output_id"].isStr()
+                && m_in_joint_output_id) {
+                m_in_joint_output_id->setText(
+                    QString::fromStdString(env["joint_output_id"].get_str()));
+            }
+            if (m_mode == Mode::PricPlain) {
+                if (env.exists("z_other") && env["z_other"].isStr()
+                    && m_in_z_share && m_in_z_share->text().trimmed().isEmpty()) {
+                    m_in_z_share->setText(
+                        QString::fromStdString(env["z_other"].get_str()));
+                }
+            }
+            if (m_mode == Mode::PricAdaptor) {
+                if (env.exists("x_pub_spender") && env["x_pub_spender"].isStr()
+                    && m_in_X_pub_peer && m_in_X_pub_peer->text().trimmed().isEmpty()) {
+                    // Cosigner: peer's X_pub goes into the X_pub_peer
+                    // field (which the existing Step 2 logic reads).
+                    m_in_X_pub_peer->setText(
+                        QString::fromStdString(env["x_pub_spender"].get_str()));
+                }
+                if (env.exists("session_label") && env["session_label"].isStr()
+                    && m_in_session_label) {
+                    m_in_session_label->setText(
+                        QString::fromStdString(env["session_label"].get_str()));
+                }
+                if (env.exists("session_payload") && env["session_payload"].isStr()
+                    && m_in_session_payload) {
+                    m_in_session_payload->setText(
+                        QString::fromStdString(env["session_payload"].get_str()));
+                }
+            }
+            setStatus(tr("Buildtx output auto-pasted from peer DM."));
+            tryAutoStep1();
+            return;
+        }
+    }
+
     if (!env.exists("round")) return;
     const int round = env["round"].getInt<int>();
     if (round == 1 && env.exists("share") && m_in_peer_share_json) {
         m_in_peer_share_json->setPlainText(
             QString::fromStdString(env["share"].write(2)));
-        setStatus(tr("Peer share auto-pasted from DM. Run step 2."));
+        setStatus(tr("Peer share auto-pasted from DM."));
+        tryAutoStep2();
     } else if (round == 3 && env.exists("s_share") && m_in_peer_s_share) {
         m_in_peer_s_share->setText(
             QString::fromStdString(env["s_share"].get_str()));
-        setStatus(tr("Peer s_share auto-pasted from DM. Run step 4."));
+        setStatus(tr("Peer s_share auto-pasted from DM."));
+        tryAutoStep4();
     }
+}
+
+// ─── Auto-coord helpers ──────────────────────────────────────────
+//
+// Phase 1: jointscan partial. Both wallets need each other's
+// scan partial to recover the joint output's (value, blind,
+// joint_pubkey). Today the user runs pricoin_jointscan_partial
+// manually, exchanges partials by hand, pastes them in. Auto-coord:
+// dialog computes its own partial when preconditions met (Nostr
+// connected, swap record has pric_funding_txid + pric_funding_height,
+// peer xonly known), DMs to peer, fills own field, and fires
+// "Run loadshare" automatically once the peer's partial arrives.
+
+void PricCoopSignDialog::tryAutoComputeJointscanPartial()
+{
+    if (m_auto_partial_computed) return;
+    if (!m_wm) return;
+    if (m_swap_id.isEmpty()) return;
+    if (!m_in_ls_my_partial) return;
+    if (!m_in_ls_my_partial->text().trimmed().isEmpty()) {
+        // User pre-filled it — don't clobber.
+        m_auto_partial_computed = true;
+        tryAutoSendJointscanPartial();
+        return;
+    }
+    auto snap = m_wm->wallet().adaptorSwapGet(m_swap_id.toStdString());
+    if (!snap) return;
+    if (snap->pric_funding_txid_hex.empty() || snap->pric_funding_vout < 0
+        || snap->pric_funding_height <= 0) {
+        // Funding info not yet pinned — try again later (caller is
+        // safe to re-invoke once the swap record updates).
+        return;
+    }
+
+    // Resolve the funding tx hex via getrawtransaction. Prefer the
+    // blockhash-anchored form so it works without txindex (the case
+    // for the joint-stealth recipient who didn't broadcast).
+    std::string blockhash_hex;
+    {
+        UniValue p_h{UniValue::VARR};
+        p_h.push_back(snap->pric_funding_height);
+        auto rh = callRpc("getblockhash", p_h.write(0));
+        if (!rh.ok) {
+            setStatus(tr("Auto: getblockhash(%1) failed: %2")
+                .arg(snap->pric_funding_height)
+                .arg(QString::fromStdString(rh.error_msg)), true);
+            return;
+        }
+        UniValue v_h;
+        v_h.read(rh.json);
+        if (v_h.isStr()) blockhash_hex = v_h.get_str();
+    }
+    if (blockhash_hex.empty()) return;
+
+    UniValue p_g{UniValue::VARR};
+    p_g.push_back(snap->pric_funding_txid_hex);
+    p_g.push_back(0);  // verbosity 0 → raw hex
+    p_g.push_back(blockhash_hex);
+    auto rg = callRpc("getrawtransaction", p_g.write(0));
+    if (!rg.ok) {
+        setStatus(tr("Auto: getrawtransaction failed: %1")
+            .arg(QString::fromStdString(rg.error_msg)), true);
+        return;
+    }
+    UniValue v_g;
+    v_g.read(rg.json);
+    const std::string tx_hex = v_g.isStr() ? v_g.get_str() : std::string{};
+    if (tx_hex.empty()) return;
+
+    UniValue p_p{UniValue::VARR};
+    p_p.push_back(tx_hex);
+    p_p.push_back(snap->pric_funding_vout);
+    auto rp = callRpc("pricoin_jointscan_partial", p_p.write(0));
+    if (!rp.ok) {
+        setStatus(tr("Auto: pricoin_jointscan_partial failed: %1")
+            .arg(QString::fromStdString(rp.error_msg)), true);
+        return;
+    }
+    UniValue v_p;
+    v_p.read(rp.json);
+    if (!v_p.exists("partial") || !v_p["partial"].isStr()) return;
+    const QString partial = QString::fromStdString(v_p["partial"].get_str());
+    m_in_ls_my_partial->setText(partial);
+    m_auto_partial_computed = true;
+    setStatus(tr("Auto: scan partial computed locally."));
+
+    tryAutoSendJointscanPartial();
+}
+
+void PricCoopSignDialog::tryAutoSendJointscanPartial()
+{
+    if (m_auto_partial_sent) return;
+    if (!m_nostr || m_relay_connected_count == 0) return;
+    if (m_peer_xonly.isEmpty()) return;
+    if (!m_in_ls_my_partial) return;
+    const QString partial = m_in_ls_my_partial->text().trimmed();
+    if (partial.size() != 66) return;
+
+    UniValue env{UniValue::VOBJ};
+    env.pushKV("v",        1);
+    env.pushKV("leg",      m_mode == Mode::PricAdaptor ? "pric_claim_adaptor"
+                                                        : "pric_refund");
+    env.pushKV("swap_id",  m_swap_id.toStdString());
+    env.pushKV("kind",     "jointscan");
+    env.pushKV("partial",  partial.toStdString());
+    const QString plaintext = QString::fromStdString(env.write(0));
+    if (m_nostr->publishDirectMessage(m_peer_xonly, plaintext)) {
+        m_auto_partial_sent = true;
+        setStatus(tr("Auto: scan partial DM sent to peer."));
+    }
+}
+
+void PricCoopSignDialog::tryAutoLoadshare()
+{
+    if (m_auto_loadshare_fired) return;
+    if (!m_in_ls_my_partial || !m_in_ls_peer_partial) return;
+    const QString my   = m_in_ls_my_partial->text().trimmed();
+    const QString peer = m_in_ls_peer_partial->text().trimmed();
+    if (my.size() != 66 || peer.size() != 66) return;
+    m_auto_loadshare_fired = true;
+    setStatus(tr("Auto: both partials present — running loadshare."));
+    onRunLoadshare();
+    // onRunLoadshare itself fires tryAutoBuildtx + tryAutoStep1
+    // at the end via the explicit calls there, so don't double-fire.
+}
+
+// Phase 2a — auto-DM own X_pub_X to peer. Adaptor mode only — plain
+// mode doesn't use X_pub. Each party sends their own; receive fills
+// m_in_X_pub_peer. Independent of spender/cosigner role; both fire.
+void PricCoopSignDialog::tryAutoSendXpubAnnounce()
+{
+    if (m_auto_xpub_announced) return;
+    if (m_mode != Mode::PricAdaptor) return;
+    if (!m_nostr || m_relay_connected_count == 0) return;
+    if (m_peer_xonly.isEmpty()) return;
+    if (!m_in_X_pub_X) return;
+    const QString xpub = m_in_X_pub_X->text().trimmed();
+    if (xpub.size() != 66) return;  // 33-byte hex
+
+    UniValue env{UniValue::VOBJ};
+    env.pushKV("v",       1);
+    env.pushKV("leg",     "pric_claim_adaptor");
+    env.pushKV("swap_id", m_swap_id.toStdString());
+    env.pushKV("kind",    "xpub_announce");
+    env.pushKV("x_pub",   xpub.toStdString());
+    const QString plaintext = QString::fromStdString(env.write(0));
+    if (m_nostr->publishDirectMessage(m_peer_xonly, plaintext)) {
+        m_auto_xpub_announced = true;
+        setStatus(tr("Auto: own X_pub announced to peer."));
+    }
+}
+
+// Phase 2b — auto-buildtx (spender only). In LTC swap:
+//   PricAdaptor (claim leg) → spender = Bob (PRIC buyer).
+//   PricPlain   (refund leg) → spender = Alice (PRIC funder).
+// Cosigner needs to receive the buildtx output (msg/pi/ring/...) via
+// DM to populate its own inputs without paste. Sender DMs after fire.
+//
+// Preconditions: loadshare done (joint_pubkey + x_share + joint_blind
+// populated), swap record loaded with role + pric funding info.
+void PricCoopSignDialog::tryAutoBuildtx()
+{
+    if (m_auto_buildtx_fired) return;
+    if (!m_wm) return;
+    if (m_swap_id.isEmpty()) return;
+    if (!m_in_joint_pubkey || m_in_joint_pubkey->text().trimmed().size() != 66) return;
+    if (!m_in_bt_joint_blind || m_in_bt_joint_blind->text().trimmed().size() != 64) return;
+
+    // Spender role detection.
+    auto snap = m_wm->wallet().adaptorSwapGet(m_swap_id.toStdString());
+    if (!snap) return;
+    const bool i_am_alice = (snap->role == "alice");
+    const bool i_am_spender =
+        (m_mode == Mode::PricAdaptor && !i_am_alice) ||
+        (m_mode == Mode::PricPlain   &&  i_am_alice);
+    if (!i_am_spender) {
+        // Cosigner waits for the buildtx DM from peer; don't fire
+        // buildtx locally.
+        m_auto_buildtx_fired = true;  // gate to avoid re-checks
+        return;
+    }
+
+    m_auto_buildtx_fired = true;
+    setStatus(tr("Auto: I'm the spender — running buildtx."));
+    onRunBuildtx();
+    tryAutoSendBuildtx();
+}
+
+void PricCoopSignDialog::tryAutoSendBuildtx()
+{
+    if (m_auto_buildtx_sent) return;
+    if (!m_nostr || m_relay_connected_count == 0) return;
+    if (m_peer_xonly.isEmpty()) return;
+    // m_unsigned_tx_hex set by onRunBuildtx on success; m_in_msg/pi/
+    // ring_or_ring_ml also populated by onRunBuildtx.
+    if (m_unsigned_tx_hex.isEmpty()) return;
+    if (!m_in_msg || m_in_msg->text().trimmed().size() != 64) return;
+    if (!m_in_pi  || m_in_pi->text().trimmed().isEmpty()) return;
+    if (!m_in_ring_or_ring_ml
+        || m_in_ring_or_ring_ml->toPlainText().trimmed().isEmpty()) return;
+
+    UniValue env{UniValue::VOBJ};
+    env.pushKV("v",        1);
+    env.pushKV("leg",      m_mode == Mode::PricAdaptor ? "pric_claim_adaptor"
+                                                        : "pric_refund");
+    env.pushKV("swap_id",  m_swap_id.toStdString());
+    env.pushKV("kind",     "buildtx");
+    env.pushKV("sighash",  m_in_msg->text().trimmed().toStdString());
+    env.pushKV("pi",       m_in_pi->text().trimmed().toInt());
+    UniValue ring_v;
+    if (ring_v.read(m_in_ring_or_ring_ml->toPlainText().trimmed().toStdString())
+        && (ring_v.isArray() || ring_v.isObject())) {
+        env.pushKV("ring_or_ml", ring_v);
+    }
+    env.pushKV("joint_pubkey",      m_in_joint_pubkey->text().trimmed().toStdString());
+    env.pushKV("session_id",        m_in_session_id->text().trimmed().toStdString());
+    if (m_in_ring_hash) {
+        env.pushKV("ring_hash",     m_in_ring_hash->text().trimmed().toStdString());
+    }
+    if (m_in_joint_output_id) {
+        env.pushKV("joint_output_id",
+                   m_in_joint_output_id->text().trimmed().toStdString());
+    }
+    if (m_mode == Mode::PricPlain) {
+        // Plain mode: spender's z_other is cosigner's z_share. The
+        // buildtx echo includes "z_other_for_peer" — extract from
+        // m_out_buildtx (parsed JSON we displayed).
+        UniValue echo;
+        if (echo.read(m_out_buildtx->toPlainText().toStdString()) && echo.isObject()
+            && echo.exists("z_other_for_peer") && echo["z_other_for_peer"].isStr()) {
+            env.pushKV("z_other", echo["z_other_for_peer"].get_str());
+        }
+    }
+    if (m_mode == Mode::PricAdaptor) {
+        // Adaptor mode: spender includes own X_pub_X (= x_share·G)
+        // and session_label/payload so the cosigner can fill them
+        // and Step 1 can fire.
+        if (m_in_X_pub_X) {
+            env.pushKV("x_pub_spender",
+                       m_in_X_pub_X->text().trimmed().toStdString());
+        }
+        if (m_in_session_label) {
+            env.pushKV("session_label",
+                       m_in_session_label->text().trimmed().toStdString());
+        }
+        if (m_in_session_payload) {
+            env.pushKV("session_payload",
+                       m_in_session_payload->text().trimmed().toStdString());
+        }
+    }
+
+    const QString plaintext = QString::fromStdString(env.write(0));
+    if (m_nostr->publishDirectMessage(m_peer_xonly, plaintext)) {
+        m_auto_buildtx_sent = true;
+        setStatus(tr("Auto: buildtx output DM sent to peer."));
+    }
+}
+
+// Phase 3 — auto-fire the four-step ceremony once required inputs are
+// populated. Step 1 + Step 3 also auto-DM their share/s_share so the
+// user no longer needs to click Send-DM buttons. Step 2 + Step 4 fire
+// when the peer's DM arrives (auto-paste already populates the input;
+// these helpers detect that and advance).
+//
+// Inputs that must be present BEFORE Step 1 can fire:
+//   - x_share (from loadshare)
+//   - joint_pubkey (from loadshare)
+//   - msg, pi, ring_or_ml (from buildtx — manual today; Phase 2 TODO)
+//   - session_id, ring_hash, joint_output_id (manual today)
+//   - For adaptor mode: T_G/T_H/dleq_t (auto-filled by ctor),
+//     X_pub_X, session_label, session_payload (manual today)
+//   - For plain mode:   z_share (auto-filled by buildtx for spender,
+//                       received via buildtx-DM for cosigner — Phase 2)
+
+void PricCoopSignDialog::tryAutoStep1()
+{
+    if (m_auto_step1_fired) return;
+    if (!m_in_x_share || !m_in_joint_pubkey || !m_in_msg
+        || !m_in_pi || !m_in_session_id) return;
+    if (m_in_x_share->text().trimmed().size() != 64) return;
+    if (m_in_joint_pubkey->text().trimmed().size() != 66) return;
+    if (m_in_msg->text().trimmed().size() != 64) return;
+    if (m_in_session_id->text().trimmed().size() != 64) return;
+    if (m_in_pi->text().trimmed().isEmpty()) return;
+    if (!m_in_ring_or_ring_ml
+        || m_in_ring_or_ring_ml->toPlainText().trimmed().isEmpty()) return;
+    if (m_mode == Mode::PricAdaptor) {
+        if (!m_in_T_G || m_in_T_G->text().trimmed().size() != 66) return;
+        if (!m_in_X_pub_X || m_in_X_pub_X->text().trimmed().size() != 66) return;
+    } else {
+        if (!m_in_z_share || m_in_z_share->text().trimmed().size() != 64) return;
+    }
+    m_auto_step1_fired = true;
+    setStatus(tr("Auto: inputs ready — running Step 1."));
+    onStep1Compute();
+    tryAutoSendRound1();
+}
+
+void PricCoopSignDialog::tryAutoSendRound1()
+{
+    if (m_auto_step1_dm_sent) return;
+    if (m_my_commitment.isEmpty()) return;
+    if (!m_nostr || m_relay_connected_count == 0 || m_peer_xonly.isEmpty()) return;
+    onSendDmRound1();
+    m_auto_step1_dm_sent = true;
+}
+
+void PricCoopSignDialog::tryAutoStep2()
+{
+    if (m_auto_step2_fired) return;
+    if (!m_auto_step1_fired) return;  // guard ordering
+    if (!m_in_peer_share_json
+        || m_in_peer_share_json->toPlainText().trimmed().isEmpty()) return;
+    m_auto_step2_fired = true;
+    setStatus(tr("Auto: peer share present — running Step 2."));
+    onStep2Compute();
+    tryAutoStep3();
+}
+
+void PricCoopSignDialog::tryAutoStep3()
+{
+    if (m_auto_step3_fired) return;
+    if (!m_auto_step2_fired) return;
+    // Step 2 sets m_KI / m_L_pi etc. Use one of those as the ready
+    // signal — Step 3 needs intermediates from Step 2 to be present.
+    if (m_KI.isEmpty()) return;
+    m_auto_step3_fired = true;
+    setStatus(tr("Auto: Step 2 complete — running Step 3."));
+    onStep3Compute();
+    tryAutoSendRound3();
+}
+
+void PricCoopSignDialog::tryAutoSendRound3()
+{
+    if (m_auto_step3_dm_sent) return;
+    if (m_my_s_share.isEmpty()) return;
+    if (!m_nostr || m_relay_connected_count == 0 || m_peer_xonly.isEmpty()) return;
+    onSendDmRound3();
+    m_auto_step3_dm_sent = true;
+}
+
+void PricCoopSignDialog::tryAutoStep4()
+{
+    if (m_auto_step4_fired) return;
+    if (!m_auto_step3_fired) return;
+    if (!m_in_peer_s_share || m_in_peer_s_share->text().trimmed().isEmpty()) return;
+    m_auto_step4_fired = true;
+    setStatus(tr("Auto: peer s_share present — running Step 4."));
+    onStep4Compute();
 }
 
 QString PricCoopSignDialog::RandomHex32()
@@ -595,11 +1132,18 @@ void PricCoopSignDialog::buildLayout(const QString& title)
         form->addRow(tr("session_id:"), m_in_session_id);
 
         m_in_ring_hash = new QLineEdit(box);
-        m_in_ring_hash->setPlaceholderText(tr("32-byte hash of the ring being signed"));
+        // Auto-populate with random hex — both parties must use the
+        // SAME ring_hash (it keys the nonce-record store). Spender
+        // ships their random value via the buildtx auto-DM; cosigner
+        // overwrites their auto-default on receive. Manual users
+        // are still free to overwrite locally.
+        m_in_ring_hash->setText(RandomHex32());
+        m_in_ring_hash->setToolTip(tr("32-byte ring hash — both parties MUST use the same value"));
         form->addRow(tr("ring_hash:"), m_in_ring_hash);
 
         m_in_joint_output_id = new QLineEdit(box);
-        m_in_joint_output_id->setPlaceholderText(tr("UTXO id being spent (e.g. txid:vout encoded as bytes)"));
+        m_in_joint_output_id->setText(RandomHex32());
+        m_in_joint_output_id->setToolTip(tr("UTXO id being spent — both parties MUST use the same value"));
         form->addRow(tr("joint_output_id:"), m_in_joint_output_id);
 
         m_in_role = new QComboBox(box);
@@ -627,11 +1171,15 @@ void PricCoopSignDialog::buildLayout(const QString& title)
             form->addRow(tr("dleq_t:"), m_in_dleq_t);
 
             m_in_session_label = new QLineEdit(box);
-            m_in_session_label->setPlaceholderText(tr("Session label (plaintext or hex)"));
+            // Random default — both parties must use the same; spender
+            // DMs via the buildtx envelope, cosigner overwrites.
+            m_in_session_label->setText(RandomHex32());
+            m_in_session_label->setToolTip(tr("Session label — both parties MUST use the same value"));
             form->addRow(tr("session_label:"), m_in_session_label);
 
             m_in_session_payload = new QLineEdit(box);
-            m_in_session_payload->setPlaceholderText(tr("Session payload (plaintext or hex)"));
+            m_in_session_payload->setText(RandomHex32());
+            m_in_session_payload->setToolTip(tr("Session payload — both parties MUST use the same value"));
             form->addRow(tr("session_payload:"), m_in_session_payload);
         }
 
@@ -1270,6 +1818,19 @@ void PricCoopSignDialog::onStep4Compute()
     if (m_btn_broadcast) {
         m_btn_broadcast->setEnabled(
             !m_final_blob_hex.isEmpty() && !m_unsigned_tx_hex.isEmpty());
+    }
+
+    // Auto-coord finale: when Step 4 succeeds and we got here via the
+    // auto-coord chain (not manual button-click), auto-accept the
+    // dialog so the caller (the "Set pre-signatures" outer dialog)
+    // can proceed without a click. Manual users see the result for
+    // a brief moment before auto-close — sufficient for "watch it
+    // work" without blocking the flow.
+    if (!m_final_blob_hex.isEmpty() && m_auto_step4_fired) {
+        // Defer accept so the status label paints first.
+        QMetaObject::invokeMethod(this, [this]{
+            if (!m_final_blob_hex.isEmpty()) accept();
+        }, Qt::QueuedConnection);
     }
 }
 

@@ -4,6 +4,7 @@
 
 #include <qt/pricoin_swaps_page.h>
 
+#include <common/args.h>
 #include <core_io.h>
 #include <interfaces/node.h>
 #include <qt/pricoin_coopsign_dialog.h>
@@ -1192,6 +1193,29 @@ void PricoinSwapsPage::onAdvanceClicked()
         });
         form->addRow(QString(), pric_refund_helper);
         AddOkCancel(form, &dlg);
+
+        // Auto-coord finale: chain the two cooperative-sign sub-
+        // dialogs and the outer OK so the user doesn't have to
+        // click anything between BothFunded and PreSigned. Each
+        // sub-dialog auto-runs its own ceremony (Phase 1+2+3
+        // landed in PricCoopSignDialog) and auto-accepts on Step
+        // 4 success. Manual fallback: cancel any sub-dialog or
+        // the outer dialog to fall back to paste mode. LTC variant
+        // only — BTC variant (with MuSig2 BTC sigs) still goes
+        // through the manual path until that dialog auto-coord
+        // also lands.
+        if (is_ltc) {
+            QMetaObject::invokeMethod(&dlg, [pric_claim_helper, pric_p,
+                                              pric_refund_helper, pric_r,
+                                              &dlg]() {
+                pric_claim_helper->click();
+                if (pric_p->toPlainText().trimmed().isEmpty()) return;
+                pric_refund_helper->click();
+                if (pric_r->toPlainText().trimmed().isEmpty()) return;
+                dlg.accept();
+            }, Qt::QueuedConnection);
+        }
+
         if (dlg.exec() != QDialog::Accepted) return;
         interfaces::Wallet::PricoinAdaptorSwapPreSigsHex ps;
         if (!is_ltc) {
@@ -1840,6 +1864,15 @@ void PricoinSwapsPage::onLtcRefundClicked()
                                 "rejects earlier broadcasts."), &dlg));
     auto* dest_in = new QLineEdit(&dlg);
     dest_in->setPlaceholderText(tr("ltc1q… bech32 address (where the PRIC buyer receives the refunded LTC)"));
+    // Pre-fill from -pricoinltcrefundaddr config if set, so users
+    // who configured auto-refund don't have to re-type for the
+    // manual fallback path.
+    {
+        const std::string cfg_dest = gArgs.GetArg("-pricoinltcrefundaddr", "");
+        if (!cfg_dest.empty()) {
+            dest_in->setText(QString::fromStdString(cfg_dest));
+        }
+    }
     {
         QFontMetrics fm(dest_in->font());
         dest_in->setMinimumWidth(fm.horizontalAdvance(QLatin1Char('M')) * 70);

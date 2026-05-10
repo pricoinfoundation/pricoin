@@ -671,6 +671,19 @@ public:
         if (!m_node.mempool) return false;
         return m_node.mempool->HasDescendants(txid);
     }
+    std::optional<std::pair<CTransactionRef, uint256>>
+        findOnChainOrInMempool(const Txid& txid) override
+    {
+        uint256 hash_block;
+        CTransactionRef tx = node::GetTransaction(
+            /*block_index=*/nullptr,
+            /*mempool=*/m_node.mempool.get(),
+            txid,
+            chainman().m_blockman,
+            hash_block);
+        if (!tx) return std::nullopt;
+        return std::make_pair(std::move(tx), hash_block);
+    }
     bool broadcastTransaction(const CTransactionRef& tx,
         const CAmount& max_tx_fee,
         TxBroadcast broadcast_method,

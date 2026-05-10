@@ -59,6 +59,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <optional>
 #include <string>
 #include <thread>
@@ -280,6 +281,19 @@ private:
     // PRIC-leg confirmation lookup via the embedded chainstate.
     // Returns the same shape as IForeignChainClient::TxStatus.
     std::optional<ForeignTxStatus> PricTxStatus(const std::string& txid_hex);
+
+    // Auto-refund sweep — runs each Tick after the standard
+    // entry-handling loop. For active swaps where the local wallet's
+    // role can unilaterally refund (currently: Bob with LTC HTLC at
+    // CLTV expiry; PRIC presigned-refund TODO), broadcast the refund
+    // automatically. Gated on `-pricoinautorefund=1` and requires a
+    // configured `-pricoinltcrefundaddr=<bech32>`. In-memory dedup
+    // via `m_refund_attempted` so a flaky LTC backend doesn't
+    // re-broadcast every tick after a successful submission.
+    void TryAutoRefundLtc();
+    void TryAutoRefundPric();
+    std::set<uint256> m_refund_attempted;
+    std::set<uint256> m_pric_refund_attempted;
 
     ::wallet::CWallet& m_wallet;
     ForeignClientMap m_clients;

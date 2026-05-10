@@ -4609,12 +4609,33 @@ RPCMethod pricoin_jointspend_loadshare()
                 return b;
             }();
 
+            // X_pub for this party = x_share · G — needed by the
+            // adaptor-mode cooperative protocol (each party submits
+            // their own X_pub_X to combine; until now the user
+            // computed this externally and pasted into the dialog).
+            // Adding to the loadshare output so the dialog can
+            // auto-fill it.
+            std::string x_pub_hex;
+            {
+                CKey k;
+                k.Set(x_share_bytes.begin(), x_share_bytes.end(),
+                      /*compressed=*/true);
+                if (k.IsValid()) {
+                    const CPubKey p = k.GetPubKey();
+                    x_pub_hex = HexStr(std::span<const unsigned char>{
+                        p.begin(), p.size()});
+                }
+            }
+
             UniValue out{UniValue::VOBJ};
             out.pushKV("x_share",      HexStr(x_share_bytes));
             out.pushKV("blind",        HexStr(rewound->blind));
             out.pushKV("value",        ValueFromAmount(static_cast<CAmount>(rewound->value)));
             out.pushKV("joint_pubkey", HexStr(joint_pub_bytes));
             out.pushKV("vout",         static_cast<int>(vout));
+            if (!x_pub_hex.empty()) {
+                out.pushKV("x_pub", x_pub_hex);
+            }
             return out;
         }
     };

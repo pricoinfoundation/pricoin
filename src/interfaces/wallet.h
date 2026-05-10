@@ -348,6 +348,15 @@ public:
         const std::string& swap_id,
         const std::string& r_hex) = 0;
 
+    // Persist the pre-built unsigned PRIC refund tx hex captured by
+    // the spender (Alice for plain refund) at buildtx time during the
+    // PreSigned ceremony. The auto-refund watcher uses this + the
+    // stored refund-sig blob to broadcast Alice's refund without the
+    // cooperative-sign dialog being open.
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPricRefundTx(
+        const std::string& swap_id,
+        const std::string& unsigned_tx_hex) = 0;
+
     // AdaptorReady → BtcFunded.
     virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetBtcFunded(
         const std::string& swap_id,

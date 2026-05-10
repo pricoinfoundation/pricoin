@@ -90,6 +90,22 @@ private Q_SLOTS:
     void onNostrLog(const QString& msg);
     void onNostrRelayStatus(const QString& url, bool connected);
 
+    // Auto-coord helpers — drive the ceremony forward without user
+    // clicks once preconditions are met. Each fires at most once per
+    // milestone and is safe to call repeatedly (idempotent guards).
+    void tryAutoComputeJointscanPartial();
+    void tryAutoSendJointscanPartial();
+    void tryAutoLoadshare();
+    void tryAutoSendXpubAnnounce();
+    void tryAutoBuildtx();
+    void tryAutoSendBuildtx();
+    void tryAutoStep1();
+    void tryAutoSendRound1();
+    void tryAutoStep2();
+    void tryAutoStep3();
+    void tryAutoSendRound3();
+    void tryAutoStep4();
+
 private:
     WalletModel* m_wm{nullptr};
     Mode m_mode;
@@ -205,6 +221,21 @@ private:
     QCheckBox*      m_chk_auto_paste{nullptr};
     QPushButton*    m_btn_send_dm_round1{nullptr};
     QPushButton*    m_btn_send_dm_round3{nullptr};
+
+    // Auto-coord state — one-shot guards so the same milestone never
+    // re-fires. Reset to false in ctor.
+    bool m_auto_partial_computed{false};
+    bool m_auto_partial_sent{false};
+    bool m_auto_loadshare_fired{false};
+    bool m_auto_buildtx_fired{false};
+    bool m_auto_buildtx_sent{false};
+    bool m_auto_xpub_announced{false};
+    bool m_auto_step1_fired{false};
+    bool m_auto_step1_dm_sent{false};
+    bool m_auto_step2_fired{false};
+    bool m_auto_step3_fired{false};
+    bool m_auto_step3_dm_sent{false};
+    bool m_auto_step4_fired{false};
 
     void buildLayout(const QString& title);
     void setStatus(const QString& msg, bool error = false);

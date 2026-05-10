@@ -256,6 +256,14 @@ struct AdaptorSwap {
     std::array<unsigned char, 32> pric_ephemeral_r{};
     bool                          has_pric_ephemeral_r{false};
 
+    // PRIC refund unsigned tx hex. Captured by the spender (Alice for
+    // PRIC refund) at buildtx time during the PreSigned ceremony, so
+    // the auto-refund watcher can inject the cooperative refund sig
+    // and broadcast at PRIC refund timelock without dialog state. The
+    // sig blob itself is in `presigs.pric_refund_sig_blob`. Empty for
+    // pre-PreSigned swaps.
+    std::string pric_refund_unsigned_tx_hex;
+
     SERIALIZE_METHODS(AdaptorSwap, obj) {
         READWRITE(obj.swap_id);
         uint8_t role_byte = static_cast<uint8_t>(obj.role);
@@ -333,6 +341,12 @@ struct AdaptorSwap {
         uint8_t r_byte = obj.has_pric_ephemeral_r ? 1 : 0;
         READWRITE(r_byte);
         SER_READ(obj, obj.has_pric_ephemeral_r = (r_byte != 0));
+
+        // PRIC refund unsigned tx hex (appended 2026-05-11). Used by
+        // the auto-refund watcher to broadcast Alice's presigned
+        // refund without requiring the cooperative-sign dialog to be
+        // open. Empty when not yet set by the buildtx step.
+        READWRITE(obj.pric_refund_unsigned_tx_hex);
     }
 };
 
@@ -488,6 +502,16 @@ TransitionResult SetPricClaimRing(
     CWallet& wallet,
     const uint256& swap_id,
     const std::vector<std::array<unsigned char, 33>>& ring);
+
+// Record the pre-built unsigned PRIC refund tx hex. Captured by the
+// spender (Alice) during the PreSigned ceremony's buildtx step so
+// the auto-refund watcher can inject the cooperative refund sig and
+// broadcast at PRIC refund timelock without dialog state. State-
+// agnostic — allowed from any non-terminal state after Setup.
+TransitionResult SetPricRefundTx(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::string& unsigned_tx_hex);
 
 // Record Alice's foreign claim tx confirmed. Swap is done.
 // Transitions PricClaimed → Complete.

@@ -516,9 +516,22 @@ void TxToUniv(const CTransaction& tx, const uint256& block_hash, UniValue& entry
     entry.pushKV("vout", std::move(vout));
 
     if (have_undo) {
-        const CAmount fee = amt_total_in - amt_total_out;
-        CHECK_NONFATAL(MoneyRange(fee));
-        entry.pushKV("fee", ValueFromAmount(fee));
+        if (tx.version == PRICOIN_CT_VERSION) {
+            // V4 confidential txs hide input/output amounts behind
+            // Pedersen commitments; nValue is a blinded sentinel, so
+            // the standard fee = sum_in - sum_out math doesn't apply.
+            // Use the cleartext transparent_fee field from the CT
+            // bundle (which is what consensus enforces against the
+            // sum-of-commitments check).
+            const CAmount fee = static_cast<CAmount>(tx.ct_bundle.transparent_fee);
+            if (MoneyRange(fee)) {
+                entry.pushKV("fee", ValueFromAmount(fee));
+            }
+        } else {
+            const CAmount fee = amt_total_in - amt_total_out;
+            CHECK_NONFATAL(MoneyRange(fee));
+            entry.pushKV("fee", ValueFromAmount(fee));
+        }
     }
 
     // Pricoin: surface the v4 confidential-tx bundle so explorers, RPC
