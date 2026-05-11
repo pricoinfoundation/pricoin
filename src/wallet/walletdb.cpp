@@ -61,6 +61,7 @@ const std::string PRICOIN_ADAPTOR_SWAP{"pct_adaptor_swap"};
 const std::string PRICOIN_BTC_MUSIG2_NONCE{"pct_btc_musig2_nonce"};
 const std::string PRICOIN_OFFER{"pct_offer"};
 const std::string PRICOIN_CHAIN_WATCH{"pct_chain_watch"};
+const std::string PRICOIN_BROADCASTED_KI{"pct_wallet_broadcasted_ki"};
 const std::string PURPOSE{"purpose"};
 const std::string SETTINGS{"settings"};
 const std::string TX{"tx"};
@@ -1576,6 +1577,37 @@ bool WalletBatch::ReadAllPricoinChainWatches(
         std::vector<unsigned char> blob;
         ssValue >> blob;
         out.emplace(digest, std::move(blob));
+    }
+    return true;
+}
+
+bool WalletBatch::WritePricoinBroadcastedKi(
+    const std::array<unsigned char, 33>& key_image)
+{
+    // Value is empty — presence in the table is the entire signal.
+    return WriteIC(std::make_pair(DBKeys::PRICOIN_BROADCASTED_KI, key_image),
+                   std::vector<unsigned char>{});
+}
+
+bool WalletBatch::ReadAllPricoinBroadcastedKis(
+    std::set<std::array<unsigned char, 33>>& out)
+{
+    DataStream prefix;
+    prefix << DBKeys::PRICOIN_BROADCASTED_KI;
+    std::unique_ptr<DatabaseCursor> cursor = m_batch->GetNewPrefixCursor(prefix);
+    if (!cursor) return false;
+    while (true) {
+        DataStream ssKey;
+        DataStream ssValue;
+        DatabaseCursor::Status status = cursor->Next(ssKey, ssValue);
+        if (status == DatabaseCursor::Status::DONE) break;
+        if (status == DatabaseCursor::Status::FAIL) return false;
+        std::string type;
+        ssKey >> type;
+        if (type != DBKeys::PRICOIN_BROADCASTED_KI) continue;
+        std::array<unsigned char, 33> ki;
+        ssKey >> ki;
+        out.insert(ki);
     }
     return true;
 }

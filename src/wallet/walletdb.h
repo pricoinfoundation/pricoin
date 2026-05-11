@@ -12,7 +12,9 @@
 #include <wallet/db.h>
 #include <wallet/walletutil.h>
 
+#include <array>
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -124,6 +126,16 @@ extern const std::string PRICOIN_OFFER;
 // PRIC chain, advance the swap state machine via the matching SetX
 // transition." See wallet/pricoin_chain_watcher.cpp.
 extern const std::string PRICOIN_CHAIN_WATCH;
+// Wallet-local broadcasted-keyimage tracking. Multi-row, keyed by
+// 33-byte compressed keyimage point. Empty value (presence is the
+// signal). Persists across -reindex (chain's keyimages.dat gets
+// wiped; this stays). Used by walletsendct_ring's input picker to
+// refuse re-spending an input the wallet has already broadcast a
+// spend for, even when the chain's global keyimage set is stale or
+// behind the wallet's view. Closes the double-spend window observed
+// 2026-05-11 where Mac re-spent an input already used in an earlier
+// confirmed tx after a -reindex sync race.
+extern const std::string PRICOIN_BROADCASTED_KI;
 extern const std::string PURPOSE;
 extern const std::string SETTINGS;
 extern const std::string TX;
@@ -393,6 +405,14 @@ public:
     bool ErasePricoinChainWatch(const uint256& digest);
     bool ReadAllPricoinChainWatches(
         std::map<uint256, std::vector<unsigned char>>& out);
+    // Wallet-local broadcasted-keyimage tracking. Key = 33-byte
+    // compressed keyimage point. Value is empty (presence is the
+    // signal). Loaded once at startup into the in-memory set used
+    // by walletsendct_ring's input picker.
+    bool WritePricoinBroadcastedKi(
+        const std::array<unsigned char, 33>& key_image);
+    bool ReadAllPricoinBroadcastedKis(
+        std::set<std::array<unsigned char, 33>>& out);
     //! Begin a new transaction
     bool TxnBegin();
     //! Commit current transaction

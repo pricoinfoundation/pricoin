@@ -42,6 +42,7 @@
 #include <swap/btc_refund_tx.h>
 #include <crypto/hmac_sha256.h>
 #include <wallet/pricoin_adaptor_swap.h>
+#include <wallet/pricoin_broadcasted_kis.h>
 #include <wallet/pricoin_btc_holding.h>
 #include <wallet/pricoin_btc_musig2_nonce_records.h>
 #include <wallet/pricoin_chain_watcher.h>
@@ -1090,6 +1091,11 @@ RPCMethod pricoin_listownct()
                 for (const auto& [outpoint, rec] : index.entries) {
                     if (rec.height < startheight) continue;
                     if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
+                    // Filter inputs the wallet has already broadcast a
+                    // spend for, even if the chain's set is stale.
+                    // Keeps reported balance honest.
+                    if (::wallet::pricoin_broadcasted_kis::Contains(
+                            wallet, rec.key_image)) continue;
                     total_recovered += rec.value;
                     UniValue entry{UniValue::VOBJ};
                     entry.pushKV("txid", outpoint.hash.ToString());
@@ -1368,6 +1374,14 @@ RPCMethod walletsendct_ring()
                 for (const auto& [outpoint, rec] : index.entries) {
                     if (rec.value < target) continue;
                     if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
+                    // Wallet-local broadcasted-keyimage filter — defense
+                    // against re-spending an input the wallet has
+                    // already broadcast a spend for, even when the
+                    // chain's global keyimage set is stale (e.g. after
+                    // a -reindex sync race). Closes the double-spend
+                    // window hit on 2026-05-11.
+                    if (::wallet::pricoin_broadcasted_kis::Contains(
+                            wallet, rec.key_image)) continue;
                     picked_outpoint = outpoint;
                     picked_height = rec.height;
                     break;
@@ -1613,12 +1627,31 @@ RPCMethod walletsendct_ring()
             // 10. Insert sig into the bundle and broadcast.
             mtx.ct_bundle.ring_inputs[0].sig = *sig;
 
+            // Capture the keyimage BEFORE moving mtx into the
+            // transaction ref — we'll persist it to the wallet's
+            // broadcasted-keyimage set after a successful broadcast
+            // so the picker refuses to re-spend this input even if
+            // the chain's global set is later wiped/desynced.
+            const std::array<unsigned char, 33> ki_to_persist =
+                mtx.ct_bundle.ring_inputs[0].sig.key_image;
+
             CTransactionRef tx_ref = MakeTransactionRef(std::move(mtx));
             std::string err_str;
             if (!chain.broadcastTransaction(tx_ref, MAX_MONEY,
                                              node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL,
                                              err_str)) {
                 throw JSONRPCError(RPC_WALLET_ERROR, "broadcast failed: " + err_str);
+            }
+
+            // Persist the spent keyimage. Best-effort — broadcast
+            // already succeeded; if persistence fails (e.g. wallet
+            // DB write error) the wallet falls back to the chain's
+            // keyimage set for double-spend protection (still safe
+            // when the chain is fully synced).
+            if (!::wallet::pricoin_broadcasted_kis::Add(wallet, ki_to_persist)) {
+                LogInfo("Pricoin walletsendct_ring: broadcasted-KI persist "
+                        "failed for tx %s — chain-set fallback only\n",
+                        tx_ref->GetHash().ToString());
             }
 
             // Find the post-shuffle position of the recipient output.
@@ -1703,6 +1736,8 @@ RPCMethod walletsendct_from_ct()
                 sorted.reserve(index.entries.size());
                 for (const auto& [outpoint, rec] : index.entries) {
                     if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
+                    if (::wallet::pricoin_broadcasted_kis::Contains(
+                            wallet, rec.key_image)) continue;
                     sorted.push_back({outpoint, rec.value, rec.height});
                 }
             }
