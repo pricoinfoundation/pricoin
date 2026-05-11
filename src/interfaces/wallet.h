@@ -265,6 +265,13 @@ public:
         // adaptorSwapSetPeerStealthPubkeys after swap creation.
         std::string peer_view_pubkey_hex;
         std::string peer_spend_pubkey_hex;
+        // Cooperative-sign per-leg session JSON. Restored by the
+        // dialog on reopen so alpha + commitments + s_share don't
+        // reset across close.
+        std::string pric_claim_adaptor_session_json;
+        std::string pric_refund_session_json;
+        std::string btc_claim_adaptor_session_json;
+        std::string btc_refund_session_json;
         // Adaptor scalar t — present once the holder's wallet has it.
         // For Bob, populated at SetAdaptorMaterials. For Alice,
         // populated by SetTSecret (typically called from the extract
@@ -316,6 +323,13 @@ public:
         // adaptorSwapSetPeerStealthPubkeys after swap creation.
         std::string peer_view_pubkey_hex;
         std::string peer_spend_pubkey_hex;
+        // Cooperative-sign per-leg session JSON. Restored by the
+        // dialog on reopen so alpha + commitments + s_share don't
+        // reset across close.
+        std::string pric_claim_adaptor_session_json;
+        std::string pric_refund_session_json;
+        std::string btc_claim_adaptor_session_json;
+        std::string btc_refund_session_json;
         // Optional pre-allocated swap_id (32-byte hex). When non-empty,
         // adaptorSwapCreate uses this instead of generating a random
         // id. Lets the matcher's wallet ship a swap_id in the
@@ -371,6 +385,22 @@ public:
     virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetBtcRefundTx(
         const std::string& swap_id,
         const std::string& unsigned_tx_hex) = 0;
+
+    // Cooperative-sign session legs. Mirror of pricoin_adaptor_swap::CoopsignLeg.
+    enum class CoopsignLeg : uint8_t {
+        PricClaimAdaptor = 0,
+        PricRefund       = 1,
+        BtcClaimAdaptor  = 2,
+        BtcRefund        = 3,
+    };
+
+    // Persist a cooperative-sign dialog's per-step state as an opaque
+    // JSON blob keyed by leg. Used by the dialog to survive close +
+    // reopen without restarting the ceremony.
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetCoopsignSession(
+        const std::string& swap_id,
+        CoopsignLeg leg,
+        const std::string& session_json) = 0;
 
     // Persist peer's PRIC stealth view + spend pubkeys (33-byte hex
     // each). Set by the orderbook page right after swap creation,

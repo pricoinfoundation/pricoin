@@ -178,6 +178,22 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
         }
     }
 
+    // Restore cooperative-sign session state if persisted from a
+    // previous dialog instance (close/reopen cycle). Loads m_alpha,
+    // m_my_commitment, m_my_s_share, etc. plus mirrors back into
+    // input widgets so the user sees resumed progress.
+    if (m_wm && !swap_id.empty()) {
+        auto snap = m_wm->wallet().adaptorSwapGet(swap_id);
+        if (snap) {
+            const std::string& blob = (m_mode == Mode::PricAdaptor)
+                ? snap->pric_claim_adaptor_session_json
+                : snap->pric_refund_session_json;
+            if (!blob.empty()) {
+                loadSessionFromRecord(blob);
+            }
+        }
+    }
+
     // Subscribe to the shared Nostr client SYNCHRONOUSLY so we don't
     // race against incoming DMs that arrive between dialog show and
     // QueuedConnection delivery. (Observed 2026-05-11: Mac's partial
@@ -292,6 +308,11 @@ void PricCoopSignDialog::onRunLoadshare()
     if (!x_pub_hex.empty())     echo.pushKV("x_pub",        x_pub_hex);
     m_out_loadshare->setPlainText(QString::fromStdString(echo.write(2)));
     setStatus(tr("Loadshare OK. x_share + joint_blind + joint_pubkey filled."));
+
+    // Capture loadshare outputs into m_* shadows for persistSession.
+    m_x_share = QString::fromStdString(x_share);
+    if (m_in_x_share) m_in_x_share->setText(m_x_share);
+    persistSession();
 
     // Auto-coord chain: Phase 2 (xpub announce + auto-buildtx if I'm
     // spender) and Phase 3 (Step 1+ chain).
@@ -423,6 +444,7 @@ void PricCoopSignDialog::onRunBuildtx()
                 /*error=*/false);
         }
     }
+    persistSession();
     // Auto-DM the buildtx output to the cosigner so they don't have
     // to copy-paste msg/pi/ring/etc. Idempotent guard.
     tryAutoSendBuildtx();
@@ -609,6 +631,7 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
             if (m_in_ls_peer_partial && m_in_ls_peer_partial->text().trimmed().isEmpty()) {
                 m_in_ls_peer_partial->setText(QString::fromStdString(partial));
                 setStatus(tr("Peer scan partial auto-pasted from DM."));
+                persistSession();
                 tryAutoLoadshare();
                 // Bilateral resend: if I sent my partial before peer's
                 // dialog was subscribed, peer never received it. Now
@@ -705,6 +728,7 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
                 }
             }
             setStatus(tr("Buildtx output auto-pasted from peer DM."));
+            persistSession();
             tryAutoStep1();
             return;
         }
@@ -717,6 +741,7 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
             m_in_peer_share_json->setPlainText(
                 QString::fromStdString(env["share"].write(2)));
             setStatus(tr("Peer share auto-pasted from DM."));
+            persistSession();
             tryAutoStep2();
             // Bilateral resend: if my Step 1 share was sent before
             // peer subscribed, it never landed. Resend now that peer
@@ -729,6 +754,7 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
             m_in_peer_s_share->setText(
                 QString::fromStdString(env["s_share"].get_str()));
             setStatus(tr("Peer s_share auto-pasted from DM."));
+            persistSession();
             tryAutoStep4();
             // Bilateral resend (same reasoning as round 1).
             m_auto_step3_dm_sent = false;
@@ -747,6 +773,236 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
 // connected, swap record has pric_funding_txid + pric_funding_height,
 // peer xonly known), DMs to peer, fills own field, and fires
 // "Run loadshare" automatically once the peer's partial arrives.
+
+// Cooperative-sign session persistence — serializes the dialog's
+// in-memory + input-widget state to a JSON blob and stores on the
+// swap record. Mirror loader rehydrates on dialog reopen.
+//
+// Field selection: every m_* shadow we set across step computes
+// (alpha, my_*_share, commitment, dleq_*, X_pub_X, KI, L_pi, R_pi,
+// L_prime, R_prime, c_pi, c0, mu_P, mu_C, s_others_json, my_s_share,
+// final_blob, unsigned_tx, x_share, z_share) plus the user-visible
+// input widgets (joint_pubkey, msg, pi, session_id, ring_hash,
+// joint_output_id, role, X_pub_peer, session_label, session_payload,
+// ring_or_ring_ml, buildtx helpers, loadshare partials/absorb, peer
+// share/s_share/X_pub_peer/x_pub).
+//
+// JSON shape: flat object, key = field name, value = string.
+void PricCoopSignDialog::persistSession()
+{
+    if (!m_wm || m_swap_id.isEmpty()) return;
+    UniValue j{UniValue::VOBJ};
+
+    auto put = [&](const char* k, const QString& v) {
+        if (!v.isEmpty()) j.pushKV(k, v.toStdString());
+    };
+    auto put_txt = [&](const char* k, QPlainTextEdit* w) {
+        if (w && !w->toPlainText().trimmed().isEmpty()) {
+            j.pushKV(k, w->toPlainText().trimmed().toStdString());
+        }
+    };
+    auto put_le = [&](const char* k, QLineEdit* w) {
+        if (w && !w->text().trimmed().isEmpty()) {
+            j.pushKV(k, w->text().trimmed().toStdString());
+        }
+    };
+
+    put("alpha", m_alpha);
+    put("my_L_share", m_my_L_share);
+    put("my_R_share", m_my_R_share);
+    put("my_KI_share", m_my_KI_share);
+    put("my_D_share", m_my_D_share);
+    put("my_commitment", m_my_commitment);
+    put("my_dleq_alpha", m_my_dleq_alpha);
+    put("my_dleq_x", m_my_dleq_x);
+    put("X_pub_X", m_X_pub_X);
+    put("KI", m_KI);
+    put("D", m_D);
+    put("L_pi", m_L_pi);
+    put("R_pi", m_R_pi);
+    put("L_prime", m_L_prime);
+    put("R_prime", m_R_prime);
+    put("c_pi", m_c_pi);
+    put("c0", m_c0);
+    put("mu_P", m_mu_P);
+    put("mu_C", m_mu_C);
+    put("s_others_json", m_s_others_json);
+    put("my_s_share", m_my_s_share);
+    put("final_blob_hex", m_final_blob_hex);
+    put("unsigned_tx_hex", m_unsigned_tx_hex);
+    put("x_share", m_x_share);
+    put("z_share", m_z_share);
+    put("msg_hex", m_msg_hex);
+    put("pi", m_pi);
+    put("session_id", m_session_id);
+    put("ring_hash", m_ring_hash);
+    put("joint_output_id", m_joint_output_id);
+    put("role", m_role);
+    put("T_G", m_T_G);
+    put("T_H", m_T_H);
+    put("dleq_t", m_dleq_t);
+    put("session_label", m_session_label);
+    put("session_payload", m_session_payload);
+    put("ring_ml_json", m_ring_ml_json);
+    put("ring_json", m_ring_json);
+
+    // Input-widget fields that aren't mirrored by an m_* shadow.
+    put_le("in_joint_pubkey",  m_in_joint_pubkey);
+    put_le("in_X_pub_peer",    m_in_X_pub_peer);
+    put_le("in_ls_my_partial", m_in_ls_my_partial);
+    put_le("in_ls_peer_partial", m_in_ls_peer_partial);
+    put_le("in_peer_s_share",  m_in_peer_s_share);
+    put_le("in_bt_joint_txid", m_in_bt_joint_txid);
+    put_le("in_bt_joint_vout", m_in_bt_joint_vout);
+    put_le("in_bt_joint_value", m_in_bt_joint_value);
+    put_le("in_bt_joint_blind", m_in_bt_joint_blind);
+    put_le("in_bt_dest",        m_in_bt_dest);
+    put_le("in_bt_dest_amount", m_in_bt_dest_amount);
+    put_le("in_bt_fee",         m_in_bt_fee);
+    put_le("in_bt_ring_size",   m_in_bt_ring_size);
+    put_le("in_bt_nlocktime",   m_in_bt_nlocktime);
+    put_txt("in_peer_share_json", m_in_peer_share_json);
+    put_txt("in_s_others_seed_json", m_in_s_others_seed_json);
+    put_txt("in_ring_or_ring_ml",  m_in_ring_or_ring_ml);
+    put_txt("in_dleq_t", m_in_dleq_t);
+
+    using namespace ::interfaces;
+    const Wallet::CoopsignLeg leg = (m_mode == Mode::PricAdaptor)
+        ? Wallet::CoopsignLeg::PricClaimAdaptor
+        : Wallet::CoopsignLeg::PricRefund;
+    (void)m_wm->wallet().adaptorSwapSetCoopsignSession(
+        m_swap_id.toStdString(), leg, j.write(0));
+}
+
+void PricCoopSignDialog::loadSessionFromRecord(const std::string& json)
+{
+    if (json.empty()) return;
+    UniValue j;
+    if (!j.read(json) || !j.isObject()) return;
+
+    auto load_str = [&](const char* k, QString& dst) {
+        if (j.exists(k) && j[k].isStr()) {
+            dst = QString::fromStdString(j[k].get_str());
+        }
+    };
+    auto load_le = [&](const char* k, QLineEdit* w) {
+        if (w && j.exists(k) && j[k].isStr()) {
+            w->setText(QString::fromStdString(j[k].get_str()));
+        }
+    };
+    auto load_txt = [&](const char* k, QPlainTextEdit* w) {
+        if (w && j.exists(k) && j[k].isStr()) {
+            w->setPlainText(QString::fromStdString(j[k].get_str()));
+        }
+    };
+
+    load_str("alpha", m_alpha);
+    load_str("my_L_share", m_my_L_share);
+    load_str("my_R_share", m_my_R_share);
+    load_str("my_KI_share", m_my_KI_share);
+    load_str("my_D_share", m_my_D_share);
+    load_str("my_commitment", m_my_commitment);
+    load_str("my_dleq_alpha", m_my_dleq_alpha);
+    load_str("my_dleq_x", m_my_dleq_x);
+    load_str("X_pub_X", m_X_pub_X);
+    load_str("KI", m_KI);
+    load_str("D", m_D);
+    load_str("L_pi", m_L_pi);
+    load_str("R_pi", m_R_pi);
+    load_str("L_prime", m_L_prime);
+    load_str("R_prime", m_R_prime);
+    load_str("c_pi", m_c_pi);
+    load_str("c0", m_c0);
+    load_str("mu_P", m_mu_P);
+    load_str("mu_C", m_mu_C);
+    load_str("s_others_json", m_s_others_json);
+    load_str("my_s_share", m_my_s_share);
+    load_str("final_blob_hex", m_final_blob_hex);
+    load_str("unsigned_tx_hex", m_unsigned_tx_hex);
+    load_str("x_share", m_x_share);
+    load_str("z_share", m_z_share);
+    load_str("msg_hex", m_msg_hex);
+    load_str("pi", m_pi);
+    load_str("session_id", m_session_id);
+    load_str("ring_hash", m_ring_hash);
+    load_str("joint_output_id", m_joint_output_id);
+    load_str("role", m_role);
+    load_str("T_G", m_T_G);
+    load_str("T_H", m_T_H);
+    load_str("dleq_t", m_dleq_t);
+    load_str("session_label", m_session_label);
+    load_str("session_payload", m_session_payload);
+    load_str("ring_ml_json", m_ring_ml_json);
+    load_str("ring_json", m_ring_json);
+
+    // Restore input widgets so the user sees what was filled before.
+    auto restore_le = [&](const char* k, QLineEdit* w) {
+        if (w && j.exists(k) && j[k].isStr()) {
+            const QString v = QString::fromStdString(j[k].get_str());
+            if (!v.isEmpty()) w->setText(v);
+        }
+    };
+    restore_le("in_joint_pubkey",   m_in_joint_pubkey);
+    restore_le("in_X_pub_peer",     m_in_X_pub_peer);
+    restore_le("in_ls_my_partial",  m_in_ls_my_partial);
+    restore_le("in_ls_peer_partial", m_in_ls_peer_partial);
+    restore_le("in_peer_s_share",   m_in_peer_s_share);
+    restore_le("in_bt_joint_txid",  m_in_bt_joint_txid);
+    restore_le("in_bt_joint_vout",  m_in_bt_joint_vout);
+    restore_le("in_bt_joint_value", m_in_bt_joint_value);
+    restore_le("in_bt_joint_blind", m_in_bt_joint_blind);
+    restore_le("in_bt_dest",        m_in_bt_dest);
+    restore_le("in_bt_dest_amount", m_in_bt_dest_amount);
+    restore_le("in_bt_fee",         m_in_bt_fee);
+    restore_le("in_bt_ring_size",   m_in_bt_ring_size);
+    restore_le("in_bt_nlocktime",   m_in_bt_nlocktime);
+    load_txt("in_peer_share_json",  m_in_peer_share_json);
+    load_txt("in_s_others_seed_json", m_in_s_others_seed_json);
+    load_txt("in_ring_or_ring_ml",  m_in_ring_or_ring_ml);
+    load_txt("in_dleq_t",           m_in_dleq_t);
+
+    // Mirror m_* into the simple-input widgets so the user sees
+    // resumption visibly.
+    if (m_in_x_share && !m_x_share.isEmpty()) m_in_x_share->setText(m_x_share);
+    if (m_in_z_share && !m_z_share.isEmpty()) m_in_z_share->setText(m_z_share);
+    if (m_in_msg && !m_msg_hex.isEmpty())     m_in_msg->setText(m_msg_hex);
+    if (m_in_pi && !m_pi.isEmpty())           m_in_pi->setText(m_pi);
+    if (m_in_session_id && !m_session_id.isEmpty()) m_in_session_id->setText(m_session_id);
+    if (m_in_ring_hash && !m_ring_hash.isEmpty())   m_in_ring_hash->setText(m_ring_hash);
+    if (m_in_joint_output_id && !m_joint_output_id.isEmpty()) m_in_joint_output_id->setText(m_joint_output_id);
+    if (m_in_T_G && !m_T_G.isEmpty()) m_in_T_G->setText(m_T_G);
+    if (m_in_T_H && !m_T_H.isEmpty()) m_in_T_H->setText(m_T_H);
+    if (m_in_X_pub_X && !m_X_pub_X.isEmpty()) m_in_X_pub_X->setText(m_X_pub_X);
+    if (m_in_session_label && !m_session_label.isEmpty()) m_in_session_label->setText(m_session_label);
+    if (m_in_session_payload && !m_session_payload.isEmpty()) m_in_session_payload->setText(m_session_payload);
+    if (m_in_role) {
+        if (!m_role.isEmpty()) m_in_role->setCurrentText(m_role);
+    }
+
+    // Mark auto-coord guards as already-fired for milestones we
+    // restored, so we don't re-fire jointscan/loadshare/buildtx.
+    if (!m_in_ls_my_partial || !m_in_ls_my_partial->text().trimmed().isEmpty()) {
+        m_auto_partial_computed = true;
+    }
+    if (!m_x_share.isEmpty() && !m_in_joint_pubkey->text().trimmed().isEmpty()) {
+        m_auto_loadshare_fired = true;
+    }
+    if (!m_unsigned_tx_hex.isEmpty()) {
+        m_auto_buildtx_fired = true;
+    }
+    if (!m_my_commitment.isEmpty()) {
+        m_auto_step1_fired = true;
+    }
+    if (!m_KI.isEmpty()) {
+        m_auto_step2_fired = true;
+    }
+    if (!m_my_s_share.isEmpty()) {
+        m_auto_step3_fired = true;
+    }
+    if (!m_final_blob_hex.isEmpty()) {
+        m_auto_step4_fired = true;
+    }
+}
 
 void PricCoopSignDialog::tryAutoComputeJointscanPartial()
 {
@@ -1045,7 +1301,13 @@ void PricCoopSignDialog::tryAutoSendRound1()
 void PricCoopSignDialog::tryAutoStep2()
 {
     if (m_auto_step2_fired) return;
-    if (!m_auto_step1_fired) return;  // guard ordering
+    // Gate on the actual Step-1-intermediate state (m_my_commitment),
+    // not the auto-fire flag. The dialog's Step 1 can run via the
+    // auto chain OR a manual button click; either way commits the
+    // nonce. Step 2 needs Step 1's output, not the auto-fire flag.
+    // (Previously gated on m_auto_step1_fired only — manual Step 1
+    // wouldn't progress to auto Step 2 on peer-share receive.)
+    if (m_my_commitment.isEmpty()) return;
     if (!m_in_peer_share_json
         || m_in_peer_share_json->toPlainText().trimmed().isEmpty()) return;
     m_auto_step2_fired = true;
@@ -1057,9 +1319,7 @@ void PricCoopSignDialog::tryAutoStep2()
 void PricCoopSignDialog::tryAutoStep3()
 {
     if (m_auto_step3_fired) return;
-    if (!m_auto_step2_fired) return;
-    // Step 2 sets m_KI / m_L_pi etc. Use one of those as the ready
-    // signal — Step 3 needs intermediates from Step 2 to be present.
+    // Gate on Step 2 intermediate state (m_KI), not the auto-fire flag.
     if (m_KI.isEmpty()) return;
     m_auto_step3_fired = true;
     setStatus(tr("Auto: Step 2 complete — running Step 3."));
@@ -1079,7 +1339,9 @@ void PricCoopSignDialog::tryAutoSendRound3()
 void PricCoopSignDialog::tryAutoStep4()
 {
     if (m_auto_step4_fired) return;
-    if (!m_auto_step3_fired) return;
+    // Gate on Step 3 intermediate state (m_my_s_share), not the
+    // auto-fire flag. Manual Step 3 also sets this.
+    if (m_my_s_share.isEmpty()) return;
     if (!m_in_peer_s_share || m_in_peer_s_share->text().trimmed().isEmpty()) return;
     m_auto_step4_fired = true;
     setStatus(tr("Auto: peer s_share present — running Step 4."));
@@ -1628,6 +1890,7 @@ void PricCoopSignDialog::onStep1Compute()
     }
     setStatus(tr("Step 1 OK. alpha kept locally; share JSON ready for peer."));
     updateNostrStatus();
+    persistSession();
 }
 
 void PricCoopSignDialog::onStep2Compute()
@@ -1785,6 +2048,7 @@ void PricCoopSignDialog::onStep2Compute()
         m_out_step2->setPlainText(QString::fromStdString(r.json));
     }
     setStatus(tr("Step 2 OK. Combine output saved; proceed to step 3."));
+    persistSession();
 }
 
 void PricCoopSignDialog::onStep3Compute()
@@ -1817,6 +2081,12 @@ void PricCoopSignDialog::onStep3Compute()
     m_out_step3->setPlainText(m_my_s_share);
     setStatus(tr("Step 3 OK. Send `s_share` to peer."));
     updateNostrStatus();
+    persistSession();
+    // Auto-DM s_share so the peer's dialog can fire Step 4. Same
+    // behavior whether Step 3 came via auto-fire or manual click.
+    tryAutoSendRound3();
+    // If peer s_share already arrived, fire Step 4 immediately.
+    tryAutoStep4();
 }
 
 void PricCoopSignDialog::onStep4Compute()
@@ -1912,6 +2182,7 @@ void PricCoopSignDialog::onStep4Compute()
         m_btn_broadcast->setEnabled(
             !m_final_blob_hex.isEmpty() && !m_unsigned_tx_hex.isEmpty());
     }
+    persistSession();
 
     // Auto-coord finale: when Step 4 succeeds and we got here via the
     // auto-coord chain (not manual button-click), auto-accept the

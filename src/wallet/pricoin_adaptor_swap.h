@@ -273,6 +273,16 @@ struct AdaptorSwap {
     // BTC swaps that haven't reached PreSigned yet.
     std::string btc_refund_unsigned_tx_hex;
 
+    // Cooperative-sign session state, persisted across dialog closes
+    // so the user can quit/reopen mid-ceremony without losing alpha,
+    // commitments, s_share, and other per-step intermediates. Each
+    // leg has its own JSON blob (opaque key=value map serialized by
+    // the dialog). Empty until the dialog persists.
+    std::string pric_claim_adaptor_session_json;
+    std::string pric_refund_session_json;
+    std::string btc_claim_adaptor_session_json;
+    std::string btc_refund_session_json;
+
     // Peer's PRIC stealth view + spend pubkeys (33-byte hex). Used
     // at swap creation time to build the joint stealth address; now
     // also persisted so the cooperative-sign dialog can pass the
@@ -380,6 +390,15 @@ struct AdaptorSwap {
         // the cooperative-sign dialog at timelock. Empty for LTC
         // swaps and pre-PreSigned BTC swaps.
         READWRITE(obj.btc_refund_unsigned_tx_hex);
+
+        // Cooperative-sign per-leg session JSON (appended 2026-05-11).
+        // Holds alpha, commitments, s_share, intermediates from each
+        // step so the dialog can survive close+reopen without
+        // restarting the ceremony.
+        READWRITE(obj.pric_claim_adaptor_session_json);
+        READWRITE(obj.pric_refund_session_json);
+        READWRITE(obj.btc_claim_adaptor_session_json);
+        READWRITE(obj.btc_refund_session_json);
     }
 };
 
@@ -566,6 +585,25 @@ TransitionResult SetBtcRefundTx(
     CWallet& wallet,
     const uint256& swap_id,
     const std::string& unsigned_tx_hex);
+
+// Cooperative-sign session legs. Selects which per-leg session JSON
+// field to read/write.
+enum class CoopsignLeg : uint8_t {
+    PricClaimAdaptor = 0,
+    PricRefund       = 1,
+    BtcClaimAdaptor  = 2,
+    BtcRefund        = 3,
+};
+
+// Persist a cooperative-sign dialog's per-step state as an opaque
+// JSON blob keyed by leg. Used by the dialog to survive close+
+// reopen without restarting the ceremony. State-agnostic — allowed
+// from any non-terminal state.
+TransitionResult SetCoopsignSession(
+    CWallet& wallet,
+    const uint256& swap_id,
+    CoopsignLeg leg,
+    const std::string& session_json);
 
 // Record Alice's foreign claim tx confirmed. Swap is done.
 // Transitions PricClaimed → Complete.

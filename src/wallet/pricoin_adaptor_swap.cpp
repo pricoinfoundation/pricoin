@@ -482,6 +482,32 @@ TransitionResult SetPricRefundTx(
     });
 }
 
+TransitionResult SetCoopsignSession(
+    CWallet& wallet,
+    const uint256& swap_id,
+    CoopsignLeg leg,
+    const std::string& session_json)
+{
+    // Empty JSON is allowed — used to clear/reset a session.
+    return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
+        if (s.state == State::Complete || s.state == State::Refunded
+            || s.state == State::Aborted) {
+            return TransitionResult::InvalidState;
+        }
+        switch (leg) {
+        case CoopsignLeg::PricClaimAdaptor:
+            s.pric_claim_adaptor_session_json = session_json; break;
+        case CoopsignLeg::PricRefund:
+            s.pric_refund_session_json = session_json; break;
+        case CoopsignLeg::BtcClaimAdaptor:
+            s.btc_claim_adaptor_session_json = session_json; break;
+        case CoopsignLeg::BtcRefund:
+            s.btc_refund_session_json = session_json; break;
+        }
+        return TransitionResult::Ok;
+    });
+}
+
 TransitionResult SetBtcRefundTx(
     CWallet& wallet,
     const uint256& swap_id,

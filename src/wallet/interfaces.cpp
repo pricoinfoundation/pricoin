@@ -470,6 +470,10 @@ public:
         o.pric_bob_recipient_stealth     = s.pric_bob_recipient_stealth;
         o.peer_view_pubkey_hex           = s.peer_view_pubkey_hex;
         o.peer_spend_pubkey_hex          = s.peer_spend_pubkey_hex;
+        o.pric_claim_adaptor_session_json = s.pric_claim_adaptor_session_json;
+        o.pric_refund_session_json        = s.pric_refund_session_json;
+        o.btc_claim_adaptor_session_json  = s.btc_claim_adaptor_session_json;
+        o.btc_refund_session_json         = s.btc_refund_session_json;
         o.has_t = s.has_t;
         if (s.has_t) {
             o.t_secret_hex = HexStr(s.t_secret);
@@ -688,6 +692,20 @@ public:
         if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
         auto r = ::wallet::pricoin_adaptor_swap::SetBtcRefundTx(
             *m_wallet, *sid, unsigned_tx_hex);
+        return WrapTransition(r, this, *sid);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetCoopsignSession(
+        const std::string& swap_id,
+        CoopsignLeg leg,
+        const std::string& session_json) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        auto r = ::wallet::pricoin_adaptor_swap::SetCoopsignSession(
+            *m_wallet, *sid,
+            static_cast<::wallet::pricoin_adaptor_swap::CoopsignLeg>(leg),
+            session_json);
         return WrapTransition(r, this, *sid);
     }
 

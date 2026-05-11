@@ -249,6 +249,15 @@ private:
     RpcResult callRpc(const std::string& method, const std::string& params_json);
 
     static QString RandomHex32();
+
+    // Cooperative-sign session persistence. Serializes the dialog's
+    // per-step state (m_alpha + commitments + intermediates + input
+    // widget contents) to a JSON blob keyed by leg on the swap
+    // record. Restored on ctor when the swap record has a non-empty
+    // session for this dialog's mode. Lets users close/reopen the
+    // dialog mid-ceremony without losing progress.
+    void persistSession();
+    void loadSessionFromRecord(const std::string& json);
 };
 
 #endif // BITCOIN_QT_PRICOIN_PRIC_COOPSIGN_DIALOG_H
