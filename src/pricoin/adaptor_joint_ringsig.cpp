@@ -5,6 +5,7 @@
 #include <pricoin/adaptor_joint_ringsig.h>
 
 #include <crypto/sha256.h>
+#include <logging.h>
 #include <pricoin/adaptor_ringsig.h>
 #include <pricoin/joint_ringsig.h>
 #include <pricoin/ringsig.h>
@@ -386,13 +387,27 @@ std::optional<AdaptorCombineOutput> CombineAndWalk(
     std::span<const unsigned char> session_label,
     std::span<const unsigned char> session_payload)
 {
-    if (ring.empty() || pi >= ring.size()) return std::nullopt;
-    if (HasDuplicate(ring)) return std::nullopt;
-    if (X_pub_shares.size() != shares.size() || shares.empty()) return std::nullopt;
+    if (ring.empty() || pi >= ring.size()) {
+        LogInfo("Pricoin adaptor CombineAndWalk: empty ring or pi out of range "
+                "(ring.size=%u pi=%u)\n", (unsigned)ring.size(), (unsigned)pi);
+        return std::nullopt;
+    }
+    if (HasDuplicate(ring)) {
+        LogInfo("Pricoin adaptor CombineAndWalk: ring has duplicate entries\n");
+        return std::nullopt;
+    }
+    if (X_pub_shares.size() != shares.size() || shares.empty()) {
+        LogInfo("Pricoin adaptor CombineAndWalk: X_pub_shares/shares size "
+                "mismatch or empty (X_pub=%u shares=%u)\n",
+                (unsigned)X_pub_shares.size(), (unsigned)shares.size());
+        return std::nullopt;
+    }
 
     // Verify Bob's adaptor DLEQ as belt-and-braces.
     if (!::pricoin::adaptor_ringsig::VerifyDLEQProof(
             ring[pi], adaptor, dleq_t, session_label, session_payload)) {
+        LogInfo("Pricoin adaptor CombineAndWalk: DLEQ verify failed for "
+                "adaptor T_G/T_H/dleq_t against ring[pi]=P_pi\n");
         return std::nullopt;
     }
 
@@ -400,6 +415,8 @@ std::optional<AdaptorCombineOutput> CombineAndWalk(
     for (size_t k = 0; k < shares.size(); ++k) {
         if (!VerifyAdaptorNonceShare(ring[pi], X_pub_shares[k], shares[k],
                 adaptor, session_label, session_payload)) {
+            LogInfo("Pricoin adaptor CombineAndWalk: VerifyAdaptorNonceShare "
+                    "failed for share index %u\n", (unsigned)k);
             return std::nullopt;
         }
     }
@@ -428,10 +445,30 @@ std::optional<AdaptorCombineOutput> CombineAndWalk(
         Point joint_pub = X_pub_shares[0];
         for (size_t k = 1; k < X_pub_shares.size(); ++k) {
             Point sum;
-            if (!AddPoints(ctx, joint_pub, X_pub_shares[k], sum)) return std::nullopt;
+            if (!AddPoints(ctx, joint_pub, X_pub_shares[k], sum)) {
+                LogInfo("Pricoin adaptor CombineAndWalk: AddPoints failed when "
+                        "summing X_pub_shares at index %u\n", (unsigned)k);
+                return std::nullopt;
+            }
             joint_pub = sum;
         }
-        if (joint_pub != ring[pi]) return std::nullopt;
+        if (joint_pub != ring[pi]) {
+            // Hex-truncated diagnostic so operator can compare.
+            auto hex33 = [](const Point& p) {
+                static const char* lut = "0123456789abcdef";
+                std::string s; s.reserve(66);
+                for (size_t b = 0; b < p.size(); ++b) {
+                    s += lut[(p[b] >> 4) & 0xf];
+                    s += lut[p[b] & 0xf];
+                }
+                return s;
+            };
+            LogInfo("Pricoin adaptor CombineAndWalk: Σ X_pub_shares ≠ ring[pi]. "
+                    "Σ=%s ring[pi]=%s — usually means a share's x_share was "
+                    "derived against a different joint pubkey than ring[pi]\n",
+                    hex33(joint_pub), hex33(ring[pi]));
+            return std::nullopt;
+        }
     }
 
     // Apply the adaptor shift.

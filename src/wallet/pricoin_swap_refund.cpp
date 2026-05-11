@@ -263,4 +263,98 @@ PricRefundResult AutoBroadcastPricRefund(
     return r;
 }
 
+BtcRefundResult AutoBroadcastBtcRefund(
+    ::wallet::CWallet& wallet,
+    const uint256& swap_id)
+{
+    BtcRefundResult r;
+
+    aas::AdaptorSwap snap;
+    if (aas::Get(wallet, swap_id, snap) != aas::LookupResult::Ok) {
+        r.error = "swap not found";
+        return r;
+    }
+    // BTC-only refund. LTC uses AutoBroadcastLtcRefund (unilateral
+    // CLTV path); regtest is for tests.
+    if (snap.foreign_chain != "btc") {
+        r.error = "swap.foreign_chain != btc";
+        return r;
+    }
+    if (snap.state != aas::State::PreSigned
+        && snap.state != aas::State::PricClaimed
+        && snap.state != aas::State::BothFunded) {
+        r.error = "swap state is not eligible for BTC presigned refund";
+        return r;
+    }
+    if (!snap.foreign_refund_txid.empty()) {
+        r.error = "swap already has a foreign_refund_txid recorded";
+        return r;
+    }
+    if (snap.btc_refund_unsigned_tx_hex.empty()) {
+        r.error = "no unsigned BTC refund tx persisted on swap (cooperative-"
+                  "sign sighash step did not complete on this wallet)";
+        return r;
+    }
+    if (snap.presigs.btc_refund_sig.empty()
+        || snap.presigs.btc_refund_sig.size() != 64) {
+        r.error = "no BTC refund cooperative signature available — "
+                  "ceremony incomplete";
+        return r;
+    }
+
+    CMutableTransaction mtx;
+    auto tx_bytes = ParseHex(snap.btc_refund_unsigned_tx_hex);
+    if (tx_bytes.empty()) {
+        r.error = "stored unsigned BTC refund tx hex did not parse";
+        return r;
+    }
+    try {
+        DataStream ds{std::span<const unsigned char>{tx_bytes}};
+        ds >> TX_WITH_WITNESS(mtx);
+    } catch (const std::exception& e) {
+        r.error = std::string("stored tx hex failed to deserialize: ") + e.what();
+        return r;
+    }
+    if (mtx.vin.empty()) {
+        r.error = "stored tx has no inputs";
+        return r;
+    }
+    // Attach the 64-byte BIP340 cooperative sig as the sole witness
+    // stack item — matches what pricoin_btc_swap_tx_finalize does.
+    mtx.vin[0].scriptWitness.stack.clear();
+    mtx.vin[0].scriptWitness.stack.emplace_back(
+        snap.presigs.btc_refund_sig.begin(),
+        snap.presigs.btc_refund_sig.end());
+
+    DataStream sds;
+    sds << TX_WITH_WITNESS(CTransaction{mtx});
+    const std::string final_tx_hex = HexStr(std::span<const unsigned char>{
+        UCharCast(sds.data()), sds.size()});
+
+    auto backend = pcw::MakeForeignClientFromRegistry("btc");
+    if (!backend) {
+        r.error = "no BTC chain backend registered";
+        return r;
+    }
+    std::string txid;
+    try {
+        txid = backend->Broadcast(final_tx_hex);
+    } catch (const std::exception& e) {
+        r.error = std::string("BTC broadcast failed: ") + e.what();
+        return r;
+    }
+
+    pcw::WatchEntry we;
+    we.swap_id = swap_id;
+    we.kind = pcw::WatchKind::ForeignRefund;
+    we.txid_hex = txid;
+    we.vout = 0;
+    we.min_confirmations = 1;
+    (void)pcw::Add(wallet, we);
+
+    r.ok = true;
+    r.txid = txid;
+    return r;
+}
+
 }  // namespace wallet::pricoin_swap_refund

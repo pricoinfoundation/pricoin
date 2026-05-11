@@ -487,6 +487,69 @@ void ChainWatcher::TryAutoRefundLtc()
     }
 }
 
+// BTC auto-refund — broadcasts the cooperative presigned BTC refund
+// tx once the BTC chain tip reaches the foreign refund timelock.
+// Either party (Alice or Bob) can call this since both have the
+// presigs after the cooperative-sign ceremony; in MVP only the
+// spender of the BTC refund has the unsigned tx hex persisted via
+// pricoin_btc_swap_tx_build at sighash-compute time. Bob is the
+// natural caller (he funded BTC and wants it back).
+//
+// Same gArgs gate as LTC/PRIC. Conservative: opt-in, dedup so flaky
+// BTC backend doesn't re-broadcast on retry.
+void ChainWatcher::TryAutoRefundBtc()
+{
+    if (!gArgs.GetBoolArg("-pricoinautorefund", false)) return;
+
+    using namespace ::wallet::pricoin_adaptor_swap;
+    std::vector<AdaptorSwap> swaps;
+    if (List(m_wallet, swaps) != LookupResult::Ok) return;
+
+    for (const auto& s : swaps) {
+        if (m_stopping.load()) return;
+        if (s.foreign_chain != "btc") continue;
+        if (s.state != State::PreSigned
+            && s.state != State::PricClaimed
+            && s.state != State::BothFunded) continue;
+        if (s.btc_refund_unsigned_tx_hex.empty()) continue;
+        if (s.presigs.btc_refund_sig.empty()) continue;
+        if (!s.foreign_refund_txid.empty()) continue;
+        if (s.foreign_refund_height <= 0) continue;
+        if (m_btc_refund_attempted.count(s.swap_id)) continue;
+
+        std::shared_ptr<IForeignChainClient> client;
+        auto it = m_clients.find("btc");
+        if (it != m_clients.end()) client = it->second;
+        else client = MakeForeignClientFromRegistry("btc");
+        if (!client) continue;
+        if (IsChainCoolingDown("btc")) continue;
+        const auto tip = client->TipHeight();
+        if (!tip) {
+            RecordChainError("btc");
+            continue;
+        }
+        if (*tip < static_cast<int>(s.foreign_refund_height)) continue;
+
+        LogInfo("Pricoin auto-refund: BTC tip %d ≥ refund height %d for "
+                "swap %s — broadcasting cooperative presigned refund\n",
+                *tip, s.foreign_refund_height,
+                s.swap_id.ToString().substr(0, 12));
+
+        auto r = ::wallet::pricoin_swap_refund::AutoBroadcastBtcRefund(
+            m_wallet, s.swap_id);
+        if (r.ok) {
+            LogInfo("Pricoin auto-refund: BTC refund broadcast for swap %s, "
+                    "txid %s\n",
+                    s.swap_id.ToString().substr(0, 12), r.txid);
+            m_btc_refund_attempted.insert(s.swap_id);
+        } else {
+            LogInfo("Pricoin auto-refund: BTC refund failed for swap %s: %s "
+                    "(will retry next tick)\n",
+                    s.swap_id.ToString().substr(0, 12), r.error);
+        }
+    }
+}
+
 // PRIC auto-refund — Alice's safety net. Broadcasts the cooperative
 // presigned refund tx once the PRIC chain tip reaches the PRIC refund
 // timelock. Requires the spender (Alice) to have run buildtx during
@@ -557,6 +620,8 @@ void ChainWatcher::Tick()
     }
     if (m_stopping.load()) return;
     TryAutoRefundLtc();
+    if (m_stopping.load()) return;
+    TryAutoRefundBtc();
     if (m_stopping.load()) return;
     TryAutoRefundPric();
 }

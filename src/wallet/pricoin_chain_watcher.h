@@ -291,8 +291,10 @@ private:
     // via `m_refund_attempted` so a flaky LTC backend doesn't
     // re-broadcast every tick after a successful submission.
     void TryAutoRefundLtc();
+    void TryAutoRefundBtc();
     void TryAutoRefundPric();
     std::set<uint256> m_refund_attempted;
+    std::set<uint256> m_btc_refund_attempted;
     std::set<uint256> m_pric_refund_attempted;
 
     ::wallet::CWallet& m_wallet;

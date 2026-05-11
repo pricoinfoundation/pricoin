@@ -5,12 +5,15 @@
 #include <qt/pricoin_coopsign_dialog.h>
 
 #include <interfaces/node.h>
+#include <interfaces/wallet.h>
 #include <qt/pricoin_nostr_client.h>
 #include <qt/pricoin_relay_settings_dialog.h>
 #include <qt/walletmodel.h>
 #include <random.h>
 #include <univalue.h>
+#include <util/result.h>
 #include <util/strencodings.h>
+#include <util/translation.h>
 
 #include <QApplication>
 #include <QCheckBox>
@@ -218,6 +221,22 @@ void CoopSignDialog::onComputeSighash()
     m_unsigned_tx_hex = QString::fromStdString(v["tx_hex"].get_str());
     if (m_in_msg) m_in_msg->setText(sighash);
     setStatus(tr("Sighash auto-filled (%1…). Proceed to step 2.").arg(sighash.left(16)));
+
+    // BTC refund: persist the unsigned tx hex on the swap record so
+    // the auto-refund watcher can finalize + broadcast at timelock
+    // without requiring both parties to walk the cooperative dialog
+    // again. Mirrors PRIC refund persistence in PricCoopSignDialog.
+    if (m_mode == Mode::BtcPlain && m_wm && !m_swap_id.isEmpty()
+        && !m_unsigned_tx_hex.isEmpty()) {
+        auto rr = m_wm->wallet().adaptorSwapSetBtcRefundTx(
+            m_swap_id.toStdString(), m_unsigned_tx_hex.toStdString());
+        if (!rr) {
+            setStatus(tr("Sighash OK; persisting BTC refund tx for "
+                         "auto-refund failed: %1")
+                .arg(QString::fromStdString(util::ErrorString(rr).original)),
+                /*error=*/false);
+        }
+    }
 }
 
 QString CoopSignDialog::RandomHex32()

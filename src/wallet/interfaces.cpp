@@ -680,6 +680,17 @@ public:
         return WrapTransition(r, this, *sid);
     }
 
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetBtcRefundTx(
+        const std::string& swap_id,
+        const std::string& unsigned_tx_hex) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        auto r = ::wallet::pricoin_adaptor_swap::SetBtcRefundTx(
+            *m_wallet, *sid, unsigned_tx_hex);
+        return WrapTransition(r, this, *sid);
+    }
+
     util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPeerStealthPubkeys(
         const std::string& swap_id,
         const std::string& view_hex,

@@ -365,6 +365,13 @@ public:
         const std::string& swap_id,
         const std::string& unsigned_tx_hex) = 0;
 
+    // Persist the unsigned BTC refund tx hex. Captured during the BTC
+    // cooperative-sign dialog (BtcPlain mode) so the auto-refund
+    // watcher can finalize + broadcast at foreign refund timelock.
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetBtcRefundTx(
+        const std::string& swap_id,
+        const std::string& unsigned_tx_hex) = 0;
+
     // Persist peer's PRIC stealth view + spend pubkeys (33-byte hex
     // each). Set by the orderbook page right after swap creation,
     // when it still has the PeerSwapAddrs pair from the swap_addrs

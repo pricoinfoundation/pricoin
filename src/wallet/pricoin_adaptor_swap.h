@@ -264,6 +264,15 @@ struct AdaptorSwap {
     // pre-PreSigned swaps.
     std::string pric_refund_unsigned_tx_hex;
 
+    // BTC refund unsigned tx hex. Captured at sighash-compute time
+    // during BTC swap's cooperative-sign ceremony so the auto-refund
+    // watcher can finalize with `presigs.btc_refund_sig` and broadcast
+    // at foreign refund timelock without requiring Alice and Bob both
+    // online. Mirrors `pric_refund_unsigned_tx_hex` for BTC P2TR swaps.
+    // Empty for LTC swaps (LTC uses unilateral CLTV path) and for
+    // BTC swaps that haven't reached PreSigned yet.
+    std::string btc_refund_unsigned_tx_hex;
+
     // Peer's PRIC stealth view + spend pubkeys (33-byte hex). Used
     // at swap creation time to build the joint stealth address; now
     // also persisted so the cooperative-sign dialog can pass the
@@ -364,6 +373,13 @@ struct AdaptorSwap {
         // page's in-memory PeerSwapAddrs map.
         READWRITE(obj.peer_view_pubkey_hex);
         READWRITE(obj.peer_spend_pubkey_hex);
+
+        // BTC refund unsigned tx hex (appended 2026-05-11). Used by
+        // the auto-refund watcher to broadcast the BTC P2TR refund
+        // without both parties needing to be online and walk through
+        // the cooperative-sign dialog at timelock. Empty for LTC
+        // swaps and pre-PreSigned BTC swaps.
+        READWRITE(obj.btc_refund_unsigned_tx_hex);
     }
 };
 
@@ -540,6 +556,16 @@ TransitionResult SetPeerStealthPubkeys(
     const uint256& swap_id,
     const std::string& view_hex,
     const std::string& spend_hex);
+
+// Record the pre-built unsigned BTC refund tx hex. Captured by the
+// cooperative-sign dialog at sighash-compute time (BtcPlain mode)
+// so the auto-refund watcher can broadcast the BTC refund without
+// dialog state. State-agnostic — allowed from any non-terminal
+// state after Setup. Mirrors SetPricRefundTx.
+TransitionResult SetBtcRefundTx(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::string& unsigned_tx_hex);
 
 // Record Alice's foreign claim tx confirmed. Swap is done.
 // Transitions PricClaimed → Complete.

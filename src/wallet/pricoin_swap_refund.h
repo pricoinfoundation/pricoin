@@ -26,6 +26,12 @@ struct PricRefundResult {
     std::string error;
 };
 
+struct BtcRefundResult {
+    bool ok{false};
+    std::string txid;
+    std::string error;
+};
+
 // Build + broadcast the LTC HTLC refund for a swap. Used by both the
 // `pricoin_ltc_refund_swap` user-facing RPC and the chain watcher's
 // auto-refund path. Preconditions are checked here so callers don't
@@ -63,6 +69,23 @@ LtcRefundResult AutoBroadcastLtcRefund(
 // chain enforces it via the tx's nLockTime, so a too-early broadcast
 // is harmless (rejected by mempool).
 PricRefundResult AutoBroadcastPricRefund(
+    ::wallet::CWallet& wallet,
+    const uint256& swap_id);
+
+// Finalize the pre-built unsigned BTC refund tx by attaching the
+// cooperative MuSig2 refund sig (both stored on the swap record
+// after PreSigned) as a P2TR key-path-spend witness, broadcast via
+// the foreign chain backend, and register a foreign_refund watcher
+// entry. Mirrors AutoBroadcastPricRefund for the BTC P2TR variant.
+//
+// Requires the swap to be PreSigned+ with `btc_refund_unsigned_tx_hex`
+// and `presigs.btc_refund_sig` populated. BTC swaps only — LTC swaps
+// use the unilateral CLTV path (AutoBroadcastLtcRefund) instead.
+//
+// IMPORTANT: caller must dedup. Does not check chain timelock — the
+// chain enforces it via the tx's nLockTime, so a too-early broadcast
+// is harmless (rejected by mempool).
+BtcRefundResult AutoBroadcastBtcRefund(
     ::wallet::CWallet& wallet,
     const uint256& swap_id);
 
