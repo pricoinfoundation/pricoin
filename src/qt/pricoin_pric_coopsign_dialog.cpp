@@ -1257,15 +1257,22 @@ void PricCoopSignDialog::buildLayout(const QString& title)
             form->addRow(tr("dleq_t:"), m_in_dleq_t);
 
             m_in_session_label = new QLineEdit(box);
-            // Random default — both parties must use the same; spender
-            // DMs via the buildtx envelope, cosigner overwrites.
-            m_in_session_label->setText(RandomHex32());
-            m_in_session_label->setToolTip(tr("Session label — both parties MUST use the same value"));
+            // Default to the swap_id. Bob's adaptor_dleq_prove (called
+            // at adaptor-setup time in pricoin_swaps_page.cpp's Bob
+            // branch) signs the DLEQ proof with session_label = sid
+            // AND session_payload = sid. For Step 2's combine to
+            // verify Bob's proof, the cooperative-sign dialog MUST
+            // use the SAME values. Otherwise the DLEQ challenge
+            // differs and verify fails with "DLEQ verify failed".
+            // (Previously random per-dialog — that was the root cause
+            // of the persistent Step-2 failure on 2026-05-11.)
+            m_in_session_label->setText(m_swap_id);
+            m_in_session_label->setToolTip(tr("Session label — must match what was used at adaptor-setup time (swap_id)"));
             form->addRow(tr("session_label:"), m_in_session_label);
 
             m_in_session_payload = new QLineEdit(box);
-            m_in_session_payload->setText(RandomHex32());
-            m_in_session_payload->setToolTip(tr("Session payload — both parties MUST use the same value"));
+            m_in_session_payload->setText(m_swap_id);
+            m_in_session_payload->setToolTip(tr("Session payload — must match what was used at adaptor-setup time (swap_id)"));
             form->addRow(tr("session_payload:"), m_in_session_payload);
         }
 
