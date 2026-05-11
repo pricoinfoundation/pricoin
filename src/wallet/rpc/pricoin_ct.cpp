@@ -1330,6 +1330,22 @@ RPCMethod walletsendct_ring()
             const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
             interfaces::Chain& chain = wallet.chain();
 
+            // Safety gate: refuse to broadcast while the chain is in
+            // initial-block-download (IBD). The keyimage commit set
+            // (g_key_images) is rebuilt as blocks reconnect — during
+            // IBD it's incomplete, so IsKeyImageCommitted may return
+            // false for an output that's actually already spent in a
+            // higher block we haven't replayed yet. Broadcasting then
+            // double-spends the output, producing a tx that any fully-
+            // synced peer rejects. Wait until IBD finishes.
+            if (chain.isInitialBlockDownload()) {
+                throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+                    "Refusing to broadcast: chain is still in initial-block-"
+                    "download. Wait for sync to complete — the wallet can't "
+                    "reliably detect already-spent outputs until the chain's "
+                    "key-image set is fully (re)committed.");
+            }
+
             // 1. Find our recovered CT output with sufficient value via
             //    the per-wallet recovery cache. First call after a fresh
             //    daemon start pays the chain rescan; subsequent calls
@@ -4716,6 +4732,12 @@ UniValue AdaptorSwapToJSON(const aas::AdaptorSwap& s)
     }
     if (!s.pric_bob_recipient_stealth.empty()) {
         pric.pushKV("bob_recipient_stealth", s.pric_bob_recipient_stealth);
+    }
+    if (!s.peer_view_pubkey_hex.empty()) {
+        pric.pushKV("peer_view_pubkey",  s.peer_view_pubkey_hex);
+    }
+    if (!s.peer_spend_pubkey_hex.empty()) {
+        pric.pushKV("peer_spend_pubkey", s.peer_spend_pubkey_hex);
     }
     out.pushKV("pric", std::move(pric));
 

@@ -400,10 +400,55 @@ bool IsKeyImageCommitted(const ringsig::Point& ki)
     return g_key_images.contains(ki);
 }
 
-void InitKeyImageStore(const std::string& datadir_path)
+void PruneOrphanedKeyImages(
+    const std::function<bool(const uint256&)>& is_in_active_chain)
+{
+    LOCK(g_ki_mutex);
+    std::vector<uint256> to_drop;
+    to_drop.reserve(g_kis_by_block.size());
+    for (const auto& [block_hash, kis] : g_kis_by_block) {
+        if (!is_in_active_chain(block_hash)) {
+            to_drop.push_back(block_hash);
+        }
+    }
+    if (to_drop.empty()) return;
+    size_t kis_dropped = 0;
+    for (const auto& bh : to_drop) {
+        auto it = g_kis_by_block.find(bh);
+        if (it == g_kis_by_block.end()) continue;
+        for (const auto& ki : it->second) {
+            g_key_images.erase(ki);
+            ++kis_dropped;
+        }
+        g_kis_by_block.erase(it);
+    }
+    // Rewrite the persistent file to match the cleaned in-memory state.
+    RewriteFile();
+    LogInfo("Pricoin: self-heal pruned %u orphaned key-image entries "
+            "across %u block(s) (block_hashes not in active chain)\n",
+            (unsigned)kis_dropped, (unsigned)to_drop.size());
+}
+
+void InitKeyImageStore(const std::string& datadir_path, bool wipe_on_init)
 {
     LOCK(g_ki_mutex);
     g_ki_path = fs::PathFromString(datadir_path) / "pricoin_keyimages.dat";
+    // -reindex / -reindex-chainstate path: wipe the file so the
+    // store rebuilds from scratch as blocks reconnect. Without this,
+    // the store keeps the previous session's keyimages and rejects
+    // the re-validated blocks as "double-spend" of their own entries.
+    if (wipe_on_init) {
+        std::error_code ec;
+        if (fs::remove(g_ki_path, ec) && !ec) {
+            LogInfo("Pricoin: wiped key-image store at startup (%s) due to "
+                    "-reindex / -reindex-chainstate\n",
+                    fs::PathToString(g_ki_path));
+        }
+        // Drop any in-memory state too — defensive; should already be
+        // empty on first init.
+        g_key_images.clear();
+        g_kis_by_block.clear();
+    }
     // Clean up any orphaned .tmp left behind by an interrupted RewriteFile
     // (we write to <path>.tmp then rename; a crash between the two leaves
     // the partial file behind). Always-safe to remove: by definition the

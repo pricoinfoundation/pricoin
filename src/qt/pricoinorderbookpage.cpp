@@ -1691,6 +1691,27 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
                 .arg(QString::fromStdString(util::ErrorString(r).original)), true);
             return;
         }
+        // Persist peer's stealth pubkeys on this side's mirror record
+        // too. Symmetry with the clicker-side persistence in
+        // onStartSwapClicked. The swap_addrs DM from the peer was
+        // received earlier (during match flow) and lives in
+        // m_peer_swap_addrs keyed by the local order id; look it up
+        // and persist so the cooperative-sign dialog's loadshare can
+        // read peer_spend_pubkey_hex from the swap record. Without
+        // this, the cosigner side's loadshare fails with
+        // "scriptPubKey mismatch".
+        {
+            QString my_oid_qs = QString::fromStdString(my_oid);
+            auto it_addrs = m_peer_swap_addrs.find(my_oid_qs);
+            if (it_addrs != m_peer_swap_addrs.end()
+                && !it_addrs->view_pubkey.isEmpty()
+                && !it_addrs->spend_pubkey.isEmpty()) {
+                (void)m_model->wallet().adaptorSwapSetPeerStealthPubkeys(
+                    r->swap_id,
+                    it_addrs->view_pubkey.toStdString(),
+                    it_addrs->spend_pubkey.toStdString());
+            }
+        }
         refreshTable();
         setStatus(tr("Counterparty started the swap; mirror record "
                       "created on this side. Switch to the Swaps tab."));

@@ -9,6 +9,7 @@
 #include <pricoin/ringsig.h>
 #include <uint256.h>
 
+#include <functional>
 #include <span>
 #include <string>
 
@@ -57,7 +58,22 @@ void UncommitBlockKIs(const uint256& block_hash);
 // Initialize the key-image persistent store. Loads any existing key images
 // from <datadir>/pricoin_keyimages.dat into the in-memory set, and opens
 // the file for append. Called once at daemon startup.
-void InitKeyImageStore(const std::string& datadir_path);
+//
+// If `wipe_on_init` is true (typically when -reindex or
+// -reindex-chainstate is passed), the file is deleted before loading.
+// Without this, a reindex rebuilds chainstate from genesis but the
+// keyimage store keeps the previous session's entries — the same
+// blocks then fail re-validation as "double-spend" of keyimages the
+// store thinks are already used.
+void InitKeyImageStore(const std::string& datadir_path,
+                        bool wipe_on_init = false);
+
+// Drop all keyimages associated with block_hashes that aren't in the
+// active chain. Called from init.cpp after chainstate is fully
+// loaded, as a self-heal against half-applied reorgs (e.g., crash
+// between CommitBlockKIs and chainstate flush). Idempotent.
+void PruneOrphanedKeyImages(
+    const std::function<bool(const uint256&)>& is_in_active_chain);
 
 // Pricoin: query whether a given key image has been committed to the
 // global set (either via on-chain ring tx or via load-from-file at

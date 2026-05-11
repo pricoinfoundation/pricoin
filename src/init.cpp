@@ -1525,8 +1525,15 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     // Pricoin: initialize the persistent key-image store. Loads any KIs
     // committed by past sessions; subsequent CommitRingKeyImages calls
-    // append to this file.
-    pricoin::InitKeyImageStore(fs::PathToString(args.GetDataDirNet()));
+    // append to this file. Wipe on -reindex / -reindex-chainstate so
+    // the store rebuilds in lockstep with chainstate (otherwise the
+    // store would have entries for blocks the rebuilt chainstate
+    // hasn't re-applied yet, causing "double-spend" rejections).
+    const bool reindexing =
+        args.GetBoolArg("-reindex", false) ||
+        args.GetBoolArg("-reindex-chainstate", false);
+    pricoin::InitKeyImageStore(fs::PathToString(args.GetDataDirNet()),
+                                /*wipe_on_init=*/reindexing);
 
     // Pricoin: register chain-watch backends from -btcwatchurl /
     // -ltcwatchurl / -chainwatchurl=<chain>=<url> args. Backends are
@@ -2255,6 +2262,26 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         // Import blocks and ActivateBestChain()
         ImportBlocks(chainman, vImportFiles);
         WITH_LOCK(::cs_main, chainman.UpdateIBDStatus());
+
+        // Pricoin: self-heal the key-image store against orphaned
+        // entries — block_hashes in keyimages.dat that aren't on the
+        // active chain (left behind by a disconnect that failed to
+        // call UncommitBlockKIs, or a crash between commit and chain
+        // tip flush). Runs after ImportBlocks + ActivateBestChain so
+        // the chain is fully loaded; without this, validation rejects
+        // re-connection of the same block as "double-spend" of its
+        // own stale keyimage entry.
+        {
+            LOCK(::cs_main);
+            pricoin::PruneOrphanedKeyImages(
+                std::function<bool(const uint256&)>{
+                    [&chainman](const uint256& block_hash)
+                        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) -> bool {
+                        const CBlockIndex* bi = chainman.m_blockman
+                            .LookupBlockIndex(block_hash);
+                        return bi && chainman.ActiveChain().Contains(*bi);
+                    }});
+        }
         if (args.GetBoolArg("-stopafterblockimport", DEFAULT_STOPAFTERBLOCKIMPORT)) {
             LogInfo("Stopping after block import");
             if (!(Assert(node.shutdown_request))()) {
