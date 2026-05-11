@@ -468,6 +468,8 @@ public:
         o.btc_bob_recipient_xonly_hex    = s.btc_bob_recipient_xonly_hex;
         o.pric_alice_recipient_stealth   = s.pric_alice_recipient_stealth;
         o.pric_bob_recipient_stealth     = s.pric_bob_recipient_stealth;
+        o.peer_view_pubkey_hex           = s.peer_view_pubkey_hex;
+        o.peer_spend_pubkey_hex          = s.peer_spend_pubkey_hex;
         o.has_t = s.has_t;
         if (s.has_t) {
             o.t_secret_hex = HexStr(s.t_secret);
@@ -675,6 +677,18 @@ public:
         if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
         auto r = ::wallet::pricoin_adaptor_swap::SetPricRefundTx(
             *m_wallet, *sid, unsigned_tx_hex);
+        return WrapTransition(r, this, *sid);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPeerStealthPubkeys(
+        const std::string& swap_id,
+        const std::string& view_hex,
+        const std::string& spend_hex) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        auto r = ::wallet::pricoin_adaptor_swap::SetPeerStealthPubkeys(
+            *m_wallet, *sid, view_hex, spend_hex);
         return WrapTransition(r, this, *sid);
     }
 

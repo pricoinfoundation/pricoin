@@ -1136,6 +1136,30 @@ void PricoinOrderbookPage::onStartSwapClicked()
     }
     const std::string created_swap_id = r->swap_id;
 
+    // Persist peer's PRIC stealth view+spend pubkeys to the swap
+    // record. Needed by the cooperative-sign dialog's loadshare
+    // call (other_spend_pubkey arg). PeerSwapAddrs lives only
+    // in this page's in-memory map; without persisting, a Qt
+    // restart loses the data and loadshare fails. Best-effort —
+    // if peer_addrs wasn't populated (swap_addrs DM didn't arrive),
+    // skip silently and the manual paste fallback still works.
+    if (!peer_addrs.view_pubkey.isEmpty()
+        && !peer_addrs.spend_pubkey.isEmpty()) {
+        auto rs = m_model->wallet().adaptorSwapSetPeerStealthPubkeys(
+            created_swap_id,
+            peer_addrs.view_pubkey.toStdString(),
+            peer_addrs.spend_pubkey.toStdString());
+        if (!rs) {
+            // Surface but don't block — the swap is created and the
+            // user can fall back to manual paste in the loadshare
+            // helper if needed.
+            setStatus(tr("Swap created; persisting peer stealth pubkeys "
+                         "failed: %1 (loadshare will need manual peer "
+                         "spend pubkey)").arg(QString::fromStdString(
+                util::ErrorString(rs).original)), false);
+        }
+    }
+
     // DM the counterparty so their wallet auto-creates the mirror
     // swap record. Without this, the counterparty has to fill out
     // the same Start-swap dialog independently and risk transcribing

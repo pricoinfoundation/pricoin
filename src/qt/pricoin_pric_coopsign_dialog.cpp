@@ -214,17 +214,22 @@ void PricCoopSignDialog::onRunLoadshare()
 
     // The RPC takes 6 params: (tx_hex, vout, my_partial, other_partial,
     // other_spend_pubkey, absorb_shared_secret). other_spend_pubkey is
-    // the counterparty's 33-byte spend pubkey, which lives on the swap
-    // record as `counterparty_pubkey_hex`.
+    // the counterparty's STEALTH spend pubkey (NOT the swap-identity
+    // counterparty_pubkey, which is the ECDSA pubkey used for HTLCs
+    // — different key entirely). Persisted to the swap record at
+    // creation time via adaptorSwapSetPeerStealthPubkeys.
     std::string other_spend_hex;
     if (m_wm && !m_swap_id.isEmpty()) {
         auto snap = m_wm->wallet().adaptorSwapGet(m_swap_id.toStdString());
-        if (snap && snap->counterparty_pubkey_hex.size() == 66) {
-            other_spend_hex = snap->counterparty_pubkey_hex;
+        if (snap && snap->peer_spend_pubkey_hex.size() == 66) {
+            other_spend_hex = snap->peer_spend_pubkey_hex;
         }
     }
     if (other_spend_hex.size() != 66) {
-        setStatus(tr("Counterparty spend pubkey unavailable (swap record incomplete)"), true);
+        setStatus(tr("Peer stealth spend pubkey not on swap record. "
+                     "Was the swap_addrs DM delivered? Manual fallback: "
+                     "paste peer's 33-byte spend pubkey hex into the "
+                     "swap record via cli."), true);
         return;
     }
 
@@ -370,6 +375,23 @@ void PricCoopSignDialog::onRunBuildtx()
     if (m_in_pi)  m_in_pi->setText(QString::number(pi));
     if (m_in_ring_or_ring_ml && m_mode == Mode::PricPlain) {
         m_in_ring_or_ring_ml->setPlainText(QString::fromStdString(ring_ml));
+    }
+    // Adaptor mode needs single-layer ring (JSON array of pubkey hex
+    // strings). buildtx returns multi-layer ring_ml ([{P,W}, ...]);
+    // project to just the P field per entry. Without this, auto-coord
+    // stalls in adaptor mode because the ring field stays empty and
+    // tryAutoStep1 / tryAutoSendBuildtx never proceed.
+    if (m_in_ring_or_ring_ml && m_mode == Mode::PricAdaptor
+        && v.exists("ring_ml") && v["ring_ml"].isArray()) {
+        UniValue ring_single{UniValue::VARR};
+        for (size_t i = 0; i < v["ring_ml"].size(); ++i) {
+            const UniValue& entry = v["ring_ml"][i];
+            if (entry.isObject() && entry.exists("P") && entry["P"].isStr()) {
+                ring_single.push_back(entry["P"]);
+            }
+        }
+        m_in_ring_or_ring_ml->setPlainText(
+            QString::fromStdString(ring_single.write(0)));
     }
     // Spender's z_self auto-fills the z_share field (plain only).
     if (m_in_z_share && m_mode == Mode::PricPlain) {

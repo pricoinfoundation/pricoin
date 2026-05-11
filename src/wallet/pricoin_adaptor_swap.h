@@ -264,6 +264,15 @@ struct AdaptorSwap {
     // pre-PreSigned swaps.
     std::string pric_refund_unsigned_tx_hex;
 
+    // Peer's PRIC stealth view + spend pubkeys (33-byte hex). Used
+    // at swap creation time to build the joint stealth address; now
+    // also persisted so the cooperative-sign dialog can pass the
+    // peer's spend pubkey to pricoin_jointspend_loadshare. Without
+    // these, loadshare fails with "scriptPubKey mismatch" because it
+    // can't reconstruct the joint one-time pubkey.
+    std::string peer_view_pubkey_hex;
+    std::string peer_spend_pubkey_hex;
+
     SERIALIZE_METHODS(AdaptorSwap, obj) {
         READWRITE(obj.swap_id);
         uint8_t role_byte = static_cast<uint8_t>(obj.role);
@@ -347,6 +356,14 @@ struct AdaptorSwap {
         // refund without requiring the cooperative-sign dialog to be
         // open. Empty when not yet set by the buildtx step.
         READWRITE(obj.pric_refund_unsigned_tx_hex);
+
+        // Peer's PRIC stealth view + spend pubkeys (appended
+        // 2026-05-11). Persisted at swap creation so the loadshare
+        // RPC can reconstruct the joint one-time pubkey without the
+        // cooperative-sign dialog needing access to the orderbook
+        // page's in-memory PeerSwapAddrs map.
+        READWRITE(obj.peer_view_pubkey_hex);
+        READWRITE(obj.peer_spend_pubkey_hex);
     }
 };
 
@@ -512,6 +529,17 @@ TransitionResult SetPricRefundTx(
     CWallet& wallet,
     const uint256& swap_id,
     const std::string& unsigned_tx_hex);
+
+// Persist peer's stealth view + spend pubkeys (33-byte hex each).
+// Set by the orderbook page right after swap creation, when it
+// still has the PeerSwapAddrs pair from the swap_addrs DM. Needed
+// by the cooperative-sign dialog's loadshare call. Idempotent
+// re-set with same values is OK; conflicting re-set rejected.
+TransitionResult SetPeerStealthPubkeys(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::string& view_hex,
+    const std::string& spend_hex);
 
 // Record Alice's foreign claim tx confirmed. Swap is done.
 // Transitions PricClaimed → Complete.

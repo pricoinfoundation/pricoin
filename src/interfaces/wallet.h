@@ -261,6 +261,10 @@ public:
         std::string btc_bob_recipient_xonly_hex;
         std::string pric_alice_recipient_stealth;
         std::string pric_bob_recipient_stealth;
+        // Peer's stealth view + spend pubkeys (33-byte hex). Set by
+        // adaptorSwapSetPeerStealthPubkeys after swap creation.
+        std::string peer_view_pubkey_hex;
+        std::string peer_spend_pubkey_hex;
         // Adaptor scalar t — present once the holder's wallet has it.
         // For Bob, populated at SetAdaptorMaterials. For Alice,
         // populated by SetTSecret (typically called from the extract
@@ -308,6 +312,10 @@ public:
         std::string btc_bob_recipient_xonly_hex;
         std::string pric_alice_recipient_stealth;
         std::string pric_bob_recipient_stealth;
+        // Peer's stealth view + spend pubkeys (33-byte hex). Set by
+        // adaptorSwapSetPeerStealthPubkeys after swap creation.
+        std::string peer_view_pubkey_hex;
+        std::string peer_spend_pubkey_hex;
         // Optional pre-allocated swap_id (32-byte hex). When non-empty,
         // adaptorSwapCreate uses this instead of generating a random
         // id. Lets the matcher's wallet ship a swap_id in the
@@ -356,6 +364,16 @@ public:
     virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPricRefundTx(
         const std::string& swap_id,
         const std::string& unsigned_tx_hex) = 0;
+
+    // Persist peer's PRIC stealth view + spend pubkeys (33-byte hex
+    // each). Set by the orderbook page right after swap creation,
+    // when it still has the PeerSwapAddrs pair from the swap_addrs
+    // DM. The cooperative-sign dialog's loadshare call needs the
+    // peer's spend pubkey to reconstruct the joint one-time pubkey.
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPeerStealthPubkeys(
+        const std::string& swap_id,
+        const std::string& view_hex,
+        const std::string& spend_hex) = 0;
 
     // AdaptorReady → BtcFunded.
     virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetBtcFunded(

@@ -5058,6 +5058,36 @@ RPCMethod pricoin_adaptor_swap_set_pric_funded()
     };
 }
 
+RPCMethod pricoin_adaptor_swap_set_peer_stealth_pubkeys()
+{
+    return RPCMethod{
+        "pricoin_adaptor_swap_set_peer_stealth_pubkeys",
+        "Persist peer's PRIC stealth view + spend pubkeys (33-byte hex each)\n"
+        "on an existing swap record. Normally called automatically at swap\n"
+        "creation time; this RPC is for backfilling records that were\n"
+        "created before automatic persistence landed.\n",
+        {
+            {"swap_id",     RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"view_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte peer stealth view pubkey"},
+            {"spend_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte peer stealth spend pubkey"},
+        },
+        RPCResult{ RPCResult::Type::ANY, "", "Updated swap record" },
+        RPCExamples{HelpExampleCli("pricoin_adaptor_swap_set_peer_stealth_pubkeys",
+            "<swap_id> <view_hex> <spend_hex>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const uint256 sid = ParseSwapId(request.params[0].get_str());
+            auto r = aas::SetPeerStealthPubkeys(*wallet_sp, sid,
+                request.params[1].get_str(), request.params[2].get_str());
+            if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
+            aas::AdaptorSwap out;
+            (void)aas::Get(*wallet_sp, sid, out);
+            return AdaptorSwapToJSON(out);
+        }
+    };
+}
+
 RPCMethod pricoin_adaptor_swap_set_pre_signed()
 {
     return RPCMethod{
@@ -8234,6 +8264,7 @@ RPCMethod pricoin_adaptor_swap_set_timelocks_export()    { return pricoin_adapto
 RPCMethod pricoin_adaptor_swap_set_btc_funded_export()   { return pricoin_adaptor_swap_set_btc_funded(); }
 RPCMethod pricoin_adaptor_swap_set_pric_claim_ring_export() { return pricoin_adaptor_swap_set_pric_claim_ring(); }
 RPCMethod pricoin_adaptor_swap_set_pric_funded_export()  { return pricoin_adaptor_swap_set_pric_funded(); }
+RPCMethod pricoin_adaptor_swap_set_peer_stealth_pubkeys_export() { return pricoin_adaptor_swap_set_peer_stealth_pubkeys(); }
 RPCMethod pricoin_adaptor_swap_set_pre_signed_export()   { return pricoin_adaptor_swap_set_pre_signed(); }
 RPCMethod pricoin_adaptor_swap_set_pric_claimed_export() { return pricoin_adaptor_swap_set_pric_claimed(); }
 RPCMethod pricoin_adaptor_swap_set_complete_export()     { return pricoin_adaptor_swap_set_complete(); }

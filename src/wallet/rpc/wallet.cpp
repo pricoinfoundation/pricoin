@@ -948,6 +948,7 @@ RPCMethod pricoin_adaptor_swap_set_timelocks_export();
 RPCMethod pricoin_adaptor_swap_set_btc_funded_export();
 RPCMethod pricoin_adaptor_swap_set_pric_claim_ring_export();
 RPCMethod pricoin_adaptor_swap_set_pric_funded_export();
+RPCMethod pricoin_adaptor_swap_set_peer_stealth_pubkeys_export();
 RPCMethod pricoin_adaptor_swap_set_pre_signed_export();
 RPCMethod pricoin_adaptor_swap_set_pric_claimed_export();
 RPCMethod pricoin_adaptor_swap_set_complete_export();
@@ -1056,6 +1057,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &pricoin_adaptor_swap_set_btc_funded_export},
         {"wallet", &pricoin_adaptor_swap_set_pric_claim_ring_export},
         {"wallet", &pricoin_adaptor_swap_set_pric_funded_export},
+        {"wallet", &pricoin_adaptor_swap_set_peer_stealth_pubkeys_export},
         {"wallet", &pricoin_adaptor_swap_set_pre_signed_export},
         {"wallet", &pricoin_adaptor_swap_set_pric_claimed_export},
         {"wallet", &pricoin_adaptor_swap_set_complete_export},

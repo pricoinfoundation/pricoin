@@ -482,6 +482,33 @@ TransitionResult SetPricRefundTx(
     });
 }
 
+TransitionResult SetPeerStealthPubkeys(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::string& view_hex,
+    const std::string& spend_hex)
+{
+    if (view_hex.size() != 66 || spend_hex.size() != 66) {
+        return TransitionResult::InvalidInput;
+    }
+    return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
+        if (s.state == State::Complete || s.state == State::Refunded
+            || s.state == State::Aborted) {
+            return TransitionResult::InvalidState;
+        }
+        if (!s.peer_view_pubkey_hex.empty() || !s.peer_spend_pubkey_hex.empty()) {
+            if (s.peer_view_pubkey_hex == view_hex
+                && s.peer_spend_pubkey_hex == spend_hex) {
+                return TransitionResult::Ok;
+            }
+            return TransitionResult::InvalidInput;
+        }
+        s.peer_view_pubkey_hex = view_hex;
+        s.peer_spend_pubkey_hex = spend_hex;
+        return TransitionResult::Ok;
+    });
+}
+
 TransitionResult SetComplete(
     CWallet& wallet,
     const uint256& swap_id,
