@@ -4,6 +4,7 @@
 
 #include <qt/pricoin_pric_coopsign_dialog.h>
 
+#include <crypto/sha256.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <qt/pricoin_nostr_client.h>
@@ -202,6 +203,16 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
     // QueuedConnection so it doesn't block ctor on RPC calls.
     if (!m_nostr) onNostrConnectClicked();
     QMetaObject::invokeMethod(this, [this]{
+        // If a previous run already completed this leg (session
+        // restore set m_final_blob_hex), auto-accept on construction
+        // so the outer dialog's Phase-4 chain proceeds without
+        // forcing the user to re-run the ceremony.
+        if (!m_final_blob_hex.isEmpty()) {
+            setStatus(tr("Auto: previous session completed — final blob "
+                          "restored, dialog closing."));
+            accept();
+            return;
+        }
         tryAutoComputeJointscanPartial();
     }, Qt::QueuedConnection);
 }
@@ -1692,6 +1703,29 @@ void PricCoopSignDialog::buildLayout(const QString& title)
             MakeMono(m_in_s_others_seed_json);
             m_in_s_others_seed_json->setMaximumHeight(80);
             m_in_s_others_seed_json->setPlaceholderText(tr("[\"<s0>\",\"<s1>\",\"<s2>\",\"<s3>\"]"));
+            // Auto-fill with deterministic values derived from swap_id +
+            // index, so both parties produce the same array without
+            // needing to DM-exchange it. CSHA256(swap_id || idx_byte) ×
+            // ring_size. Default ring size is 4 (matches the
+            // hardcoded buildtx ring_size below).
+            if (!m_swap_id.isEmpty()) {
+                UniValue arr{UniValue::VARR};
+                const std::string sid_str = m_swap_id.toStdString();
+                for (unsigned char i = 0; i < 4; ++i) {
+                    unsigned char digest[32];
+                    CSHA256()
+                        .Write(reinterpret_cast<const unsigned char*>(
+                                   sid_str.data()), sid_str.size())
+                        .Write(reinterpret_cast<const unsigned char*>(
+                                   "pricoin/s_others_v1/"), 20)
+                        .Write(&i, 1)
+                        .Finalize(digest);
+                    arr.push_back(HexStr(std::span<const unsigned char>{
+                        digest, 32}));
+                }
+                m_in_s_others_seed_json->setPlainText(
+                    QString::fromStdString(arr.write(0)));
+            }
             layout->addWidget(m_in_s_others_seed_json);
             layout->addLayout(MakeCopyPasteRow(m_in_s_others_seed_json));
         }

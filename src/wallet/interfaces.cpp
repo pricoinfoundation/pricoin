@@ -754,12 +754,34 @@ public:
         ps.pric_claim_presig_blob   = parse(presigs.pric_claim_presig_blob_hex);
         ps.btc_refund_sig           = parse(presigs.btc_refund_sig_hex);
         ps.pric_refund_sig_blob     = parse(presigs.pric_refund_sig_blob_hex);
-        if (ps.btc_claim_presig.size() != 64
-            || ps.btc_claim_session.size() != 133
-            || ps.btc_refund_sig.size() != 64
-            || ps.pric_claim_presig_blob.empty()
-            || ps.pric_refund_sig_blob.empty()) {
-            return util::Error{Untranslated("pre-sig blobs must be valid hex of the expected lengths (64/133/64 fixed; PRIC blobs non-empty)")};
+
+        // For LTC swaps the BTC-side fields don't apply (the LTC HTLC
+        // has a unilateral CLTV refund and uses ECDSA for the claim
+        // adaptor binding instead of MuSig2-over-P2TR). Only require
+        // them for BTC swaps. Always require the PRIC blobs.
+        ::wallet::pricoin_adaptor_swap::AdaptorSwap snap;
+        const bool is_btc = (::wallet::pricoin_adaptor_swap::Get(
+                                *m_wallet, *sid, snap)
+                             == ::wallet::pricoin_adaptor_swap::LookupResult::Ok)
+                            && snap.foreign_chain == "btc";
+        if (is_btc) {
+            if (ps.btc_claim_presig.size() != 64
+                || ps.btc_claim_session.size() != 133
+                || ps.btc_refund_sig.size() != 64
+                || ps.pric_claim_presig_blob.empty()
+                || ps.pric_refund_sig_blob.empty()) {
+                return util::Error{Untranslated(
+                    "BTC swap pre-sig blobs invalid (need 64/133/64 BTC sigs "
+                    "+ non-empty PRIC claim/refund blobs)")};
+            }
+        } else {
+            // LTC (or regtest): only PRIC blobs required.
+            if (ps.pric_claim_presig_blob.empty()
+                || ps.pric_refund_sig_blob.empty()) {
+                return util::Error{Untranslated(
+                    "LTC swap pre-sig blobs invalid (need non-empty PRIC "
+                    "claim/refund blobs)")};
+            }
         }
         auto r = ::wallet::pricoin_adaptor_swap::SetPreSigned(*m_wallet, *sid, ps);
         return WrapTransition(r, this, *sid);
