@@ -1940,9 +1940,9 @@ void PricoinSwapsPage::onAdaptPricClaimClicked()
     auto* form = new QFormLayout(&dlg);
     form->addRow(new QLabel(tr("PRIC buyer only: uses the wallet's stored "
         "t_secret to adapt the PRIC adaptor pre-sig and broadcast the claim. "
-        "The 3 inputs below come from the cooperative-sign dialog session — "
-        "paste tx_hex (buildtx output), the single-layer ring of joint "
-        "pubkeys, and the 32-byte sighash."), &dlg));
+        "The 3 inputs below auto-fill from the cooperative-sign session "
+        "saved on the swap record (Phase 2026-05-11) — override only if "
+        "the auto-filled values are stale."), &dlg));
     auto* tx_hex = new QPlainTextEdit(&dlg);
     tx_hex->setPlaceholderText(tr("Skeleton tx hex from pricoin_jointspend_buildtx"));
     tx_hex->setMaximumHeight(80);
@@ -1954,6 +1954,28 @@ void PricoinSwapsPage::onAdaptPricClaimClicked()
     auto* msg = new QLineEdit(&dlg);
     msg->setPlaceholderText(tr("32-byte sighash hex"));
     form->addRow(tr("msg (sighash):"), msg);
+
+    // Auto-fill from the persisted claim-leg coopsign session.
+    // Spares the user the copy-paste from the cooperative-sign
+    // dialog — all three fields are already in the session JSON.
+    if (auto snap_opt = m_model->wallet().adaptorSwapGet(sid); snap_opt) {
+        const std::string& blob = snap_opt->pric_claim_adaptor_session_json;
+        UniValue j;
+        if (!blob.empty() && j.read(blob) && j.isObject()) {
+            if (j.exists("unsigned_tx_hex") && j["unsigned_tx_hex"].isStr()) {
+                tx_hex->setPlainText(QString::fromStdString(
+                    j["unsigned_tx_hex"].get_str()));
+            }
+            if (j.exists("ring_json") && j["ring_json"].isStr()) {
+                ring->setPlainText(QString::fromStdString(
+                    j["ring_json"].get_str()));
+            }
+            if (j.exists("msg_hex") && j["msg_hex"].isStr()) {
+                msg->setText(QString::fromStdString(
+                    j["msg_hex"].get_str()));
+            }
+        }
+    }
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     QObject::connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     QObject::connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
