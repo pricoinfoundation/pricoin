@@ -1295,6 +1295,11 @@ RPCMethod walletsendct_ring()
                 {RPCResult::Type::STR_AMOUNT, "change_amount", "Change amount"},
                 {RPCResult::Type::NUM, "size", ""},
                 {RPCResult::Type::NUM, "bundle_size", ""},
+                {RPCResult::Type::NUM, "recipient_vout",
+                    "Post-shuffle on-chain vout of the recipient output. "
+                    "Needed by atomic-swap PRIC funding so the cooperative-sign "
+                    "loadshare gets the correct vout. -1 if not found (shouldn't "
+                    "happen for non-empty pending list)."},
             }
         },
         RPCExamples{HelpExampleCli("walletsendct_ring", "\"pricstl1...\" 5 0.0001 4")},
