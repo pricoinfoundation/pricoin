@@ -1582,15 +1582,15 @@ bool WalletBatch::ReadAllPricoinChainWatches(
 }
 
 bool WalletBatch::WritePricoinBroadcastedKi(
-    const std::array<unsigned char, 33>& key_image)
+    const std::array<unsigned char, 33>& key_image,
+    const uint256& txid)
 {
-    // Value is empty — presence in the table is the entire signal.
     return WriteIC(std::make_pair(DBKeys::PRICOIN_BROADCASTED_KI, key_image),
-                   std::vector<unsigned char>{});
+                   txid);
 }
 
 bool WalletBatch::ReadAllPricoinBroadcastedKis(
-    std::set<std::array<unsigned char, 33>>& out)
+    std::map<std::array<unsigned char, 33>, uint256>& out)
 {
     DataStream prefix;
     prefix << DBKeys::PRICOIN_BROADCASTED_KI;
@@ -1607,7 +1607,9 @@ bool WalletBatch::ReadAllPricoinBroadcastedKis(
         if (type != DBKeys::PRICOIN_BROADCASTED_KI) continue;
         std::array<unsigned char, 33> ki;
         ssKey >> ki;
-        out.insert(ki);
+        uint256 txid;
+        ssValue >> txid;
+        out[ki] = txid;
     }
     return true;
 }

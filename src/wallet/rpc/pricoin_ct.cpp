@@ -1092,10 +1092,14 @@ RPCMethod pricoin_listownct()
                     if (rec.height < startheight) continue;
                     if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
                     // Filter inputs the wallet has already broadcast a
-                    // spend for, even if the chain's set is stale.
-                    // Keeps reported balance honest.
-                    if (::wallet::pricoin_broadcasted_kis::Contains(
-                            wallet, rec.key_image)) continue;
+                    // CONFIRMED spend for. Mempool-only entries stay
+                    // visible (they may be RBF'd or evicted).
+                    if (auto prev = ::wallet::pricoin_broadcasted_kis::Lookup(
+                            wallet, rec.key_image)) {
+                        auto found = wallet.chain().findOnChainOrInMempool(
+                            Txid::FromUint256(*prev));
+                        if (found && !found->second.IsNull()) continue;
+                    }
                     total_recovered += rec.value;
                     UniValue entry{UniValue::VOBJ};
                     entry.pushKV("txid", outpoint.hash.ToString());
@@ -1380,8 +1384,24 @@ RPCMethod walletsendct_ring()
                     // chain's global keyimage set is stale (e.g. after
                     // a -reindex sync race). Closes the double-spend
                     // window hit on 2026-05-11.
-                    if (::wallet::pricoin_broadcasted_kis::Contains(
-                            wallet, rec.key_image)) continue;
+                    //
+                    // RBF carve-out: if our recorded txid is in mempool
+                    // (not yet confirmed), the wallet should be able
+                    // to re-pick this input to broadcast a higher-fee
+                    // replacement. Only filter if the recorded tx is
+                    // confirmed in a block — that's when the input is
+                    // genuinely spent.
+                    if (auto prev = ::wallet::pricoin_broadcasted_kis::Lookup(
+                            wallet, rec.key_image)) {
+                        auto found = chain.findOnChainOrInMempool(Txid::FromUint256(*prev));
+                        if (found && !found->second.IsNull()) {
+                            // Recorded broadcast was confirmed in a
+                            // block — input is genuinely spent.
+                            continue;
+                        }
+                        // Otherwise: in mempool only OR evicted —
+                        // allow re-pick (RBF case).
+                    }
                     picked_outpoint = outpoint;
                     picked_height = rec.height;
                     break;
@@ -1643,12 +1663,14 @@ RPCMethod walletsendct_ring()
                 throw JSONRPCError(RPC_WALLET_ERROR, "broadcast failed: " + err_str);
             }
 
-            // Persist the spent keyimage. Best-effort — broadcast
-            // already succeeded; if persistence fails (e.g. wallet
-            // DB write error) the wallet falls back to the chain's
-            // keyimage set for double-spend protection (still safe
-            // when the chain is fully synced).
-            if (!::wallet::pricoin_broadcasted_kis::Add(wallet, ki_to_persist)) {
+            // Persist the spent keyimage with the txid that produced
+            // it. The txid lets the picker check confirmation status
+            // at re-pick time so RBF (same input, higher fee) still
+            // works when the recorded tx is mempool-only. Best-
+            // effort — broadcast already succeeded; persistence
+            // failure falls back to chain's keyimage set.
+            if (!::wallet::pricoin_broadcasted_kis::Add(
+                    wallet, ki_to_persist, tx_ref->GetHash().ToUint256())) {
                 LogInfo("Pricoin walletsendct_ring: broadcasted-KI persist "
                         "failed for tx %s — chain-set fallback only\n",
                         tx_ref->GetHash().ToString());
@@ -1736,8 +1758,13 @@ RPCMethod walletsendct_from_ct()
                 sorted.reserve(index.entries.size());
                 for (const auto& [outpoint, rec] : index.entries) {
                     if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
-                    if (::wallet::pricoin_broadcasted_kis::Contains(
-                            wallet, rec.key_image)) continue;
+                    // Same RBF-aware filter as walletsendct_ring's picker.
+                    if (auto prev = ::wallet::pricoin_broadcasted_kis::Lookup(
+                            wallet, rec.key_image)) {
+                        auto found = wallet.chain().findOnChainOrInMempool(
+                            Txid::FromUint256(*prev));
+                        if (found && !found->second.IsNull()) continue;
+                    }
                     sorted.push_back({outpoint, rec.value, rec.height});
                 }
             }

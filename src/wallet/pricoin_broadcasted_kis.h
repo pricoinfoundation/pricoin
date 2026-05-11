@@ -30,6 +30,9 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
+
+#include <uint256.h>
 
 namespace wallet { class CWallet; }
 
@@ -39,16 +42,25 @@ namespace wallet::pricoin_broadcasted_kis {
 // wallet load. Idempotent.
 bool LoadFromDB(::wallet::CWallet& wallet);
 
-// Persist a newly-broadcasted keyimage to both memory + disk.
-// Returns true on success. Safe to call with the same KI multiple
-// times — second call is a no-op.
+// Persist a newly-broadcasted keyimage along with the txid that
+// produced it. The txid lets a later lookup check whether the
+// broadcast actually confirmed (vs got evicted/replaced) — which
+// is critical for RBF: the picker must ALLOW re-picking an input
+// whose previous broadcast is still in mempool (so a fee bump can
+// land), but REJECT re-picking once the broadcast is confirmed.
+// Returns true on success. Safe to call repeatedly — second call
+// with same (ki, txid) is a no-op; same ki + different txid
+// overwrites (the latest broadcast replaces).
 bool Add(::wallet::CWallet& wallet,
-          const std::array<unsigned char, 33>& key_image);
+          const std::array<unsigned char, 33>& key_image,
+          const uint256& txid);
 
-// Lookup: has the wallet ever broadcast a ring tx using this
-// keyimage as the real signer?
-bool Contains(::wallet::CWallet& wallet,
-               const std::array<unsigned char, 33>& key_image);
+// Lookup the txid this wallet recorded for `key_image`. Returns
+// std::nullopt if the keyimage wasn't broadcast by this wallet.
+// Caller is responsible for deciding what to do with the txid
+// (e.g. check confirmation status via chain).
+std::optional<uint256> Lookup(::wallet::CWallet& wallet,
+                                const std::array<unsigned char, 33>& key_image);
 
 }  // namespace wallet::pricoin_broadcasted_kis
 

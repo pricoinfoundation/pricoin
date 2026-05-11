@@ -14,6 +14,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -406,13 +407,15 @@ public:
     bool ReadAllPricoinChainWatches(
         std::map<uint256, std::vector<unsigned char>>& out);
     // Wallet-local broadcasted-keyimage tracking. Key = 33-byte
-    // compressed keyimage point. Value is empty (presence is the
-    // signal). Loaded once at startup into the in-memory set used
-    // by walletsendct_ring's input picker.
+    // compressed keyimage point. Value = 32-byte txid of the
+    // broadcast tx that produced this keyimage. The txid lets the
+    // picker check confirmation status (mempool-only entries are
+    // re-pickable for RBF; confirmed entries are spent).
     bool WritePricoinBroadcastedKi(
-        const std::array<unsigned char, 33>& key_image);
+        const std::array<unsigned char, 33>& key_image,
+        const uint256& txid);
     bool ReadAllPricoinBroadcastedKis(
-        std::set<std::array<unsigned char, 33>>& out);
+        std::map<std::array<unsigned char, 33>, uint256>& out);
     //! Begin a new transaction
     bool TxnBegin();
     //! Commit current transaction

@@ -11,7 +11,6 @@
 
 #include <map>
 #include <mutex>
-#include <set>
 
 namespace wallet::pricoin_broadcasted_kis {
 
@@ -21,21 +20,18 @@ namespace {
 // wallets have independent keyimage sets. Lock order: g_mutex
 // around the cache; per-wallet WalletBatch handles its own locking.
 Mutex g_mutex;
-std::map<::wallet::CWallet*, std::set<std::array<unsigned char, 33>>>
+std::map<::wallet::CWallet*,
+         std::map<std::array<unsigned char, 33>, uint256>>
     g_cache GUARDED_BY(g_mutex);
 std::set<::wallet::CWallet*> g_loaded GUARDED_BY(g_mutex);
 
-// Lazy-load cache for `wallet` if not yet loaded. Returns reference
-// to the per-wallet entry (creating empty on read failure so
-// subsequent Adds still work; the failure is logged but doesn't
-// break the wallet).
-std::set<std::array<unsigned char, 33>>& EnsureLoadedLocked(
+std::map<std::array<unsigned char, 33>, uint256>& EnsureLoadedLocked(
     ::wallet::CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(g_mutex)
 {
     auto& entry = g_cache[&wallet];
     if (g_loaded.contains(&wallet)) return entry;
     g_loaded.insert(&wallet);
-    std::set<std::array<unsigned char, 33>> loaded;
+    std::map<std::array<unsigned char, 33>, uint256> loaded;
     {
         WalletBatch batch(wallet.GetDatabase());
         if (!batch.ReadAllPricoinBroadcastedKis(loaded)) {
@@ -59,17 +55,20 @@ bool LoadFromDB(::wallet::CWallet& wallet)
 }
 
 bool Add(::wallet::CWallet& wallet,
-          const std::array<unsigned char, 33>& key_image)
+          const std::array<unsigned char, 33>& key_image,
+          const uint256& txid)
 {
     {
         LOCK(g_mutex);
         auto& s = EnsureLoadedLocked(wallet);
-        if (!s.insert(key_image).second) {
+        auto existing = s.find(key_image);
+        if (existing != s.end() && existing->second == txid) {
             return true;
         }
+        s[key_image] = txid;
     }
     WalletBatch batch(wallet.GetDatabase());
-    if (!batch.WritePricoinBroadcastedKi(key_image)) {
+    if (!batch.WritePricoinBroadcastedKi(key_image, txid)) {
         LOCK(g_mutex);
         g_cache[&wallet].erase(key_image);
         return false;
@@ -77,12 +76,14 @@ bool Add(::wallet::CWallet& wallet,
     return true;
 }
 
-bool Contains(::wallet::CWallet& wallet,
-               const std::array<unsigned char, 33>& key_image)
+std::optional<uint256> Lookup(::wallet::CWallet& wallet,
+                                const std::array<unsigned char, 33>& key_image)
 {
     LOCK(g_mutex);
     const auto& s = EnsureLoadedLocked(wallet);
-    return s.contains(key_image);
+    auto it = s.find(key_image);
+    if (it == s.end()) return std::nullopt;
+    return it->second;
 }
 
 }  // namespace wallet::pricoin_broadcasted_kis
