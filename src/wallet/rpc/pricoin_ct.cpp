@@ -1457,8 +1457,29 @@ RPCMethod walletsendct_ring()
                 pending.push_back({&id.public_address, 0,
                                    ::pricoin::stealth::AddressKind::Main, false});
             }
+            // Atomic-swap PRIC funding pins ephemeral r AND pre-computes
+            // the joint output's P_pi at output_index=0 (Bob's adaptor
+            // setup uses 0 because the on-chain vout isn't known yet at
+            // setup time). Bob then signs the DLEQ proof binding T_G/T_H
+            // to P_pi(idx=0). For the on-chain P_pi to match Bob's
+            // proof, the recipient MUST land at vout=0 — i.e., DON'T
+            // shuffle it. Shuffle the non-recipient outputs only.
+            //
+            // Without this, walletsendct_ring's shuffle puts the
+            // recipient at a random vout, the on-chain P_pi uses that
+            // vout's output_index in DeriveSharedSecret, and Bob's DLEQ
+            // proof (bound to idx=0) fails to verify at cooperative-
+            // sign Step 2. (Observed 2026-05-11 — root cause of the
+            // "CombineAndWalk failed" failures.)
             FastRandomContext shuffle_rng;
-            std::shuffle(pending.begin(), pending.end(), shuffle_rng);
+            if (!pinned_eph_priv.empty()) {
+                // Swap mode: keep recipient at index 0, shuffle the rest.
+                if (pending.size() > 2) {
+                    std::shuffle(pending.begin() + 1, pending.end(), shuffle_rng);
+                }
+            } else {
+                std::shuffle(pending.begin(), pending.end(), shuffle_rng);
+            }
 
             // Per-output stealth derivation uses the FINAL position because
             // the recipient scans by output_index.
