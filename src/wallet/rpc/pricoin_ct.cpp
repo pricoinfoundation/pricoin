@@ -1595,6 +1595,20 @@ RPCMethod walletsendct_ring()
                 throw JSONRPCError(RPC_WALLET_ERROR, "broadcast failed: " + err_str);
             }
 
+            // Find the post-shuffle position of the recipient output.
+            // Critical for atomic-swap PRIC funding: the cooperative-
+            // sign loadshare needs vout matching where the joint
+            // stealth output actually landed on chain. Hardcoding 0
+            // to the watch entry caused "scriptPubKey mismatch"
+            // failures because vout 0 was usually change/decoy.
+            int recipient_vout = -1;
+            for (size_t i = 0; i < pending.size(); ++i) {
+                if (pending[i].is_recipient) {
+                    recipient_vout = static_cast<int>(i);
+                    break;
+                }
+            }
+
             UniValue out{UniValue::VOBJ};
             out.pushKV("txid", tx_ref->GetHash().ToString());
             out.pushKV("ring_size", ring_size);
@@ -1602,6 +1616,7 @@ RPCMethod walletsendct_ring()
             out.pushKV("change_amount", ValueFromAmount(change_value));
             out.pushKV("size", (int)::GetSerializeSize(TX_WITH_WITNESS(*tx_ref)));
             out.pushKV("bundle_size", (int)tx_ref->ct_bundle.SerializedSize());
+            out.pushKV("recipient_vout", recipient_vout);
             return out;
         }
     };

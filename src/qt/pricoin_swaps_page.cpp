@@ -1048,6 +1048,18 @@ void PricoinSwapsPage::onAdvanceClicked()
                 return;
             }
             const std::string txid_hex = r_send["txid"].get_str();
+            // walletsendct_ring shuffles outputs internally for
+            // privacy, so the recipient can land at vout 0/1/2.
+            // Hard-coding 0 here caused the cooperative-sign
+            // loadshare to fail with "scriptPubKey mismatch" when
+            // the joint stealth output ended up at a different vout
+            // (the wrong output gets scanned, math doesn't agree).
+            // Use the recipient_vout returned by walletsendct_ring.
+            int recipient_vout = 0;
+            if (r_send.exists("recipient_vout") && r_send["recipient_vout"].isNum()) {
+                recipient_vout = r_send["recipient_vout"].getInt<int>();
+                if (recipient_vout < 0) recipient_vout = 0;
+            }
             // Register a local pric_funding watch so the chain watcher
             // ticks the swap forward when this tx confirms — symmetric
             // with what pricoin_btc_fund_swap does for the foreign leg.
@@ -1058,7 +1070,7 @@ void PricoinSwapsPage::onAdvanceClicked()
                 p_watch.push_back(sid);
                 p_watch.push_back("pric_funding");
                 p_watch.push_back(txid_hex);
-                p_watch.push_back(0);  // vout
+                p_watch.push_back(recipient_vout);
                 p_watch.push_back(1);  // min_confirmations
                 m_model->node().executeRpc("pricoin_swapwatch_add", p_watch,
                     "/wallet/" + m_model->getWalletName().toStdString());
@@ -1082,7 +1094,7 @@ void PricoinSwapsPage::onAdvanceClicked()
                         QString::fromStdString(sid),
                         QStringLiteral("pric_funding"),
                         QString::fromStdString(txid_hex),
-                        /*vout=*/0,
+                        recipient_vout,
                         /*min_confirmations=*/1);
                 }
             }

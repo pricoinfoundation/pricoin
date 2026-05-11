@@ -5,6 +5,7 @@
 #include <qt/pricoinorderbookpage.h>
 
 #include <common/args.h>
+#include <index/txindex.h>
 #include <qt/pricoin_joint_stealth_dialog.h>
 #include <qt/pricoin_match_dialog.h>
 #include <qt/pricoin_nostr_client.h>
@@ -204,7 +205,11 @@ public:
         // confirmed-but-not-mempool txs via g_txindex. Without
         // txindex, the buyer's swap stalls at BtcFunded waiting for
         // a confirmation that never auto-detects.
-        if (out.side == "buy_pric" && !gArgs.GetBoolArg("-txindex", false)) {
+        // Use DEFAULT_TXINDEX (= true for Pricoin) as the fallback so
+        // users on the default config don't trip the gate. The gate
+        // only fires when the user explicitly sets -txindex=0.
+        if (out.side == "buy_pric"
+            && !gArgs.GetBoolArg("-txindex", DEFAULT_TXINDEX)) {
             err = tr("Buy-PRIC orders require txindex=1 on this node.\n\n"
                      "Without it, your wallet can't auto-confirm the seller's "
                      "PRIC funding tx (it's a joint-stealth output your wallet "
