@@ -115,11 +115,13 @@ private:
     QString m_my_L_share;
     QString m_my_R_share;
     QString m_my_KI_share;
-    QString m_my_D_share;     // multi-layer plain only
+    QString m_my_D_share;     // multi-layer (plain OR adaptor_ml)
     QString m_my_commitment;
     QString m_my_dleq_alpha;  // adaptor only
     QString m_my_dleq_x;      // adaptor only
+    QString m_my_dleq_z;      // adaptor_ml only
     QString m_X_pub_X;        // adaptor only — x_X·G
+    QString m_Z_pub_X;        // adaptor_ml only — z_X·G
     QString m_KI;
     QString m_D;
     QString m_L_pi, m_R_pi;
@@ -157,6 +159,7 @@ private:
     QComboBox*      m_in_role{nullptr};
     // adaptor-only:
     QLineEdit*      m_in_X_pub_X{nullptr};
+    QLineEdit*      m_in_Z_pub_X{nullptr};
     QLineEdit*      m_in_T_G{nullptr};
     QLineEdit*      m_in_T_H{nullptr};
     QPlainTextEdit* m_in_dleq_t{nullptr};
@@ -192,6 +195,7 @@ private:
     // ─── Step 2: Combine (paste peer's round-1 share) ───
     QPlainTextEdit* m_in_peer_share_json{nullptr};
     QLineEdit*      m_in_X_pub_peer{nullptr};   // adaptor only
+    QLineEdit*      m_in_Z_pub_peer{nullptr};   // adaptor_ml only
     QPlainTextEdit* m_in_s_others_seed_json{nullptr}; // plain only — taker-supplied decoy s_others
     QPushButton*    m_btn_step2{nullptr};
     QPlainTextEdit* m_out_step2{nullptr};

@@ -581,6 +581,38 @@ std::optional<Signature> Adapt(
     return sig;
 }
 
+std::optional<Signature> AdaptML(
+    const AdaptorPreSignature& presig,
+    const Scalar& t,
+    std::span<const ::pricoin::ringsig::MultiLayerMember> ring,
+    const uint256& msg)
+{
+    LOCK(g_ctx_mutex);
+    secp256k1_context* ctx = ACtx();
+
+    // Verify t · G == T_G.
+    Point tG;
+    if (!ScalarMultG(ctx, t, tG)) return std::nullopt;
+    if (tG != presig.adaptor.T_G) return std::nullopt;
+
+    Signature sig;
+    sig.key_image        = presig.key_image;
+    sig.commitment_image = presig.commitment_image;
+    sig.c0               = presig.c0;
+    sig.s                = presig.s;
+
+    Scalar s_pi = presig.s[presig.pi];
+    if (!secp256k1_ec_seckey_tweak_add(ctx, s_pi.data(), t.data())) return std::nullopt;
+    if (!secp256k1_ec_seckey_verify(ctx, s_pi.data())) return std::nullopt;
+    sig.s[presig.pi] = s_pi;
+
+    // Multi-layer verify against (P, W) ring — what consensus uses.
+    if (!::pricoin::ringsig::VerifyMultiLayer(ring, sig, msg)) {
+        return std::nullopt;
+    }
+    return sig;
+}
+
 std::optional<Scalar> Extract(
     std::span<const Point> ring,
     const AdaptorPreSignature& presig,

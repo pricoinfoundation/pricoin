@@ -5,6 +5,7 @@
 #include <qt/pricoin_pric_coopsign_dialog.h>
 
 #include <crypto/sha256.h>
+#include <key.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <qt/pricoin_nostr_client.h>
@@ -36,6 +37,23 @@
 #include <stdexcept>
 
 namespace {
+
+// Derive `secret · G` as 33-byte compressed pubkey hex. Returns empty
+// string on failure (zero/oversize scalar, etc.). Used to auto-fill
+// the adaptor-ML Z_pub_X field from the user's z_share without a
+// round-trip through an RPC.
+QString DerivePubkeyHex(const QString& secret_hex)
+{
+    if (secret_hex.size() != 64) return {};
+    const auto bytes = TryParseHex<unsigned char>(secret_hex.toStdString());
+    if (!bytes || bytes->size() != 32) return {};
+    CKey k;
+    k.Set(bytes->begin(), bytes->end(), /*compressed=*/true);
+    if (!k.IsValid()) return {};
+    const CPubKey p = k.GetPubKey();
+    return QString::fromStdString(
+        HexStr(std::span<const unsigned char>{p.begin(), p.size()}));
+}
 
 QGroupBox* MakeStepBox(const QString& title, QWidget* parent)
 {
@@ -405,29 +423,26 @@ void PricCoopSignDialog::onRunBuildtx()
     m_unsigned_tx_hex = QString::fromStdString(v["tx_hex"].get_str());
     if (m_in_msg) m_in_msg->setText(QString::fromStdString(sighash));
     if (m_in_pi)  m_in_pi->setText(QString::number(pi));
-    if (m_in_ring_or_ring_ml && m_mode == Mode::PricPlain) {
+    // Both PricPlain and PricAdaptor now use the multi-layer ring_ml
+    // format end-to-end. Previously adaptor mode projected ring_ml to
+    // single-layer P-only, which made the resulting sig fail consensus
+    // VerifyMultiLayer (commitment_image == zero point). Per
+    // 2026-05-12 fix: keep the multi-layer view and route Step 2
+    // through pricoin_jointspend_adaptor_combine_ml.
+    if (m_in_ring_or_ring_ml) {
         m_in_ring_or_ring_ml->setPlainText(QString::fromStdString(ring_ml));
     }
-    // Adaptor mode needs single-layer ring (JSON array of pubkey hex
-    // strings). buildtx returns multi-layer ring_ml ([{P,W}, ...]);
-    // project to just the P field per entry. Without this, auto-coord
-    // stalls in adaptor mode because the ring field stays empty and
-    // tryAutoStep1 / tryAutoSendBuildtx never proceed.
-    if (m_in_ring_or_ring_ml && m_mode == Mode::PricAdaptor
-        && v.exists("ring_ml") && v["ring_ml"].isArray()) {
-        UniValue ring_single{UniValue::VARR};
-        for (size_t i = 0; i < v["ring_ml"].size(); ++i) {
-            const UniValue& entry = v["ring_ml"][i];
-            if (entry.isObject() && entry.exists("P") && entry["P"].isStr()) {
-                ring_single.push_back(entry["P"]);
-            }
-        }
-        m_in_ring_or_ring_ml->setPlainText(
-            QString::fromStdString(ring_single.write(0)));
-    }
-    // Spender's z_self auto-fills the z_share field (plain only).
-    if (m_in_z_share && m_mode == Mode::PricPlain) {
+    // Spender's z_self auto-fills the z_share field for BOTH modes.
+    // adaptor_ml needs z_X (= z_self for the spender) to build
+    // D_share = z_X·H_p(P_pi) at round1.
+    if (m_in_z_share) {
         m_in_z_share->setText(QString::fromStdString(z_self));
+    }
+    // adaptor_ml: Z_pub_X = z_X · G. Auto-derive from z_self so the
+    // user doesn't have to compute or paste it.
+    if (m_in_Z_pub_X && m_mode == Mode::PricAdaptor) {
+        const QString zpub = DerivePubkeyHex(QString::fromStdString(z_self));
+        if (!zpub.isEmpty()) m_in_Z_pub_X->setText(zpub);
     }
     UniValue out{UniValue::VOBJ};
     out.pushKV("sighash",     sighash);
@@ -661,9 +676,21 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
             if (!env.exists("x_pub") || !env["x_pub"].isStr()) return;
             const std::string xpub = env["x_pub"].get_str();
             if (xpub.size() != 66) return;
+            bool any_change = false;
             if (m_in_X_pub_peer && m_in_X_pub_peer->text().trimmed().isEmpty()) {
                 m_in_X_pub_peer->setText(QString::fromStdString(xpub));
-                setStatus(tr("Peer X_pub auto-pasted from DM."));
+                any_change = true;
+            }
+            if (env.exists("z_pub") && env["z_pub"].isStr()
+                && m_in_Z_pub_peer && m_in_Z_pub_peer->text().trimmed().isEmpty()) {
+                const std::string zpub = env["z_pub"].get_str();
+                if (zpub.size() == 66) {
+                    m_in_Z_pub_peer->setText(QString::fromStdString(zpub));
+                    any_change = true;
+                }
+            }
+            if (any_change) {
+                setStatus(tr("Peer X_pub/Z_pub auto-pasted from DM."));
                 tryAutoStep1();
                 // Bilateral resend (see jointscan above).
                 m_auto_xpub_announced = false;
@@ -712,11 +739,17 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
                 m_in_joint_output_id->setText(
                     QString::fromStdString(env["joint_output_id"].get_str()));
             }
-            if (m_mode == Mode::PricPlain) {
-                if (env.exists("z_other") && env["z_other"].isStr()
-                    && m_in_z_share && m_in_z_share->text().trimmed().isEmpty()) {
-                    m_in_z_share->setText(
-                        QString::fromStdString(env["z_other"].get_str()));
+            // z_other → cosigner's z_share, for BOTH modes. adaptor_ml
+            // needs z_X to compute D_share at round1; without it the
+            // sig fails consensus VerifyMultiLayer.
+            if (env.exists("z_other") && env["z_other"].isStr()
+                && m_in_z_share && m_in_z_share->text().trimmed().isEmpty()) {
+                m_in_z_share->setText(
+                    QString::fromStdString(env["z_other"].get_str()));
+                if (m_in_Z_pub_X && m_mode == Mode::PricAdaptor
+                    && m_in_Z_pub_X->text().trimmed().isEmpty()) {
+                    const QString zpub = DerivePubkeyHex(m_in_z_share->text().trimmed());
+                    if (!zpub.isEmpty()) m_in_Z_pub_X->setText(zpub);
                 }
             }
             if (m_mode == Mode::PricAdaptor) {
@@ -726,6 +759,11 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
                     // field (which the existing Step 2 logic reads).
                     m_in_X_pub_peer->setText(
                         QString::fromStdString(env["x_pub_spender"].get_str()));
+                }
+                if (env.exists("z_pub_spender") && env["z_pub_spender"].isStr()
+                    && m_in_Z_pub_peer && m_in_Z_pub_peer->text().trimmed().isEmpty()) {
+                    m_in_Z_pub_peer->setText(
+                        QString::fromStdString(env["z_pub_spender"].get_str()));
                 }
                 if (env.exists("session_label") && env["session_label"].isStr()
                     && m_in_session_label) {
@@ -826,7 +864,9 @@ void PricCoopSignDialog::persistSession()
     put("my_commitment", m_my_commitment);
     put("my_dleq_alpha", m_my_dleq_alpha);
     put("my_dleq_x", m_my_dleq_x);
+    put("my_dleq_z", m_my_dleq_z);
     put("X_pub_X", m_X_pub_X);
+    put("Z_pub_X", m_Z_pub_X);
     put("KI", m_KI);
     put("D", m_D);
     put("L_pi", m_L_pi);
@@ -860,6 +900,10 @@ void PricCoopSignDialog::persistSession()
     // Input-widget fields that aren't mirrored by an m_* shadow.
     put_le("in_joint_pubkey",  m_in_joint_pubkey);
     put_le("in_X_pub_peer",    m_in_X_pub_peer);
+    put_le("in_Z_pub_peer",    m_in_Z_pub_peer);
+    put_le("in_X_pub_X",       m_in_X_pub_X);
+    put_le("in_Z_pub_X",       m_in_Z_pub_X);
+    put_le("in_z_share",       m_in_z_share);
     put_le("in_ls_my_partial", m_in_ls_my_partial);
     put_le("in_ls_peer_partial", m_in_ls_peer_partial);
     put_le("in_peer_s_share",  m_in_peer_s_share);
@@ -915,7 +959,9 @@ void PricCoopSignDialog::loadSessionFromRecord(const std::string& json)
     load_str("my_commitment", m_my_commitment);
     load_str("my_dleq_alpha", m_my_dleq_alpha);
     load_str("my_dleq_x", m_my_dleq_x);
+    load_str("my_dleq_z", m_my_dleq_z);
     load_str("X_pub_X", m_X_pub_X);
+    load_str("Z_pub_X", m_Z_pub_X);
     load_str("KI", m_KI);
     load_str("D", m_D);
     load_str("L_pi", m_L_pi);
@@ -955,6 +1001,10 @@ void PricCoopSignDialog::loadSessionFromRecord(const std::string& json)
     };
     restore_le("in_joint_pubkey",   m_in_joint_pubkey);
     restore_le("in_X_pub_peer",     m_in_X_pub_peer);
+    restore_le("in_Z_pub_peer",     m_in_Z_pub_peer);
+    restore_le("in_X_pub_X",        m_in_X_pub_X);
+    restore_le("in_Z_pub_X",        m_in_Z_pub_X);
+    restore_le("in_z_share",        m_in_z_share);
     restore_le("in_ls_my_partial",  m_in_ls_my_partial);
     restore_le("in_ls_peer_partial", m_in_ls_peer_partial);
     restore_le("in_peer_s_share",   m_in_peer_s_share);
@@ -1147,6 +1197,15 @@ void PricCoopSignDialog::tryAutoSendXpubAnnounce()
     env.pushKV("swap_id", m_swap_id.toStdString());
     env.pushKV("kind",    "xpub_announce");
     env.pushKV("x_pub",   xpub.toStdString());
+    // Also include z_pub if we already have a z_share filled in
+    // (typically the spender has it post-buildtx; the cosigner has it
+    // after receiving the buildtx DM). Best-effort — if absent, the
+    // receiver will see only x_pub and the Z_pub_peer field stays
+    // empty until later sync.
+    if (m_in_Z_pub_X) {
+        const QString zpub = m_in_Z_pub_X->text().trimmed();
+        if (zpub.size() == 66) env.pushKV("z_pub", zpub.toStdString());
+    }
     const QString plaintext = QString::fromStdString(env.write(0));
     if (m_nostr->publishDirectMessage(m_peer_xonly, plaintext)) {
         m_auto_xpub_announced = true;
@@ -1225,10 +1284,10 @@ void PricCoopSignDialog::tryAutoSendBuildtx()
         env.pushKV("joint_output_id",
                    m_in_joint_output_id->text().trimmed().toStdString());
     }
-    if (m_mode == Mode::PricPlain) {
-        // Plain mode: spender's z_other is cosigner's z_share. The
-        // buildtx echo includes "z_other_for_peer" — extract from
-        // m_out_buildtx (parsed JSON we displayed).
+    // Spender's z_other is cosigner's z_share — needed for BOTH plain
+    // and adaptor_ml mode. The buildtx echo includes "z_other_for_peer"
+    // (extract from m_out_buildtx, parsed JSON we displayed).
+    {
         UniValue echo;
         if (echo.read(m_out_buildtx->toPlainText().toStdString()) && echo.isObject()
             && echo.exists("z_other_for_peer") && echo["z_other_for_peer"].isStr()) {
@@ -1236,12 +1295,16 @@ void PricCoopSignDialog::tryAutoSendBuildtx()
         }
     }
     if (m_mode == Mode::PricAdaptor) {
-        // Adaptor mode: spender includes own X_pub_X (= x_share·G)
-        // and session_label/payload so the cosigner can fill them
-        // and Step 1 can fire.
+        // Adaptor mode: spender includes own X_pub_X (= x_share·G),
+        // own Z_pub_X (= z_share·G), and session_label/payload so the
+        // cosigner can fill them and Step 1 can fire.
         if (m_in_X_pub_X) {
             env.pushKV("x_pub_spender",
                        m_in_X_pub_X->text().trimmed().toStdString());
+        }
+        if (m_in_Z_pub_X) {
+            env.pushKV("z_pub_spender",
+                       m_in_Z_pub_X->text().trimmed().toStdString());
         }
         if (m_in_session_label) {
             env.pushKV("session_label",
@@ -1466,12 +1529,15 @@ void PricCoopSignDialog::buildLayout(const QString& title)
         m_in_x_share->setPlaceholderText(tr("32-byte spend-secret share from loadshare"));
         form->addRow(tr("x_share:"), m_in_x_share);
 
-        if (!adaptor) {
-            m_in_z_share = new QLineEdit(box);
-            m_in_z_share->setEchoMode(QLineEdit::Password);
-            m_in_z_share->setPlaceholderText(tr("32-byte commitment-offset share (multi-layer): z_self for spender, z_other for peer"));
-            form->addRow(tr("z_share:"), m_in_z_share);
-        }
+        // z_share is needed for BOTH plain and adaptor multi-layer.
+        // Spender: filled from buildtx's z_self. Cosigner: filled from
+        // peer's buildtx-DM `z_other`. Without it, adaptor_round1_ml
+        // can't build D_share, and CombineAndWalkML / consensus
+        // VerifyMultiLayer will reject the resulting sig.
+        m_in_z_share = new QLineEdit(box);
+        m_in_z_share->setEchoMode(QLineEdit::Password);
+        m_in_z_share->setPlaceholderText(tr("32-byte commitment-offset share (multi-layer): z_self for spender, z_other for peer"));
+        form->addRow(tr("z_share:"), m_in_z_share);
 
         m_in_joint_pubkey = new QLineEdit(box);
         m_in_joint_pubkey->setPlaceholderText(tr("33-byte joint pubkey at ring[pi].P (the joint stealth one-time pubkey)"));
@@ -1515,6 +1581,10 @@ void PricCoopSignDialog::buildLayout(const QString& title)
             m_in_X_pub_X->setPlaceholderText(tr("33-byte public spend share = x_share · G"));
             form->addRow(tr("X_pub_X (mine):"), m_in_X_pub_X);
 
+            m_in_Z_pub_X = new QLineEdit(box);
+            m_in_Z_pub_X->setPlaceholderText(tr("33-byte public commitment-offset share = z_share · G"));
+            form->addRow(tr("Z_pub_X (mine):"), m_in_Z_pub_X);
+
             m_in_T_G = new QLineEdit(box);
             m_in_T_G->setPlaceholderText(tr("33-byte adaptor point T_G = t · G"));
             form->addRow(tr("T_G:"), m_in_T_G);
@@ -1552,11 +1622,9 @@ void PricCoopSignDialog::buildLayout(const QString& title)
         m_in_ring_or_ring_ml = new QPlainTextEdit(box);
         MakeMono(m_in_ring_or_ring_ml);
         m_in_ring_or_ring_ml->setMaximumHeight(110);
-        m_in_ring_or_ring_ml->setPlaceholderText(adaptor
-            ? tr("ring as JSON array of pubkey hex strings, e.g. [\"<P0>\",\"<P1>\",...]")
-            : tr("ring_ml as JSON array of {P,W} objects, e.g. [{\"P\":\"<P0>\",\"W\":\"<W0>\"},...]"));
-        form->addRow(adaptor ? tr("ring (JSON):") : tr("ring_ml (JSON):"),
-                      m_in_ring_or_ring_ml);
+        m_in_ring_or_ring_ml->setPlaceholderText(
+            tr("ring_ml as JSON array of {P,W} objects, e.g. [{\"P\":\"<P0>\",\"W\":\"<W0>\"},...]"));
+        form->addRow(tr("ring_ml (JSON):"), m_in_ring_or_ring_ml);
 
         steps_v->addWidget(box);
     }
@@ -1696,6 +1764,9 @@ void PricCoopSignDialog::buildLayout(const QString& title)
             m_in_X_pub_peer = new QLineEdit(box);
             m_in_X_pub_peer->setPlaceholderText(tr("33-byte public spend share = peer's x · G"));
             peer_pub_row->addRow(tr("Peer X_pub:"), m_in_X_pub_peer);
+            m_in_Z_pub_peer = new QLineEdit(box);
+            m_in_Z_pub_peer->setPlaceholderText(tr("33-byte public commitment-offset share = peer's z · G"));
+            peer_pub_row->addRow(tr("Peer Z_pub:"), m_in_Z_pub_peer);
             layout->addLayout(peer_pub_row);
         } else {
             layout->addWidget(new QLabel(tr("s_others (decoy closing scalars, JSON array of 32-byte hex; entry at pi will be ignored — fill with zeros):"), box));
@@ -1821,9 +1892,8 @@ void PricCoopSignDialog::onStep1Compute()
     const bool adaptor = (m_mode == Mode::PricAdaptor);
 
     m_x_share          = m_in_x_share->text().trimmed();
-    if (!adaptor) {
-        m_z_share = m_in_z_share->text().trimmed();
-    }
+    // z_share is needed for both plain and adaptor_ml.
+    if (m_in_z_share) m_z_share = m_in_z_share->text().trimmed();
     const QString joint_pubkey = m_in_joint_pubkey->text().trimmed();
     m_msg_hex          = m_in_msg->text().trimmed();
     m_pi               = m_in_pi->text().trimmed();
@@ -1835,6 +1905,7 @@ void PricCoopSignDialog::onStep1Compute()
     m_ring_json        = adaptor ? m_in_ring_or_ring_ml->toPlainText().trimmed() : QString{};
     if (adaptor) {
         m_X_pub_X        = m_in_X_pub_X->text().trimmed();
+        if (m_in_Z_pub_X) m_Z_pub_X = m_in_Z_pub_X->text().trimmed();
         m_T_G            = m_in_T_G->text().trimmed();
         m_T_H            = m_in_T_H->text().trimmed();
         m_dleq_t         = m_in_dleq_t->toPlainText().trimmed();
@@ -1850,18 +1921,32 @@ void PricCoopSignDialog::onStep1Compute()
     if (m_session_id.size() != 64) { setStatus(tr("session_id must be 32-byte hex"), true); return; }
 
     if (adaptor) {
-        // pricoin_jointspend_adaptor_round1(P_pi, X_pub_X, x_X, T_G, T_H, label, payload)
+        // Multi-layer adaptor round 1. Args:
+        //   (P_pi, X_pub_X, Z_pub_X, x_X, z_X, T_G, T_H, label, payload)
+        // Falling back to the single-layer adaptor_round1 produces a
+        // pre-sig with zero commitment_image, which fails consensus
+        // VerifyMultiLayer when broadcast.
+        if (m_z_share.size() != 64) {
+            setStatus(tr("z_share must be 32-byte hex (auto-filled from buildtx z_self/z_other for adaptor_ml)"), true);
+            return;
+        }
+        if (m_Z_pub_X.size() != 66) {
+            setStatus(tr("Z_pub_X must be 33-byte hex (auto-derived from z_share)"), true);
+            return;
+        }
         std::string params = std::string("[\"")
             + joint_pubkey.toStdString() + "\",\""
             + m_X_pub_X.toStdString()    + "\",\""
+            + m_Z_pub_X.toStdString()    + "\",\""
             + m_x_share.toStdString()    + "\",\""
+            + m_z_share.toStdString()    + "\",\""
             + m_T_G.toStdString()        + "\",\""
             + m_T_H.toStdString()        + "\",\""
             + m_session_label.toStdString()   + "\",\""
             + m_session_payload.toStdString() + "\"]";
-        auto r = callRpc("pricoin_jointspend_adaptor_round1", params);
+        auto r = callRpc("pricoin_jointspend_adaptor_round1_ml", params);
         if (!r.ok) {
-            setStatus(tr("adaptor_round1 failed: %1").arg(QString::fromStdString(r.error_msg)), true);
+            setStatus(tr("adaptor_round1_ml failed: %1").arg(QString::fromStdString(r.error_msg)), true);
             return;
         }
         UniValue v;
@@ -1870,8 +1955,10 @@ void PricCoopSignDialog::onStep1Compute()
         m_my_L_share     = QString::fromStdString(v["L_share"].get_str());
         m_my_R_share     = QString::fromStdString(v["R_share"].get_str());
         m_my_KI_share    = QString::fromStdString(v["KI_share"].get_str());
+        m_my_D_share     = QString::fromStdString(v["D_share"].get_str());
         m_my_dleq_alpha  = QString::fromStdString(v["dleq_alpha"].get_str());
         m_my_dleq_x      = QString::fromStdString(v["dleq_x"].get_str());
+        m_my_dleq_z      = QString::fromStdString(v["dleq_z"].get_str());
         m_my_commitment  = QString::fromStdString(v["commitment"].get_str());
         // Strip alpha from the displayed JSON — it must NEVER leave
         // the wallet before round 3. Show the rest as the share to
@@ -1880,8 +1967,10 @@ void PricCoopSignDialog::onStep1Compute()
         share_for_peer.pushKV("L_share",    v["L_share"]);
         share_for_peer.pushKV("R_share",    v["R_share"]);
         share_for_peer.pushKV("KI_share",   v["KI_share"]);
+        share_for_peer.pushKV("D_share",    v["D_share"]);
         share_for_peer.pushKV("dleq_alpha", v["dleq_alpha"]);
         share_for_peer.pushKV("dleq_x",     v["dleq_x"]);
+        share_for_peer.pushKV("dleq_z",     v["dleq_z"]);
         share_for_peer.pushKV("commitment", v["commitment"]);
         m_out_step1->setPlainText(QString::fromStdString(share_for_peer.write(2)));
     } else {
@@ -1942,37 +2031,46 @@ void PricCoopSignDialog::onStep2Compute()
     }
 
     if (adaptor) {
-        // Build X_pub_shares array — convention here is initiator
-        // first, responder second. The peer's role is the opposite of
-        // mine.
-        const QString peer_pub = m_in_X_pub_peer->text().trimmed();
+        // Build X_pub_shares + Z_pub_shares arrays — convention is
+        // initiator first, responder second. The peer's role is the
+        // opposite of mine.
+        const QString peer_pub  = m_in_X_pub_peer->text().trimmed();
+        const QString peer_zpub = m_in_Z_pub_peer ? m_in_Z_pub_peer->text().trimmed() : QString{};
         if (peer_pub.size() != 66) {
             setStatus(tr("Peer X_pub must be 33-byte hex"), true);
             return;
         }
-        const QString first_pub  = (m_role == "initiator") ? m_X_pub_X : peer_pub;
-        const QString second_pub = (m_role == "initiator") ? peer_pub  : m_X_pub_X;
+        if (peer_zpub.size() != 66) {
+            setStatus(tr("Peer Z_pub must be 33-byte hex (auto-filled from peer's buildtx DM in adaptor_ml)"), true);
+            return;
+        }
+        const QString first_pub   = (m_role == "initiator") ? m_X_pub_X  : peer_pub;
+        const QString second_pub  = (m_role == "initiator") ? peer_pub   : m_X_pub_X;
+        const QString first_zpub  = (m_role == "initiator") ? m_Z_pub_X  : peer_zpub;
+        const QString second_zpub = (m_role == "initiator") ? peer_zpub  : m_Z_pub_X;
 
         // Per-party shares array — same role-ordered.
         UniValue mine_share{UniValue::VOBJ};
         mine_share.pushKV("L_share",    m_my_L_share.toStdString());
         mine_share.pushKV("R_share",    m_my_R_share.toStdString());
         mine_share.pushKV("KI_share",   m_my_KI_share.toStdString());
+        mine_share.pushKV("D_share",    m_my_D_share.toStdString());
         mine_share.pushKV("dleq_alpha", m_my_dleq_alpha.toStdString());
         mine_share.pushKV("dleq_x",     m_my_dleq_x.toStdString());
+        mine_share.pushKV("dleq_z",     m_my_dleq_z.toStdString());
         mine_share.pushKV("commitment", m_my_commitment.toStdString());
 
         UniValue first_share  = (m_role == "initiator") ? mine_share : peer;
         UniValue second_share = (m_role == "initiator") ? peer       : mine_share;
 
         UniValue params{UniValue::VARR};
-        // ring (parsed from JSON)
-        UniValue ring_v;
-        if (!ring_v.read(m_ring_json.toStdString()) || !ring_v.isArray()) {
-            setStatus(tr("ring must be a JSON array of pubkey hex strings"), true);
+        // ring_ml: array of {P,W} objects (multi-layer).
+        UniValue ring_ml_v;
+        if (!ring_ml_v.read(m_ring_json.toStdString()) || !ring_ml_v.isArray()) {
+            setStatus(tr("ring must be a JSON array of {P,W} objects"), true);
             return;
         }
-        params.push_back(ring_v);
+        params.push_back(ring_ml_v);
         params.push_back(m_pi.toInt());
         params.push_back(m_msg_hex.toStdString());
         params.push_back(m_T_G.toStdString());
@@ -1982,6 +2080,10 @@ void PricCoopSignDialog::onStep2Compute()
         Xs.push_back(first_pub.toStdString());
         Xs.push_back(second_pub.toStdString());
         params.push_back(Xs);
+        UniValue Zs{UniValue::VARR};
+        Zs.push_back(first_zpub.toStdString());
+        Zs.push_back(second_zpub.toStdString());
+        params.push_back(Zs);
         UniValue shares_arr{UniValue::VARR};
         shares_arr.push_back(first_share);
         shares_arr.push_back(second_share);
@@ -1989,18 +2091,21 @@ void PricCoopSignDialog::onStep2Compute()
         params.push_back(m_session_label.toStdString());
         params.push_back(m_session_payload.toStdString());
 
-        auto r = callRpc("pricoin_jointspend_adaptor_combine", params.write(0));
+        auto r = callRpc("pricoin_jointspend_adaptor_combine_ml", params.write(0));
         if (!r.ok) {
-            setStatus(tr("adaptor_combine failed: %1").arg(QString::fromStdString(r.error_msg)), true);
+            setStatus(tr("adaptor_combine_ml failed: %1").arg(QString::fromStdString(r.error_msg)), true);
             return;
         }
         UniValue v;
         v.read(r.json);
         m_KI       = QString::fromStdString(v["KI"].get_str());
+        m_D        = QString::fromStdString(v["D"].get_str());
         m_L_pi     = QString::fromStdString(v["L_pi"].get_str());
         m_R_pi     = QString::fromStdString(v["R_pi"].get_str());
         m_L_prime  = QString::fromStdString(v["L_prime"].get_str());
         m_R_prime  = QString::fromStdString(v["R_prime"].get_str());
+        m_mu_P     = QString::fromStdString(v["mu_P"].get_str());
+        m_mu_C     = QString::fromStdString(v["mu_C"].get_str());
         m_c_pi     = QString::fromStdString(v["c_pi"].get_str());
         m_c0       = QString::fromStdString(v["c0"].get_str());
         // Echo s_others verbatim — needed at assemble.
@@ -2009,17 +2114,24 @@ void PricCoopSignDialog::onStep2Compute()
 
         // Persist the cooperative ring into the swap record so the
         // watcher can run extract automatically when Bob's claim hits
-        // chain. Best-effort — failure here doesn't break the
-        // cooperative ceremony, just falls back to manual ring entry
-        // in the Qt extract dialog.
+        // chain. The set_pric_claim_ring RPC stores only the P side
+        // (extract just needs ring[pi].P for the t·G==T_G check); we
+        // project ring_ml {P,W} → [P] before calling. Best-effort.
         if (!m_swap_id.isEmpty()) {
+            UniValue ring_p_only{UniValue::VARR};
+            for (size_t i = 0; i < ring_ml_v.size(); ++i) {
+                const UniValue& entry = ring_ml_v[i];
+                if (entry.isObject() && entry.exists("P") && entry["P"].isStr()) {
+                    ring_p_only.push_back(entry["P"]);
+                }
+            }
             UniValue ring_params{UniValue::VARR};
             ring_params.push_back(m_swap_id.toStdString());
-            ring_params.push_back(ring_v);
+            ring_params.push_back(ring_p_only);
             auto rr = callRpc("pricoin_adaptor_swap_set_pric_claim_ring",
                                 ring_params.write(0));
             if (!rr.ok) {
-                setStatus(tr("ring persisted via adaptor_combine but "
+                setStatus(tr("ring persisted via adaptor_combine_ml but "
                               "set_pric_claim_ring failed: %1")
                     .arg(QString::fromStdString(rr.error_msg)), false);
             }
@@ -2149,18 +2261,27 @@ void PricCoopSignDialog::onStep4Compute()
     }
 
     if (adaptor) {
-        // pricoin_jointspend_adaptor_assemble(KI, L_pi, R_pi, L_prime, R_prime, c_pi, c0, s_others, close_shares, pi, T_G, T_H, dleq_t)
+        // pricoin_jointspend_adaptor_assemble_ml(KI, D, L_pi, R_pi,
+        //   L_prime, R_prime, mu_P, mu_C, c_pi, c0, s_others,
+        //   close_shares, pi, T_G, T_H, dleq_t)
         UniValue s_others_v;
         if (!s_others_v.read(m_s_others_json.toStdString()) || !s_others_v.isArray()) {
             setStatus(tr("internal: s_others vanished"), true);
             return;
         }
+        if (m_D.isEmpty() || m_mu_P.isEmpty() || m_mu_C.isEmpty()) {
+            setStatus(tr("internal: D / mu_P / mu_C vanished — re-run Step 2"), true);
+            return;
+        }
         UniValue params{UniValue::VARR};
         params.push_back(m_KI.toStdString());
+        params.push_back(m_D.toStdString());
         params.push_back(m_L_pi.toStdString());
         params.push_back(m_R_pi.toStdString());
         params.push_back(m_L_prime.toStdString());
         params.push_back(m_R_prime.toStdString());
+        params.push_back(m_mu_P.toStdString());
+        params.push_back(m_mu_C.toStdString());
         params.push_back(m_c_pi.toStdString());
         params.push_back(m_c0.toStdString());
         params.push_back(s_others_v);
@@ -2169,9 +2290,9 @@ void PricCoopSignDialog::onStep4Compute()
         params.push_back(m_T_G.toStdString());
         params.push_back(m_T_H.toStdString());
         params.push_back(m_dleq_t.toStdString());
-        auto r = callRpc("pricoin_jointspend_adaptor_assemble", params.write(0));
+        auto r = callRpc("pricoin_jointspend_adaptor_assemble_ml", params.write(0));
         if (!r.ok) {
-            setStatus(tr("adaptor_assemble failed: %1").arg(QString::fromStdString(r.error_msg)), true);
+            setStatus(tr("adaptor_assemble_ml failed: %1").arg(QString::fromStdString(r.error_msg)), true);
             return;
         }
         UniValue v;
@@ -2179,9 +2300,9 @@ void PricCoopSignDialog::onStep4Compute()
         m_final_blob_hex = QString::fromStdString(v["presig"].get_str());
         UniValue out{UniValue::VOBJ};
         out.pushKV("presig", m_final_blob_hex.toStdString());
-        out.pushKV("kind",   "adaptor_pre_signature");
+        out.pushKV("kind",   "adaptor_pre_signature_ml");
         m_out_step4->setPlainText(QString::fromStdString(out.write(2)));
-        setStatus(tr("Step 4 OK. AdaptorPreSignature blob produced."));
+        setStatus(tr("Step 4 OK. Multi-layer AdaptorPreSignature blob produced."));
     } else {
         // pricoin_jointspend_assemble(KI, c0, s_others, s_pi_shares, pi, [D])
         UniValue s_others_v;

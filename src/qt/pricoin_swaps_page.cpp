@@ -1948,30 +1948,23 @@ void PricoinSwapsPage::onAdaptPricClaimClicked()
     tx_hex->setMaximumHeight(80);
     form->addRow(tr("tx_hex:"), tx_hex);
     auto* ring = new QPlainTextEdit(&dlg);
-    ring->setPlaceholderText(tr("JSON array of 33-byte compressed pubkey hex strings"));
+    ring->setPlaceholderText(tr("Multi-layer ring_ml as JSON array of {P,W} objects (matches buildtx output)"));
     ring->setMaximumHeight(80);
-    form->addRow(tr("ring (JSON):"), ring);
+    form->addRow(tr("ring_ml (JSON):"), ring);
     auto* msg = new QLineEdit(&dlg);
     msg->setPlaceholderText(tr("32-byte sighash hex"));
     form->addRow(tr("msg (sighash):"), msg);
 
-    // Auto-fill the 3 fields. The ring should come from the AUTHORITATIVE
-    // pric_claim_ring on the swap record (set at Step 2 time, the same
-    // ring the presig was generated against). tx_hex + msg come from
-    // the persisted claim-leg coopsign session JSON.
+    // Auto-fill the 3 fields. For the multi-layer adapt path, ring
+    // MUST be the {P,W} ring_ml from the coopsign session JSON —
+    // single-layer P-only (pric_claim_ring_hex on the snap) produces
+    // a sig with zero commitment_image that fails consensus
+    // VerifyMultiLayer. tx_hex + msg come from the same session JSON.
     if (auto snap_opt = m_model->wallet().adaptorSwapGet(sid); snap_opt) {
-        // Ring from swap record (authoritative).
-        if (!snap_opt->pric_claim_ring_hex.empty()) {
-            UniValue ring_arr{UniValue::VARR};
-            for (const auto& h : snap_opt->pric_claim_ring_hex) {
-                ring_arr.push_back(h);
-            }
-            ring->setPlainText(QString::fromStdString(ring_arr.write(0)));
-        }
-        // tx_hex + msg from session JSON.
         const std::string& blob = snap_opt->pric_claim_adaptor_session_json;
         UniValue j;
-        if (!blob.empty() && j.read(blob) && j.isObject()) {
+        const bool have_session = !blob.empty() && j.read(blob) && j.isObject();
+        if (have_session) {
             if (j.exists("unsigned_tx_hex") && j["unsigned_tx_hex"].isStr()) {
                 tx_hex->setPlainText(QString::fromStdString(
                     j["unsigned_tx_hex"].get_str()));
@@ -1980,13 +1973,26 @@ void PricoinSwapsPage::onAdaptPricClaimClicked()
                 msg->setText(QString::fromStdString(
                     j["msg_hex"].get_str()));
             }
-            // Fallback: if pric_claim_ring isn't populated on the
-            // record yet, try the session's ring_json.
-            if (snap_opt->pric_claim_ring_hex.empty()
-                && j.exists("ring_json") && j["ring_json"].isStr()) {
+            // Prefer session's ring_json (post-2026-05-12 coopsign
+            // stores ring_ml here for adaptor mode).
+            if (j.exists("ring_json") && j["ring_json"].isStr()) {
                 ring->setPlainText(QString::fromStdString(
                     j["ring_json"].get_str()));
             }
+        }
+        // Fallback for sessions that pre-date the ML port (ring_json
+        // was single-layer): if ring is still empty, fill from the
+        // single-layer pric_claim_ring_hex on the snap. The adapt
+        // RPC will then take the legacy path (which fails consensus
+        // but at least surfaces a clear error rather than a silent
+        // "0 inputs filled").
+        if (ring->toPlainText().trimmed().isEmpty()
+            && !snap_opt->pric_claim_ring_hex.empty()) {
+            UniValue ring_arr{UniValue::VARR};
+            for (const auto& h : snap_opt->pric_claim_ring_hex) {
+                ring_arr.push_back(h);
+            }
+            ring->setPlainText(QString::fromStdString(ring_arr.write(0)));
         }
     }
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);

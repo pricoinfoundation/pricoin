@@ -187,6 +187,17 @@ std::optional<Signature> Adapt(
     std::span<const Point> ring,
     const uint256& msg);
 
+// Multi-layer adapt: verifies the resulting signature via
+// `pricoin::ringsig::VerifyMultiLayer` against the (P, W) ring
+// members. Use this when the pre-sig was produced by the multi-layer
+// adaptor protocol (AssembleAdaptorPreSigML) — i.e. when the sig
+// must validate at consensus, which uses VerifyMultiLayer.
+std::optional<Signature> AdaptML(
+    const AdaptorPreSignature& presig,
+    const Scalar& t,
+    std::span<const ::pricoin::ringsig::MultiLayerMember> ring,
+    const uint256& msg);
+
 // Extract `t` from an on-chain signature given the pre-sig that
 // produced it. `t = sig.s[pi] - presig.s[pi]`.
 //

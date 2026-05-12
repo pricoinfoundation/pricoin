@@ -7706,9 +7706,15 @@ RPCMethod pricoin_swapwatch_adapt_pric_claim()
             {"tx_hex",             RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
                 "Skeleton tx hex from pricoin_jointspend_buildtx (Bob's coopsign session)"},
             {"ring",               RPCArg::Type::ARR,     RPCArg::Optional::NO,
-                "Single-layer ring of joint pubkeys used at adapt-round-1 time. "
-                "Bob's coopsign dialog displayed these alongside z_self/z_other.",
-                {{"P", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+                "Multi-layer ring [{P,W}, ...] from pricoin_jointspend_buildtx's "
+                "ring_ml output. Both P (one-time pubkey) and W (commitment "
+                "delta) are required so AdaptML can verify the resulting sig "
+                "under pricoin::ringsig::VerifyMultiLayer (what consensus uses). "
+                "For backward compat, an array of P-only hex strings is also "
+                "accepted but the broadcast will fail consensus validation.",
+                {{"member", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
+                  {{"P", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+                   {"W", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""}}}}},
             {"msg_hex",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
                 "32-byte sighash from pricoin_jointspend_buildtx — must match what was signed"},
             {"min_confirmations",  RPCArg::Type::NUM,     RPCArg::Default{1}, ""},
@@ -7735,21 +7741,50 @@ RPCMethod pricoin_swapwatch_adapt_pric_claim()
             const int32_t min_conf = request.params[4].isNull() ? 1
                 : request.params[4].getInt<int32_t>();
 
-            // Parse ring + msg.
+            // Parse ring. Accepts either multi-layer ([{P,W},...]) — the
+            // recommended/working format — or legacy single-layer
+            // ([P,...]). Single-layer adapt will produce a sig that
+            // fails consensus VerifyMultiLayer; broadcasting will
+            // hit `bad-pct-ring-sig-invalid`. Hence the ML format is
+            // what callers should provide post-2026-05-12.
             if (!ring_arr.isArray() || ring_arr.empty()) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "ring must be a non-empty array of pubkey hex");
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "ring must be a non-empty array");
             }
-            std::vector<::pricoin::ringsig::Point> ring;
+            const bool ring_is_ml = ring_arr[0].isObject();
+            std::vector<::pricoin::ringsig::Point> ring;             // P-only view for legacy Adapt path
+            std::vector<::pricoin::ringsig::MultiLayerMember> ring_ml;  // {P,W} view for AdaptML
             ring.reserve(ring_arr.size());
+            ring_ml.reserve(ring_arr.size());
             for (size_t i = 0; i < ring_arr.size(); ++i) {
-                auto pb = TryParseHex<unsigned char>(ring_arr[i].get_str());
-                if (!pb || pb->size() != 33) {
-                    throw JSONRPCError(RPC_INVALID_PARAMETER,
-                        strprintf("ring[%u] must be 33-byte compressed pubkey hex",
-                            static_cast<unsigned>(i)));
-                }
+                const UniValue& entry = ring_arr[i];
                 ::pricoin::ringsig::Point P{};
-                std::copy(pb->begin(), pb->end(), P.begin());
+                if (ring_is_ml) {
+                    if (!entry.isObject() || !entry.exists("P") || !entry.exists("W")) {
+                        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                            strprintf("ring[%u] must be {P,W} object",
+                                static_cast<unsigned>(i)));
+                    }
+                    auto pb = TryParseHex<unsigned char>(entry["P"].get_str());
+                    auto wb = TryParseHex<unsigned char>(entry["W"].get_str());
+                    if (!pb || pb->size() != 33 || !wb || wb->size() != 33) {
+                        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                            strprintf("ring[%u] P/W must be 33-byte hex",
+                                static_cast<unsigned>(i)));
+                    }
+                    ::pricoin::ringsig::MultiLayerMember m;
+                    std::copy(pb->begin(), pb->end(), m.P.begin());
+                    std::copy(wb->begin(), wb->end(), m.W.begin());
+                    ring_ml.push_back(m);
+                    std::copy(pb->begin(), pb->end(), P.begin());
+                } else {
+                    auto pb = TryParseHex<unsigned char>(entry.get_str());
+                    if (!pb || pb->size() != 33) {
+                        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                            strprintf("ring[%u] must be 33-byte hex (or {P,W} object)",
+                                static_cast<unsigned>(i)));
+                    }
+                    std::copy(pb->begin(), pb->end(), P.begin());
+                }
                 ring.push_back(P);
             }
             // CRITICAL: parse msg_hex as raw bytes (direct copy), NOT
@@ -7799,10 +7834,26 @@ RPCMethod pricoin_swapwatch_adapt_pric_claim()
             }
 
             // Adapt: presig + t + ring + msg → final CLSAG signature.
+            // For multi-layer rings (the format produced by the
+            // adaptor-ML protocol path) we route through AdaptML so
+            // the post-adapt verify uses VerifyMultiLayer — the same
+            // routine consensus runs at chain-validate time. The
+            // single-layer Adapt branch survives for legacy callers
+            // but produces a sig with zero commitment_image that will
+            // fail consensus.
             ::pricoin::ringsig::Scalar t_scalar;
             std::copy(snap.t_secret.begin(), snap.t_secret.end(), t_scalar.begin());
-            auto final_sig_opt = ::pricoin::adaptor_ringsig::Adapt(presig, t_scalar,
-                std::span<const ::pricoin::ringsig::Point>{ring}, msg);
+            std::optional<::pricoin::ringsig::Signature> final_sig_opt;
+            if (ring_is_ml) {
+                final_sig_opt = ::pricoin::adaptor_ringsig::AdaptML(
+                    presig, t_scalar,
+                    std::span<const ::pricoin::ringsig::MultiLayerMember>{ring_ml},
+                    msg);
+            } else {
+                final_sig_opt = ::pricoin::adaptor_ringsig::Adapt(
+                    presig, t_scalar,
+                    std::span<const ::pricoin::ringsig::Point>{ring}, msg);
+            }
             if (!final_sig_opt) {
                 throw JSONRPCError(RPC_INVALID_REQUEST,
                     "Adapt failed (t did not match T_G/T_H or pre-sig malformed or ring/msg mismatch)");
