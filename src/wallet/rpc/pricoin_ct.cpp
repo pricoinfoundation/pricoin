@@ -1091,14 +1091,16 @@ RPCMethod pricoin_listownct()
                 for (const auto& [outpoint, rec] : index.entries) {
                     if (rec.height < startheight) continue;
                     if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
-                    // Filter inputs the wallet has already broadcast a
-                    // CONFIRMED spend for. Mempool-only entries stay
-                    // visible (they may be RBF'd or evicted).
-                    if (auto prev = ::wallet::pricoin_broadcasted_kis::Lookup(
+                    // Wallet-local broadcasted-keyimage filter (2026-
+                    // 05-13 tightening): any recorded broadcast for
+                    // this KI hides the output from balance/listing,
+                    // mempool or mined alike. The prior "show if
+                    // mempool-only" carve-out caused stale-mempool
+                    // outputs to surface as spendable balance only to
+                    // fail at broadcast.
+                    if (::wallet::pricoin_broadcasted_kis::Lookup(
                             wallet, rec.key_image)) {
-                        auto found = wallet.chain().findOnChainOrInMempool(
-                            Txid::FromUint256(*prev));
-                        if (found && !found->second.IsNull()) continue;
+                        continue;
                     }
                     total_recovered += rec.value;
                     UniValue entry{UniValue::VOBJ};
@@ -1385,22 +1387,20 @@ RPCMethod walletsendct_ring()
                     // a -reindex sync race). Closes the double-spend
                     // window hit on 2026-05-11.
                     //
-                    // RBF carve-out: if our recorded txid is in mempool
-                    // (not yet confirmed), the wallet should be able
-                    // to re-pick this input to broadcast a higher-fee
-                    // replacement. Only filter if the recorded tx is
-                    // confirmed in a block — that's when the input is
-                    // genuinely spent.
-                    if (auto prev = ::wallet::pricoin_broadcasted_kis::Lookup(
+                    // Tighter rule (2026-05-13): once we broadcast,
+                    // those inputs are off-limits to NEW spends —
+                    // whether the broadcast is in mempool, mined, or
+                    // evicted. The prior "RBF carve-out" (allow
+                    // re-pick if prev tx is mempool-only) let the
+                    // wallet build a tx that the chain mempool then
+                    // had to reject as a non-signalling replacement,
+                    // breaking unrelated new swaps when an old tx
+                    // hadn't yet evicted. RBF fee-bumping is a
+                    // separate caller intent and needs an explicit
+                    // opt-in (not wired yet).
+                    if (::wallet::pricoin_broadcasted_kis::Lookup(
                             wallet, rec.key_image)) {
-                        auto found = chain.findOnChainOrInMempool(Txid::FromUint256(*prev));
-                        if (found && !found->second.IsNull()) {
-                            // Recorded broadcast was confirmed in a
-                            // block — input is genuinely spent.
-                            continue;
-                        }
-                        // Otherwise: in mempool only OR evicted —
-                        // allow re-pick (RBF case).
+                        continue;
                     }
                     picked_outpoint = outpoint;
                     picked_height = rec.height;
@@ -1758,12 +1758,12 @@ RPCMethod walletsendct_from_ct()
                 sorted.reserve(index.entries.size());
                 for (const auto& [outpoint, rec] : index.entries) {
                     if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
-                    // Same RBF-aware filter as walletsendct_ring's picker.
-                    if (auto prev = ::wallet::pricoin_broadcasted_kis::Lookup(
+                    // Same wallet-local broadcasted-KI filter as
+                    // walletsendct_ring's picker (2026-05-13 tightening:
+                    // any broadcast for this KI hides the output).
+                    if (::wallet::pricoin_broadcasted_kis::Lookup(
                             wallet, rec.key_image)) {
-                        auto found = wallet.chain().findOnChainOrInMempool(
-                            Txid::FromUint256(*prev));
-                        if (found && !found->second.IsNull()) continue;
+                        continue;
                     }
                     sorted.push_back({outpoint, rec.value, rec.height});
                 }
