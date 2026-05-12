@@ -82,6 +82,11 @@ void PruneOrphanedKeyImages(
 // where chainstate-erasure is no longer the spent indicator.
 bool IsKeyImageCommitted(const ringsig::Point& ki);
 
+// Diagnostic: total count of KIs in the global committed set. Used by
+// the startup self-heal pass in init.cpp to detect whether a rebuild-
+// from-chain walk added any missing entries.
+size_t CountCommittedKeyImages();
+
 } // namespace pricoin
 
 #endif // BITCOIN_PRICOIN_VALIDATION_H

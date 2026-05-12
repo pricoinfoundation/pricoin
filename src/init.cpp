@@ -2282,6 +2282,67 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                         return bi && chainman.ActiveChain().Contains(*bi);
                     }});
         }
+
+        // Pricoin: rebuild any MISSING key-image entries by walking
+        // the active chain. Counterpart to PruneOrphanedKeyImages:
+        // that drops attributions to non-active blocks; this re-adds
+        // attributions for active-chain blocks whose KIs aren't in
+        // the store. Without it, a partial pricoin_keyimages.dat
+        // (interrupted rewrite, manual delete, mid-IBD crash) leaves
+        // g_key_images missing entries — and the next time the same
+        // KI shows up in mempool the check passes, the tx gets mined
+        // into a block, and we have a chain-level double-spend that
+        // every fresh-IBD node will rightly reject. Root-cause fix
+        // for the 2026-05-12 chain incident at height 1827.
+        //
+        // Cost: one disk read per block in the active chain on every
+        // startup. Cheap on the current ~2k-block chain; will need a
+        // "skip already-validated tip" optimization before this can
+        // scale to many years of history. CommitBlockKIs's insert-
+        // only-if-new logic keeps it idempotent against re-runs.
+        {
+            LOCK(::cs_main);
+            const CChain& active = chainman.ActiveChain();
+            const node::BlockManager& blockman = chainman.m_blockman;
+            size_t blocks_scanned = 0;
+            size_t kis_added = 0;
+            for (int h = 0; h <= active.Height(); ++h) {
+                const CBlockIndex* pindex = active[h];
+                if (!pindex) continue;
+                CBlock block;
+                if (!blockman.ReadBlock(block, *pindex)) {
+                    LogWarning("Pricoin: KI rebuild — ReadBlock failed at "
+                               "height %d (%s); skipping\n",
+                               h, pindex->GetBlockHash().ToString());
+                    continue;
+                }
+                std::vector<::pricoin::ringsig::Point> kis;
+                for (const auto& tx : block.vtx) {
+                    if (!tx || tx->version != PRICOIN_CT_VERSION) continue;
+                    for (const auto& ri : tx->ct_bundle.ring_inputs) {
+                        kis.push_back(ri.sig.key_image);
+                    }
+                }
+                if (kis.empty()) continue;
+                ++blocks_scanned;
+                const size_t before = pricoin::CountCommittedKeyImages();
+                pricoin::CommitBlockKIs(pindex->GetBlockHash(), kis);
+                const size_t after = pricoin::CountCommittedKeyImages();
+                kis_added += (after > before) ? (after - before) : 0;
+            }
+            if (kis_added > 0) {
+                LogWarning(
+                    "Pricoin: KI rebuild ADDED %u missing key image(s) across "
+                    "%u v4 block(s) — pricoin_keyimages.dat was incomplete; "
+                    "this would have allowed a double-spend at the next "
+                    "matching mempool tx. Self-healed.\n",
+                    (unsigned)kis_added, (unsigned)blocks_scanned);
+            } else {
+                LogInfo("Pricoin: KI rebuild scanned %u v4 block(s), nothing "
+                        "missing — store is consistent with active chain\n",
+                        (unsigned)blocks_scanned);
+            }
+        }
         if (args.GetBoolArg("-stopafterblockimport", DEFAULT_STOPAFTERBLOCKIMPORT)) {
             LogInfo("Stopping after block import");
             if (!(Assert(node.shutdown_request))()) {

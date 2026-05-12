@@ -426,6 +426,12 @@ bool IsKeyImageCommitted(const ringsig::Point& ki)
     return g_key_images.contains(ki);
 }
 
+size_t CountCommittedKeyImages()
+{
+    LOCK(g_ki_mutex);
+    return g_key_images.size();
+}
+
 void PruneOrphanedKeyImages(
     const std::function<bool(const uint256&)>& is_in_active_chain)
 {
