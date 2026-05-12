@@ -7752,10 +7752,22 @@ RPCMethod pricoin_swapwatch_adapt_pric_claim()
                 std::copy(pb->begin(), pb->end(), P.begin());
                 ring.push_back(P);
             }
-            auto msg_opt = uint256::FromHex(msg_hex);
-            if (!msg_opt) throw JSONRPCError(RPC_INVALID_PARAMETER,
-                "msg_hex must be 32-byte hex");
-            const uint256 msg = *msg_opt;
+            // CRITICAL: parse msg_hex as raw bytes (direct copy), NOT
+            // via uint256::FromHex (which reverses byte order). The
+            // ceremony's pricoin_jointspend_adaptor_combine uses the
+            // raw-bytes convention (src/rpc/pricoin_ct.cpp via
+            // ParseScalar32 + std::copy). Adapt's CLSAG verify must
+            // see the SAME uint256 msg value the presig was computed
+            // against, else verification fails with "ring/msg
+            // mismatch". (Fixed 2026-05-12 — root cause of
+            // "Adapt failed" on the first PreSigned-stage test.)
+            auto msg_bytes = TryParseHex<unsigned char>(msg_hex);
+            if (!msg_bytes || msg_bytes->size() != 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "msg_hex must be 32-byte hex");
+            }
+            uint256 msg;
+            std::copy(msg_bytes->begin(), msg_bytes->end(), msg.begin());
 
             // Load + validate.
             ::wallet::pricoin_adaptor_swap::AdaptorSwap snap;
