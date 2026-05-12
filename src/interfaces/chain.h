@@ -203,6 +203,15 @@ public:
     //! Check if transaction has descendants in mempool.
     virtual bool hasDescendantsInMempool(const Txid& txid) = 0;
 
+    //! Pricoin-only: check if any v4 transaction in mempool consumes
+    //! this key image. Used by the wallet's CT input picker to avoid
+    //! re-picking a UTXO that another (possibly externally broadcast)
+    //! tx is already trying to spend — would otherwise hit
+    //! "bip125-replacement-disallowed" or "insufficient fee" replacement
+    //! rejection at broadcast time.
+    virtual bool isPricoinKeyImageInMempool(
+        std::span<const unsigned char, 33> key_image) = 0;
+
     //! Process a local transaction, optionally adding it to the mempool and
     //! optionally broadcasting it to the network.
     //! @param[in] tx Transaction to process.

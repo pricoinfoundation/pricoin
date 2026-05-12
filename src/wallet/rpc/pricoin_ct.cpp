@@ -1102,6 +1102,15 @@ RPCMethod pricoin_listownct()
                             wallet, rec.key_image)) {
                         continue;
                     }
+                    // Chain-mempool check — catches mempool entries
+                    // we didn't broadcast (other wallet / external
+                    // tool). See walletsendct_ring picker for the
+                    // detailed rationale.
+                    if (wallet.chain().isPricoinKeyImageInMempool(
+                            std::span<const unsigned char, 33>{
+                                rec.key_image.data(), 33})) {
+                        continue;
+                    }
                     total_recovered += rec.value;
                     UniValue entry{UniValue::VOBJ};
                     entry.pushKV("txid", outpoint.hash.ToString());
@@ -1400,6 +1409,20 @@ RPCMethod walletsendct_ring()
                     // opt-in (not wired yet).
                     if (::wallet::pricoin_broadcasted_kis::Lookup(
                             wallet, rec.key_image)) {
+                        continue;
+                    }
+                    // Also defend against KIs that landed in the
+                    // chain's mempool via a DIFFERENT wallet/tool —
+                    // not in our broadcasted_kis store, so the above
+                    // check misses them. Without this, the picker
+                    // hands the user back a tx that the mempool
+                    // rejects with "insufficient fee, rejecting
+                    // replacement …". Seen in the wild on 2026-05-12
+                    // after a wallet resync: a prior funding attempt
+                    // sat in mempool with no matching wallet record.
+                    if (chain.isPricoinKeyImageInMempool(
+                            std::span<const unsigned char, 33>{
+                                rec.key_image.data(), 33})) {
                         continue;
                     }
                     picked_outpoint = outpoint;
@@ -1763,6 +1786,13 @@ RPCMethod walletsendct_from_ct()
                     // any broadcast for this KI hides the output).
                     if (::wallet::pricoin_broadcasted_kis::Lookup(
                             wallet, rec.key_image)) {
+                        continue;
+                    }
+                    // Chain-mempool check — catches KIs other tools /
+                    // wallets may have parked in the local mempool.
+                    if (wallet.chain().isPricoinKeyImageInMempool(
+                            std::span<const unsigned char, 33>{
+                                rec.key_image.data(), 33})) {
                         continue;
                     }
                     sorted.push_back({outpoint, rec.value, rec.height});

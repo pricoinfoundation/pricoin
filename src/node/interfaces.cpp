@@ -671,6 +671,24 @@ public:
         if (!m_node.mempool) return false;
         return m_node.mempool->HasDescendants(txid);
     }
+    bool isPricoinKeyImageInMempool(
+        std::span<const unsigned char, 33> key_image) override
+    {
+        if (!m_node.mempool) return false;
+        LOCK(m_node.mempool->cs);
+        for (const auto& entry : m_node.mempool->mapTx) {
+            const CTransaction& mtx = entry.GetTx();
+            if (mtx.version != PRICOIN_CT_VERSION) continue;
+            if (mtx.ct_bundle.ring_inputs.empty()) continue;
+            for (const auto& ri : mtx.ct_bundle.ring_inputs) {
+                if (std::equal(key_image.begin(), key_image.end(),
+                               ri.sig.key_image.begin())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
     std::optional<std::pair<CTransactionRef, uint256>>
         findOnChainOrInMempool(const Txid& txid) override
     {
