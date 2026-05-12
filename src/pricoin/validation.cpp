@@ -286,6 +286,32 @@ bool VerifyRingInputs(
         {
             LOCK(g_ki_mutex);
             if (g_key_images.contains(ri.sig.key_image)) {
+                // Diagnostic: find which prior block bucket holds this
+                // KI. Helps distinguish a legitimate chain double-spend
+                // from a node-local reorg-cleanup bug where stale KIs
+                // remained in g_key_images attributed to a block that's
+                // no longer in the active chain.
+                std::string owner_str = "<unknown>";
+                size_t total_buckets = g_kis_by_block.size();
+                for (const auto& [bh, kis] : g_kis_by_block) {
+                    for (const auto& k : kis) {
+                        if (k == ri.sig.key_image) {
+                            owner_str = (bh.IsNull() ? std::string{"<legacy/untagged>"}
+                                                     : bh.ToString());
+                            goto found;
+                        }
+                    }
+                }
+                found:
+                LogWarning(
+                    "Pricoin: bad-pct-double-spend-keyimage rejecting ring_input "
+                    "ki=%s; previously committed by block=%s "
+                    "(g_key_images=%u, g_kis_by_block=%u buckets)",
+                    HexStr(std::span<const unsigned char>{
+                        ri.sig.key_image.data(), ri.sig.key_image.size()}),
+                    owner_str,
+                    (unsigned)g_key_images.size(),
+                    (unsigned)total_buckets);
                 return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-pct-double-spend-keyimage");
             }
         }
