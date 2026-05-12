@@ -4849,6 +4849,12 @@ UniValue AdaptorSwapToJSON(const aas::AdaptorSwap& s)
         }
         pric.pushKV("pric_claim_ring", std::move(ring_arr));
     }
+    if (!s.pric_claim_adaptor_session_json.empty()) {
+        pric.pushKV("claim_session_json", s.pric_claim_adaptor_session_json);
+    }
+    if (!s.pric_refund_session_json.empty()) {
+        pric.pushKV("refund_session_json", s.pric_refund_session_json);
+    }
     out.pushKV("pric", std::move(pric));
 
     if (s.adaptor_set) {
