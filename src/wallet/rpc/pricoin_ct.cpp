@@ -1664,11 +1664,11 @@ RPCMethod walletsendct_ring()
             }
 
             // Persist the spent keyimage with the txid that produced
-            // it. The txid lets the picker check confirmation status
-            // at re-pick time so RBF (same input, higher fee) still
-            // works when the recorded tx is mempool-only. Best-
-            // effort — broadcast already succeeded; persistence
-            // failure falls back to chain's keyimage set.
+            // it. Future picker calls skip this KI outright — there's
+            // no RBF carve-out (2026-05-13). The txid is still stored
+            // for forensic / RPC inspection. Best-effort: broadcast
+            // already succeeded; persistence failure falls back to
+            // chain's keyimage set when the tx confirms.
             if (!::wallet::pricoin_broadcasted_kis::Add(
                     wallet, ki_to_persist, tx_ref->GetHash().ToUint256())) {
                 LogInfo("Pricoin walletsendct_ring: broadcasted-KI persist "
