@@ -1955,10 +1955,20 @@ void PricoinSwapsPage::onAdaptPricClaimClicked()
     msg->setPlaceholderText(tr("32-byte sighash hex"));
     form->addRow(tr("msg (sighash):"), msg);
 
-    // Auto-fill from the persisted claim-leg coopsign session.
-    // Spares the user the copy-paste from the cooperative-sign
-    // dialog — all three fields are already in the session JSON.
+    // Auto-fill the 3 fields. The ring should come from the AUTHORITATIVE
+    // pric_claim_ring on the swap record (set at Step 2 time, the same
+    // ring the presig was generated against). tx_hex + msg come from
+    // the persisted claim-leg coopsign session JSON.
     if (auto snap_opt = m_model->wallet().adaptorSwapGet(sid); snap_opt) {
+        // Ring from swap record (authoritative).
+        if (!snap_opt->pric_claim_ring_hex.empty()) {
+            UniValue ring_arr{UniValue::VARR};
+            for (const auto& h : snap_opt->pric_claim_ring_hex) {
+                ring_arr.push_back(h);
+            }
+            ring->setPlainText(QString::fromStdString(ring_arr.write(0)));
+        }
+        // tx_hex + msg from session JSON.
         const std::string& blob = snap_opt->pric_claim_adaptor_session_json;
         UniValue j;
         if (!blob.empty() && j.read(blob) && j.isObject()) {
@@ -1966,13 +1976,16 @@ void PricoinSwapsPage::onAdaptPricClaimClicked()
                 tx_hex->setPlainText(QString::fromStdString(
                     j["unsigned_tx_hex"].get_str()));
             }
-            if (j.exists("ring_json") && j["ring_json"].isStr()) {
-                ring->setPlainText(QString::fromStdString(
-                    j["ring_json"].get_str()));
-            }
             if (j.exists("msg_hex") && j["msg_hex"].isStr()) {
                 msg->setText(QString::fromStdString(
                     j["msg_hex"].get_str()));
+            }
+            // Fallback: if pric_claim_ring isn't populated on the
+            // record yet, try the session's ring_json.
+            if (snap_opt->pric_claim_ring_hex.empty()
+                && j.exists("ring_json") && j["ring_json"].isStr()) {
+                ring->setPlainText(QString::fromStdString(
+                    j["ring_json"].get_str()));
             }
         }
     }

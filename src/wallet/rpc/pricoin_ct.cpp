@@ -4842,6 +4842,13 @@ UniValue AdaptorSwapToJSON(const aas::AdaptorSwap& s)
     if (!s.peer_spend_pubkey_hex.empty()) {
         pric.pushKV("peer_spend_pubkey", s.peer_spend_pubkey_hex);
     }
+    if (!s.pric_claim_ring.empty()) {
+        UniValue ring_arr{UniValue::VARR};
+        for (const auto& p : s.pric_claim_ring) {
+            ring_arr.push_back(HexStr(p));
+        }
+        pric.pushKV("pric_claim_ring", std::move(ring_arr));
+    }
     out.pushKV("pric", std::move(pric));
 
     if (s.adaptor_set) {
