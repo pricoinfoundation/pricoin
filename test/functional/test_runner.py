@@ -103,6 +103,7 @@ BASE_SCRIPTS = [
     'feature_pricoin_jointspend.py',
     'feature_pricoin_jointspend_refund.py',
     'feature_pricoin_jointspend_adaptor.py',
+    'feature_pricoin_jointspend_adaptor_ml.py',
     'feature_pricoin_chainwatch.py',
     'feature_pricoin_btc_htlc.py',
     'feature_pricoin_btc_swap_tx.py',
