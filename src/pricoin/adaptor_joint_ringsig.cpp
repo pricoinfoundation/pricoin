@@ -1021,14 +1021,31 @@ std::optional<AdaptorCombineOutputML> CombineAndWalkML(
     std::span<const unsigned char> session_label,
     std::span<const unsigned char> session_payload)
 {
-    if (ring.empty() || pi >= ring.size()) return std::nullopt;
-    if (HasDuplicateMembers(ring)) return std::nullopt;
-    if (X_pub_shares.size() != shares.size() || shares.empty()) return std::nullopt;
-    if (Z_pub_shares.size() != shares.size())                   return std::nullopt;
+    if (ring.empty() || pi >= ring.size()) {
+        LogWarning("Pricoin CombineAndWalkML: invalid ring/pi (size=%u, pi=%u)",
+                   (unsigned)ring.size(), (unsigned)pi);
+        return std::nullopt;
+    }
+    if (HasDuplicateMembers(ring)) {
+        LogWarning("Pricoin CombineAndWalkML: ring has duplicate members");
+        return std::nullopt;
+    }
+    if (X_pub_shares.size() != shares.size() || shares.empty()) {
+        LogWarning("Pricoin CombineAndWalkML: X_pub_shares.size=%u vs shares.size=%u",
+                   (unsigned)X_pub_shares.size(), (unsigned)shares.size());
+        return std::nullopt;
+    }
+    if (Z_pub_shares.size() != shares.size()) {
+        LogWarning("Pricoin CombineAndWalkML: Z_pub_shares.size=%u vs shares.size=%u",
+                   (unsigned)Z_pub_shares.size(), (unsigned)shares.size());
+        return std::nullopt;
+    }
 
     // Verify Bob's adaptor DLEQ.
     if (!::pricoin::adaptor_ringsig::VerifyDLEQProof(
             ring[pi].P, adaptor, dleq_t, session_label, session_payload)) {
+        LogWarning("Pricoin CombineAndWalkML: dleq_t verify failed (T_G/T_H/"
+                   "session_label/session_payload mismatch between parties?)");
         return std::nullopt;
     }
 
@@ -1036,6 +1053,11 @@ std::optional<AdaptorCombineOutputML> CombineAndWalkML(
     for (size_t k = 0; k < shares.size(); ++k) {
         if (!VerifyAdaptorNonceShareML(ring[pi].P, X_pub_shares[k], Z_pub_shares[k],
                 shares[k], adaptor, session_label, session_payload)) {
+            LogWarning("Pricoin CombineAndWalkML: share[%u] failed "
+                       "VerifyAdaptorNonceShareML (DLEQ-1/2/3 or commitment "
+                       "mismatch — peer's session_label/payload, X_pub, or "
+                       "Z_pub doesn't agree with what they signed)",
+                       (unsigned)k);
             return std::nullopt;
         }
     }
@@ -1073,8 +1095,21 @@ std::optional<AdaptorCombineOutputML> CombineAndWalkML(
             if (!AddPoints(ctx, joint_z, Z_pub_shares[k], sum)) return std::nullopt;
             joint_z = sum;
         }
-        if (joint_x != ring[pi].P) return std::nullopt;
-        if (joint_z != ring[pi].W) return std::nullopt;
+        if (joint_x != ring[pi].P) {
+            LogWarning("Pricoin CombineAndWalkML: Σ X_pub != ring[pi].P — "
+                       "spender's X_pub_X and cosigner's X_pub don't sum to "
+                       "the on-chain joint pubkey (loadshare absorb_shared_"
+                       "secret config mismatch, or wrong P_pi/joint_pubkey)");
+            return std::nullopt;
+        }
+        if (joint_z != ring[pi].W) {
+            LogWarning("Pricoin CombineAndWalkML: Σ Z_pub != ring[pi].W — "
+                       "spender's Z_pub_X and cosigner's Z_pub don't sum to "
+                       "the on-chain commitment-delta (W = C_real - C_pseudo); "
+                       "z_self/z_other split from buildtx didn't reach the "
+                       "cosigner intact");
+            return std::nullopt;
+        }
     }
 
     // µ from (ring, KI, D) — reuse joint_ringsig's existing helper.
