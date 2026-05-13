@@ -1326,10 +1326,49 @@ RPCMethod pricoin_jointspend_adaptor_round1_ml()
             auto label   = ParseSessionLabel(request.params[7], "session_label");
             auto payload = ParseSessionLabel(request.params[8], "session_payload");
 
+            // Pre-flight sanity checks that the C++ primitive does
+            // silently — surface specific mismatches to the caller so
+            // a stale Z_pub_X / wrong x_share doesn't show up as the
+            // opaque "NonceGenAdaptorML failed".
+            {
+                CKey kx;
+                kx.Set(x_X.data(), x_X.data() + 32, /*compressed=*/true);
+                if (!kx.IsValid()) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        "x_X is not a valid secp256k1 secret key");
+                }
+                const CPubKey xpub = kx.GetPubKey();
+                std::array<unsigned char, 33> xpub_bytes{};
+                std::copy(xpub.begin(), xpub.end(), xpub_bytes.begin());
+                if (xpub_bytes != X_pub_X) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        strprintf("x_X · G (%s) does not match X_pub_X (%s) — "
+                                  "secret/public share mismatch; re-run loadshare?",
+                                  HexStr(xpub_bytes), HexStr(X_pub_X)));
+                }
+                CKey kz;
+                kz.Set(z_X.data(), z_X.data() + 32, /*compressed=*/true);
+                if (!kz.IsValid()) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        "z_X is not a valid secp256k1 secret key");
+                }
+                const CPubKey zpub = kz.GetPubKey();
+                std::array<unsigned char, 33> zpub_bytes{};
+                std::copy(zpub.begin(), zpub.end(), zpub_bytes.begin());
+                if (zpub_bytes != Z_pub_X) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        strprintf("z_X · G (%s) does not match Z_pub_X (%s) — "
+                                  "z-share/Z_pub mismatch; for spender re-run "
+                                  "buildtx, for cosigner re-receive buildtx DM",
+                                  HexStr(zpub_bytes), HexStr(Z_pub_X)));
+                }
+            }
             auto share = pajr::NonceGenAdaptorML(P_pi, X_pub_X, Z_pub_X,
                 x_X, z_X, adaptor,
                 ToBytesSpan(label), ToBytesSpan(payload));
-            if (!share) throw JSONRPCError(RPC_INVALID_PARAMETER, "NonceGenAdaptorML failed");
+            if (!share) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "NonceGenAdaptorML failed (inputs passed sanity but math step errored — "
+                "check T_G/T_H/session_label/session_payload)");
 
             UniValue out{UniValue::VOBJ};
             out.pushKV("alpha",       ScalarHex(share->alpha));

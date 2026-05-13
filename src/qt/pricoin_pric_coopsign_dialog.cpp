@@ -807,11 +807,35 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
     if (!env.exists("round")) return;
     const int round = env["round"].getInt<int>();
     if (round == 1 && env.exists("share") && m_in_peer_share_json) {
-        if (m_in_peer_share_json->toPlainText().trimmed().isEmpty()) {
+        // Overwrite when (a) the field is empty, or (b) the field is
+        // populated with a STALE share that's missing the multi-layer
+        // dleq_z field but the incoming share has it. Case (b) covers
+        // the binary-upgrade-mid-ceremony scenario (a pre-_ml binary
+        // sent the first DM, then the upgraded binary sends a complete
+        // one — without this, the upgraded share is ignored and Step 2
+        // keeps failing on a stale cache).
+        const std::string current = m_in_peer_share_json->toPlainText().trimmed().toStdString();
+        bool replace = current.empty();
+        if (!replace) {
+            UniValue cur, incoming;
+            if (cur.read(current) && cur.isObject()) {
+                const bool cur_has_dleq_z =
+                    cur.exists("dleq_z") && cur["dleq_z"].isStr();
+                const UniValue& sh = env["share"];
+                const bool inc_has_dleq_z =
+                    sh.isObject() && sh.exists("dleq_z") && sh["dleq_z"].isStr();
+                if (!cur_has_dleq_z && inc_has_dleq_z) replace = true;
+            }
+        }
+        if (replace) {
             m_in_peer_share_json->setPlainText(
                 QString::fromStdString(env["share"].write(2)));
             setStatus(tr("Peer share auto-pasted from DM."));
             persistSession();
+            // Stale Step-2 may have already fired and failed; reset
+            // the auto-fire flag so the upgraded share triggers a
+            // fresh attempt.
+            m_auto_step2_fired = false;
             tryAutoStep2();
             // Bilateral resend: if my Step 1 share was sent before
             // peer subscribed, it never landed. Resend now that peer
