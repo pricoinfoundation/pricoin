@@ -444,6 +444,19 @@ void PricCoopSignDialog::onRunBuildtx()
         const QString zpub = DerivePubkeyHex(QString::fromStdString(z_self));
         if (!zpub.isEmpty()) m_in_Z_pub_X->setText(zpub);
     }
+    // adaptor_ml: the spender knows BOTH z-halves at buildtx time
+    // (z_self for self, z_other for peer). Compute the peer's
+    // Z_pub directly from z_other so the spender doesn't need a
+    // DM round-trip with the cosigner to fill it in. Without this,
+    // the xpub_announce DM arrives BEFORE the cosigner has derived
+    // their own Z_pub (xpub_announce fires at loadshare-end, which
+    // is before buildtx is received), so the spender's Z_pub_peer
+    // stays empty and Step 2 (combine_ml) blocks. Cosigner derives
+    // their own Z_pub_X from z_other when the buildtx DM lands.
+    if (m_in_Z_pub_peer && m_mode == Mode::PricAdaptor) {
+        const QString zpub_peer = DerivePubkeyHex(QString::fromStdString(z_other));
+        if (!zpub_peer.isEmpty()) m_in_Z_pub_peer->setText(zpub_peer);
+    }
     UniValue out{UniValue::VOBJ};
     out.pushKV("sighash",     sighash);
     out.pushKV("pi",          pi);

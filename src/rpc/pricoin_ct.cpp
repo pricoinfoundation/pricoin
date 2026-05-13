@@ -791,6 +791,40 @@ RPCMethod pricoin_jointspend_verify()
     };
 }
 
+RPCMethod pricoin_pubkey_from_scalar()
+{
+    return RPCMethod{
+        "pricoin_pubkey_from_scalar",
+        "Compute the 33-byte compressed pubkey for a 32-byte scalar (= scalar · G).\n"
+        "Helper for recovering an in-flight coopsign session when the dialog's\n"
+        "auto-derive missed a Z_pub field: paste the corresponding z_self or\n"
+        "z_other into this RPC, paste the returned pubkey into the dialog.\n",
+        {
+            {"scalar", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte secret hex"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::STR_HEX, "pubkey", "33-byte compressed pubkey hex"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_pubkey_from_scalar", "<32-byte hex>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            const std::string hex = request.params[0].get_str();
+            auto bytes = TryParseHex<unsigned char>(hex);
+            if (!bytes || bytes->size() != 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "scalar must be 32-byte hex");
+            }
+            CKey k;
+            k.Set(bytes->begin(), bytes->end(), /*compressed=*/true);
+            if (!k.IsValid()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "scalar is not a valid secp256k1 secret key");
+            }
+            const CPubKey p = k.GetPubKey();
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("pubkey", HexStr(std::span<const unsigned char>{p.begin(), p.size()}));
+            return out;
+        }
+    };
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Atomic-swap phase 5 — cooperative adaptor-CLSAG wire RPCs.
 //
@@ -1675,6 +1709,7 @@ void RegisterPricoinCTRPCCommands(CRPCTable& t)
         {"pricoin", &pricoin_jointspend_share},
         {"pricoin", &pricoin_jointspend_assemble},
         {"pricoin", &pricoin_jointspend_verify},
+        {"pricoin", &pricoin_pubkey_from_scalar},
         {"pricoin", &pricoin_adaptor_compute_points},
         {"pricoin", &pricoin_adaptor_dleq_prove},
         {"pricoin", &pricoin_adaptor_dleq_verify},
