@@ -987,26 +987,46 @@ bool VerifyAdaptorNonceShareML(
         AdaptorPoints alpha_points{share.L_share, share.R_share};
         if (!::pricoin::adaptor_ringsig::VerifyDLEQProof(
                 P_pi, alpha_points, share.dleq_alpha,
-                AlphaLabelSpan(), session_payload)) return false;
+                AlphaLabelSpan(), session_payload)) {
+            LogWarning("Pricoin VerifyAdaptorNonceShareML: dleq_alpha verify failed");
+            return false;
+        }
     }
     {
         AdaptorPoints x_points{X_pub_X, share.KI_share};
         if (!::pricoin::adaptor_ringsig::VerifyDLEQProof(
                 P_pi, x_points, share.dleq_x,
-                XLabelSpan(), session_payload)) return false;
+                XLabelSpan(), session_payload)) {
+            LogWarning("Pricoin VerifyAdaptorNonceShareML: dleq_x verify failed "
+                       "(peer's X_pub %s, P_pi %s)",
+                       HexStr(X_pub_X), HexStr(P_pi));
+            return false;
+        }
     }
     {
         AdaptorPoints z_points{Z_pub_X, share.D_share};
         if (!::pricoin::adaptor_ringsig::VerifyDLEQProof(
                 P_pi, z_points, share.dleq_z,
-                ZLabelSpan(), session_payload)) return false;
+                ZLabelSpan(), session_payload)) {
+            LogWarning("Pricoin VerifyAdaptorNonceShareML: dleq_z verify failed "
+                       "(peer's Z_pub %s, D_share %s)",
+                       HexStr(Z_pub_X), HexStr(share.D_share));
+            return false;
+        }
     }
 
     LOCK(g_ctx_mutex);
     secp256k1_context* ctx = JCtx();
     const Scalar recomputed = ComputeNonceCommitML(ctx, share, adaptor,
         session_label, session_payload);
-    return recomputed == share.commitment;
+    if (recomputed != share.commitment) {
+        LogWarning("Pricoin VerifyAdaptorNonceShareML: commitment mismatch "
+                   "(recomputed=%s, peer-supplied=%s — session_label / "
+                   "session_payload / T_G / T_H disagrees with what peer signed)",
+                   HexStr(recomputed), HexStr(share.commitment));
+        return false;
+    }
+    return true;
 }
 
 std::optional<AdaptorCombineOutputML> CombineAndWalkML(
