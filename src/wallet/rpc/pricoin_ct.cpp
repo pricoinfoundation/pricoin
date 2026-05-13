@@ -4642,6 +4642,10 @@ RPCMethod pricoin_jointspend_loadshare()
                     "for cooperative signing)"},
                 {RPCResult::Type::NUM, "vout",
                     "Echo of input vout (for caller convenience)"},
+                {RPCResult::Type::STR_HEX, "x_pub", /*optional=*/true,
+                    "33-byte X_pub_X = x_share · G — adaptor-mode coopsign "
+                    "needs this so the dialog can auto-fill X_pub_X without "
+                    "a separate scalar→pubkey computation"},
             }
         },
         RPCExamples{

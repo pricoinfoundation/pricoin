@@ -20,6 +20,7 @@ class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
 class QPushButton;
+class QScrollArea;
 QT_END_NAMESPACE
 
 // PricCoopSignDialog — guided UI for the PRIC-side cooperative-CLSAG
@@ -74,6 +75,13 @@ public:
     // blob, broadcastable). PricAdaptor → 32-byte presig (serialized
     // AdaptorPreSignature blob — feeds adaptorSwapSetPreSigned).
     QString finalBlobHex() const { return m_final_blob_hex; }
+
+    // Progress-only UX (default for live use): hide the full step-by-
+    // step form and show only a status line + a small "Advanced…"
+    // toggle. The auto-coord chain runs identically; the user just
+    // sees high-level progress instead of raw cryptographic fields.
+    // Call BEFORE exec() / show().
+    void setProgressOnlyMode(bool on);
 
 private Q_SLOTS:
     void onStep1Compute();
@@ -212,6 +220,14 @@ private:
     QPushButton*    m_btn_broadcast{nullptr};
 
     QLabel*         m_status_label{nullptr};
+
+    // Progress-only mode plumbing.
+    QScrollArea*    m_scroll_area{nullptr};      // the field-heavy section
+    QLabel*         m_progress_header{nullptr};  // big "leave this open" label
+    QLabel*         m_progress_state{nullptr};   // current swap state line
+    QLabel*         m_progress_action{nullptr};  // last-action / status line
+    QPushButton*    m_btn_toggle_advanced{nullptr};
+    bool            m_progress_only{false};
 
     // ─── Nostr DM transport ───
     QString             m_swap_id;

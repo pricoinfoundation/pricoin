@@ -1667,12 +1667,22 @@ RPCMethod pricoin_jointspend_adaptor_adapt()
         "pricoin_jointspend_adaptor_adapt",
         "Adapt the pre-signature with the held secret t. Output is a standard\n"
         "CLSAG Signature blob, broadcastable on-chain. Verifies before returning\n"
-        "(per spec §3.3 — t·G == T_G, s_pi != 0, full Verify under msg).\n",
+        "(per spec §3.3 — t·G == T_G, s_pi != 0, full Verify under msg).\n"
+        "\n"
+        "Accepts both ring shapes:\n"
+        "  * Array of hex strings → single-layer; calls Adapt + Verify.\n"
+        "  * Array of {P, W} objects → multi-layer; calls AdaptML + VerifyMultiLayer.\n"
+        "  Use multi-layer when the pre-sig was produced via the `_ml`\n"
+        "  protocol (assemble_ml). Single-layer Adapt cannot verify an\n"
+        "  ML pre-sig because the commitment_image field is set.\n",
         {
             {"presig", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
             {"t",      RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte adaptor secret"},
-            {"ring",   RPCArg::Type::ARR,     RPCArg::Optional::NO, "",
-                {{"P", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+            {"ring",   RPCArg::Type::ARR,     RPCArg::Optional::NO,
+                "Single-layer [hex,...] OR multi-layer [{P,W},...]",
+                {{"member", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
+                  {{"P", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""},
+                   {"W", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}}}},
             {"msg",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
         },
         RPCResult{ RPCResult::Type::OBJ, "", "",
@@ -1686,12 +1696,26 @@ RPCMethod pricoin_jointspend_adaptor_adapt()
             if (!presig) throw JSONRPCError(RPC_INVALID_PARAMETER,
                 "presig must be serialized AdaptorPreSignature hex");
             auto t = ParseScalar32(request.params[1].get_str(), "t");
-            auto ring = ParseRing(request.params[2]);
             const auto msg_scalar = ParseScalar32(request.params[3].get_str(), "msg");
             uint256 msg;
             std::copy(msg_scalar.begin(), msg_scalar.end(), msg.begin());
-            auto sig = par::Adapt(*presig, t,
-                std::span<const ::pricoin::ringsig::Point>{ring}, msg);
+
+            const UniValue& ring_arr = request.params[2];
+            if (!ring_arr.isArray() || ring_arr.empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "ring must be non-empty array");
+            }
+            const bool ring_is_ml = ring_arr[0].isObject();
+            std::optional<::pricoin::ringsig::Signature> sig;
+            if (ring_is_ml) {
+                auto ring_ml = ParseMLRing(ring_arr);
+                sig = par::AdaptML(*presig, t,
+                    std::span<const ::pricoin::ringsig::MultiLayerMember>{ring_ml},
+                    msg);
+            } else {
+                auto ring = ParseRing(ring_arr);
+                sig = par::Adapt(*presig, t,
+                    std::span<const ::pricoin::ringsig::Point>{ring}, msg);
+            }
             if (!sig) throw JSONRPCError(RPC_INVALID_PARAMETER,
                 "Adapt failed (wrong t, degenerate s_pi, or post-Verify mismatch)");
             UniValue out{UniValue::VOBJ};

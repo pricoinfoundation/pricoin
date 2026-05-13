@@ -18,6 +18,7 @@
 #include <util/translation.h>
 
 #include <QApplication>
+#include <QTimer>
 #include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
@@ -37,6 +38,12 @@
 #include <stdexcept>
 
 namespace {
+
+// Time the dialog will wait for at least one Nostr relay to connect
+// before declaring the swap dead. 30s covers a slow relay handshake
+// and a few transport retries without making the user stare at a
+// frozen UI.
+constexpr int kNostrConnectGraceMs = 30 * 1000;
 
 // Derive `secret · G` as 33-byte compressed pubkey hex. Returns empty
 // string on failure (zero/oversize scalar, etc.). Used to auto-fill
@@ -233,6 +240,26 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
         }
         tryAutoComputeJointscanPartial();
     }, Qt::QueuedConnection);
+
+    // Nostr-connectivity gate: the entire auto-coord chain is gated
+    // on a working relay (Phase 1 DMs, xpub announce, round-1 share,
+    // round-3 share are all sent over Nostr). If no relay connects
+    // within the grace window, the user is sitting in front of a
+    // dialog that will silently never advance. Surface that with a
+    // loud error rather than a hung progress UI.
+    QTimer::singleShot(kNostrConnectGraceMs, this, [this]() {
+        if (m_final_blob_hex.isEmpty() && m_relay_connected_count == 0) {
+            setStatus(tr(
+                "Cannot reach the Nostr relay — peer communication "
+                "is required for cooperative signing. Cancel this "
+                "trade and try again once Nostr is connected. "
+                "(Settings → Pricoin → Nostr relays.)"), /*error=*/true);
+            if (m_progress_state) {
+                m_progress_state->setText(tr(
+                    "✗ Nostr unreachable — cannot communicate with peer."));
+            }
+        }
+    });
 }
 
 void PricCoopSignDialog::onRunLoadshare()
@@ -786,16 +813,38 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
                     m_in_Z_pub_peer->setText(
                         QString::fromStdString(env["z_pub_spender"].get_str()));
                 }
-                if (env.exists("session_label") && env["session_label"].isStr()
-                    && m_in_session_label) {
-                    m_in_session_label->setText(
-                        QString::fromStdString(env["session_label"].get_str()));
+                // Validate (don't adopt) peer's session_label / payload.
+                // Both sides MUST derive these deterministically from
+                // the swap_id, so accepting peer-supplied values opens
+                // a back-channel for divergence — exactly the bug class
+                // we hit 2026-05-13. If the peer sent something else,
+                // flag it loudly: their binary is misconfigured.
+                if (env.exists("session_label") && env["session_label"].isStr()) {
+                    const QString peer_label = QString::fromStdString(
+                        env["session_label"].get_str());
+                    if (peer_label != m_swap_id) {
+                        setStatus(tr(
+                            "Peer's session_label disagrees with swap_id — "
+                            "their wallet may be on an older binary. "
+                            "Cancel this swap; do not retry until both sides "
+                            "run a version that derives session strings "
+                            "deterministically from swap_id."), /*error=*/true);
+                    }
                 }
-                if (env.exists("session_payload") && env["session_payload"].isStr()
-                    && m_in_session_payload) {
-                    m_in_session_payload->setText(
-                        QString::fromStdString(env["session_payload"].get_str()));
+                if (env.exists("session_payload") && env["session_payload"].isStr()) {
+                    const QString peer_payload = QString::fromStdString(
+                        env["session_payload"].get_str());
+                    if (peer_payload != m_swap_id) {
+                        setStatus(tr(
+                            "Peer's session_payload disagrees with swap_id — "
+                            "binary mismatch. Cancel and retry on matching "
+                            "versions."), /*error=*/true);
+                    }
                 }
+                // Always force our own input back to swap_id — defense
+                // against the user manually editing the field.
+                if (m_in_session_label)   m_in_session_label->setText(m_swap_id);
+                if (m_in_session_payload) m_in_session_payload->setText(m_swap_id);
             }
             setStatus(tr("Buildtx output auto-pasted from peer DM."));
             persistSession();
@@ -937,8 +986,13 @@ void PricCoopSignDialog::persistSession()
     put("T_G", m_T_G);
     put("T_H", m_T_H);
     put("dleq_t", m_dleq_t);
-    put("session_label", m_session_label);
-    put("session_payload", m_session_payload);
+    // session_label / session_payload are intentionally NOT persisted:
+    // they're deterministic from the swap_id and any persisted value
+    // would just be a chance to diverge after a binary upgrade. See
+    // 2026-05-13 root cause: cosigner restored a stale persisted
+    // session_payload from a pre-_ml binary; spender's dialog used the
+    // ctor default (swap_id); dleq_z proofs computed under different
+    // payloads → verify failed at Step 2.
     put("ring_ml_json", m_ring_ml_json);
     put("ring_json", m_ring_json);
 
@@ -1032,8 +1086,9 @@ void PricCoopSignDialog::loadSessionFromRecord(const std::string& json)
     load_str("T_G", m_T_G);
     load_str("T_H", m_T_H);
     load_str("dleq_t", m_dleq_t);
-    load_str("session_label", m_session_label);
-    load_str("session_payload", m_session_payload);
+    // Intentionally do NOT load session_label / session_payload from
+    // the persisted blob — see persistSession() for why. We force
+    // these back to swap_id below (after the rest of restore runs).
     load_str("ring_ml_json", m_ring_ml_json);
     load_str("ring_json", m_ring_json);
 
@@ -1079,8 +1134,16 @@ void PricCoopSignDialog::loadSessionFromRecord(const std::string& json)
     if (m_in_T_G && !m_T_G.isEmpty()) m_in_T_G->setText(m_T_G);
     if (m_in_T_H && !m_T_H.isEmpty()) m_in_T_H->setText(m_T_H);
     if (m_in_X_pub_X && !m_X_pub_X.isEmpty()) m_in_X_pub_X->setText(m_X_pub_X);
-    if (m_in_session_label && !m_session_label.isEmpty()) m_in_session_label->setText(m_session_label);
-    if (m_in_session_payload && !m_session_payload.isEmpty()) m_in_session_payload->setText(m_session_payload);
+    // Force session strings to swap_id, overriding any stale restored
+    // text. Both sides MUST agree on these or every adaptor DLEQ
+    // proof fails to verify at Step 2 (CombineAndWalkML). Tying them
+    // to swap_id is the only way to guarantee bilateral agreement
+    // without a sync DM. Side-channels through the persisted blob
+    // are exactly how 2026-05-13's "dleq_z verify failed" snuck in.
+    m_session_label   = m_swap_id;
+    m_session_payload = m_swap_id;
+    if (m_in_session_label)   m_in_session_label->setText(m_swap_id);
+    if (m_in_session_payload) m_in_session_payload->setText(m_swap_id);
     if (m_in_role) {
         if (!m_role.isEmpty()) m_in_role->setCurrentText(m_role);
     }
@@ -1351,14 +1414,14 @@ void PricCoopSignDialog::tryAutoSendBuildtx()
             env.pushKV("z_pub_spender",
                        m_in_Z_pub_X->text().trimmed().toStdString());
         }
-        if (m_in_session_label) {
-            env.pushKV("session_label",
-                       m_in_session_label->text().trimmed().toStdString());
-        }
-        if (m_in_session_payload) {
-            env.pushKV("session_payload",
-                       m_in_session_payload->text().trimmed().toStdString());
-        }
+        // session_label / session_payload are deterministic from
+        // swap_id on both sides — we still ship them in the envelope
+        // so the receive side can DETECT a version mismatch (its
+        // validator raises a clear error if the peer sends a
+        // non-swap_id value). Do NOT pull from the widget here in
+        // case it's been corrupted; pull straight from m_swap_id.
+        env.pushKV("session_label",   m_swap_id.toStdString());
+        env.pushKV("session_payload", m_swap_id.toStdString());
     }
 
     const QString plaintext = QString::fromStdString(env.write(0));
@@ -1397,8 +1460,23 @@ void PricCoopSignDialog::tryAutoStep1()
     if (!m_in_ring_or_ring_ml
         || m_in_ring_or_ring_ml->toPlainText().trimmed().isEmpty()) return;
     if (m_mode == Mode::PricAdaptor) {
+        // Multi-layer adaptor round 1 needs ALL of: T_G + T_H +
+        // X_pub_X + Z_pub_X + z_share. Previously this gate only
+        // checked T_G + X_pub_X; on the cosigner side that meant
+        // Step 1 could fire after loadshare but BEFORE the spender's
+        // buildtx DM arrived (which is what carries z_other + thus
+        // Z_pub_X). Result: round1_ml fails on Z_pub_X validation
+        // or — worse — the DLEQ proofs end up bound to a stale
+        // Z_pub_X if the field was restored from a prior session.
         if (!m_in_T_G || m_in_T_G->text().trimmed().size() != 66) return;
+        if (!m_in_T_H || m_in_T_H->text().trimmed().size() != 66) return;
         if (!m_in_X_pub_X || m_in_X_pub_X->text().trimmed().size() != 66) return;
+        if (!m_in_Z_pub_X || m_in_Z_pub_X->text().trimmed().size() != 66) return;
+        if (!m_in_z_share || m_in_z_share->text().trimmed().size() != 64) return;
+        // dleq_t must also be present — combine_ml verifies it on
+        // both sides at Step 2, and the validator we run there
+        // wants the proof bytes to parse.
+        if (!m_in_dleq_t || m_in_dleq_t->toPlainText().trimmed().isEmpty()) return;
     } else {
         if (!m_in_z_share || m_in_z_share->text().trimmed().size() != 64) return;
     }
@@ -1510,11 +1588,46 @@ PricCoopSignDialog::callRpc(const std::string& method, const std::string& params
 
 void PricCoopSignDialog::setStatus(const QString& msg, bool error)
 {
-    if (!m_status_label) return;
-    m_status_label->setStyleSheet(error
-        ? QStringLiteral("QLabel { color: #b71c1c; }")
-        : QStringLiteral("QLabel { color: #1b5e20; }"));
-    m_status_label->setText(msg);
+    if (m_status_label) {
+        m_status_label->setStyleSheet(error
+            ? QStringLiteral("QLabel { color: #b71c1c; }")
+            : QStringLiteral("QLabel { color: #1b5e20; }"));
+        m_status_label->setText(msg);
+    }
+    // Mirror to the progress UI so the user-visible label stays in
+    // sync without us having to call two setters at every site.
+    if (m_progress_action) {
+        m_progress_action->setStyleSheet(error
+            ? QStringLiteral("QLabel { color: #b71c1c; padding: 0 8px 8px 8px; }")
+            : QStringLiteral("QLabel { color: #555; padding: 0 8px 8px 8px; }"));
+        m_progress_action->setText(msg);
+    }
+    // Coarse-grained state line — derived from the auto-fire flags
+    // that already track ceremony progress. Cheaper than threading
+    // explicit state updates through every setStatus call site.
+    if (m_progress_state) {
+        QString state;
+        if (!m_final_blob_hex.isEmpty()) {
+            state = tr("Done — cooperative signature produced.");
+        } else if (m_auto_step4_fired || !m_my_s_share.isEmpty()) {
+            state = tr("Step 4 of 4 — assembling pre-signature…");
+        } else if (m_auto_step3_fired || !m_KI.isEmpty()) {
+            state = tr("Step 3 of 4 — exchanging close shares…");
+        } else if (m_auto_step2_fired) {
+            state = tr("Step 2 of 4 — combining round-1 shares…");
+        } else if (m_auto_step1_fired || !m_my_commitment.isEmpty()) {
+            state = tr("Step 1 of 4 — exchanging round-1 shares…");
+        } else if (m_auto_buildtx_fired) {
+            state = tr("Building spend transaction…");
+        } else if (m_auto_loadshare_fired) {
+            state = tr("Recovering joint output share…");
+        } else if (m_auto_partial_computed) {
+            state = tr("Scanning joint stealth output…");
+        } else {
+            state = tr("Connecting…");
+        }
+        m_progress_state->setText(state);
+    }
 }
 
 void PricCoopSignDialog::buildLayout(const QString& title)
@@ -1655,12 +1768,14 @@ void PricCoopSignDialog::buildLayout(const QString& title)
             // (Previously random per-dialog — that was the root cause
             // of the persistent Step-2 failure on 2026-05-11.)
             m_in_session_label->setText(m_swap_id);
-            m_in_session_label->setToolTip(tr("Session label — must match what was used at adaptor-setup time (swap_id)"));
+            m_in_session_label->setReadOnly(true);
+            m_in_session_label->setToolTip(tr("Session label — deterministically derived from swap_id; read-only (manual edits broke DLEQ verify in live testing)"));
             form->addRow(tr("session_label:"), m_in_session_label);
 
             m_in_session_payload = new QLineEdit(box);
             m_in_session_payload->setText(m_swap_id);
-            m_in_session_payload->setToolTip(tr("Session payload — must match what was used at adaptor-setup time (swap_id)"));
+            m_in_session_payload->setReadOnly(true);
+            m_in_session_payload->setToolTip(tr("Session payload — deterministically derived from swap_id; read-only"));
             form->addRow(tr("session_payload:"), m_in_session_payload);
         }
 
@@ -1921,15 +2036,74 @@ void PricCoopSignDialog::buildLayout(const QString& title)
 
     steps_v->addStretch();
     scroll->setWidget(scroll_inner);
+    m_scroll_area = scroll;
     outer->addWidget(scroll, /*stretch=*/1);
+
+    // ─── Progress-only UI (default for live use) ──────────────────
+    // The block above is the "advanced" view exposing every step and
+    // every cryptographic field. For real users we want a one-line
+    // "your trade is running, leave this open" header and a status
+    // line. The advanced view is hidden behind a toggle button so
+    // anyone debugging a stuck swap can still see what's going on.
+    {
+        m_progress_header = new QLabel(this);
+        m_progress_header->setWordWrap(true);
+        m_progress_header->setStyleSheet(
+            QStringLiteral("QLabel { font-size: 14pt; padding: 16px 8px; }"));
+        m_progress_header->setText(tr(
+            "<b>Cooperative signing in progress.</b><br/>"
+            "Leave this window open until the swap completes. The "
+            "ceremony runs automatically — no action needed."));
+        outer->addWidget(m_progress_header);
+
+        m_progress_state = new QLabel(this);
+        m_progress_state->setWordWrap(true);
+        m_progress_state->setStyleSheet(
+            QStringLiteral("QLabel { font-weight: bold; padding: 4px 8px; }"));
+        m_progress_state->setText(tr("Starting…"));
+        outer->addWidget(m_progress_state);
+
+        m_progress_action = new QLabel(this);
+        m_progress_action->setWordWrap(true);
+        m_progress_action->setStyleSheet(
+            QStringLiteral("QLabel { color: #555; padding: 0 8px 8px 8px; }"));
+        outer->addWidget(m_progress_action);
+    }
 
     m_status_label = new QLabel(this);
     m_status_label->setWordWrap(true);
     outer->addWidget(m_status_label);
 
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Close, this);
+    m_btn_toggle_advanced = new QPushButton(tr("Show advanced…"), this);
+    m_btn_toggle_advanced->setCheckable(true);
+    connect(m_btn_toggle_advanced, &QPushButton::toggled, this, [this](bool on) {
+        if (m_scroll_area) m_scroll_area->setVisible(on);
+        if (m_btn_toggle_advanced) {
+            m_btn_toggle_advanced->setText(on ? tr("Hide advanced") : tr("Show advanced…"));
+        }
+    });
+    bb->addButton(m_btn_toggle_advanced, QDialogButtonBox::ActionRole);
     connect(bb, &QDialogButtonBox::rejected, this, &QDialog::accept);
     outer->addWidget(bb);
+}
+
+void PricCoopSignDialog::setProgressOnlyMode(bool on)
+{
+    m_progress_only = on;
+    if (m_scroll_area) m_scroll_area->setVisible(!on);
+    if (m_progress_header) m_progress_header->setVisible(true);
+    if (m_progress_state) m_progress_state->setVisible(true);
+    if (m_progress_action) m_progress_action->setVisible(true);
+    if (m_btn_toggle_advanced) {
+        m_btn_toggle_advanced->setChecked(!on);
+        m_btn_toggle_advanced->setText(on ? tr("Show advanced…") : tr("Hide advanced"));
+    }
+    // Smaller, less-imposing window in progress-only mode.
+    if (on) {
+        resize(560, 220);
+        setMinimumSize(420, 160);
+    }
 }
 
 void PricCoopSignDialog::onStep1Compute()
@@ -1954,8 +2128,16 @@ void PricCoopSignDialog::onStep1Compute()
         m_T_G            = m_in_T_G->text().trimmed();
         m_T_H            = m_in_T_H->text().trimmed();
         m_dleq_t         = m_in_dleq_t->toPlainText().trimmed();
-        m_session_label  = m_in_session_label->text().trimmed();
-        m_session_payload= m_in_session_payload->text().trimmed();
+        // Override the widget reads — these must be bilaterally
+        // identical, and the only value both sides agree on without
+        // a DM round-trip is swap_id. Reading the widget would let a
+        // stale persisted value or a user edit silently break the
+        // peer's DLEQ verify. (Belt-and-suspenders alongside the
+        // restore-time force-reset.)
+        m_session_label  = m_swap_id;
+        m_session_payload= m_swap_id;
+        if (m_in_session_label)   m_in_session_label->setText(m_swap_id);
+        if (m_in_session_payload) m_in_session_payload->setText(m_swap_id);
     }
 
     // Sanity checks — cheap and gives the user better errors than

@@ -7,6 +7,9 @@
 
 #include <QWidget>
 
+#include <map>
+#include <set>
+#include <string>
 #include <vector>
 
 #include <interfaces/wallet.h>
@@ -97,6 +100,14 @@ private:
     QStandardItemModel* m_sw_table_model{nullptr};
 
     std::vector<interfaces::Wallet::PricoinAdaptorSwapSnapshot> m_swaps;
+
+    // Per-swap auto-trigger state: tracks the last observed state so
+    // refreshTable can detect transitions and auto-fire user actions
+    // (e.g. open the presigning flow as soon as BothFunded confirms,
+    // without the user having to click "Advance state").
+    std::map<std::string /*swap_id*/, std::string /*last_state*/>
+        m_last_seen_state;
+    std::set<std::string /*swap_id*/> m_auto_advance_fired;
 
     void buildLayout();
     void refreshTable();

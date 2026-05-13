@@ -1008,9 +1008,19 @@ bool VerifyAdaptorNonceShareML(
         if (!::pricoin::adaptor_ringsig::VerifyDLEQProof(
                 P_pi, z_points, share.dleq_z,
                 ZLabelSpan(), session_payload)) {
+            // session_payload is feed-string for the Fiat-Shamir
+            // challenge. If verifier and prover disagree on it, every
+            // dleq_* on the share fails (this one happens to fire
+            // first because dleq_z is unique to the multi-layer
+            // protocol — pre-_ml binaries don't produce or check it).
+            // Log it on both sides and the divergent byte stands out.
             LogWarning("Pricoin VerifyAdaptorNonceShareML: dleq_z verify failed "
-                       "(peer's Z_pub %s, D_share %s)",
-                       HexStr(Z_pub_X), HexStr(share.D_share));
+                       "(peer's Z_pub %s, D_share %s, "
+                       "verifier session_payload='%s' [%u bytes])",
+                       HexStr(Z_pub_X), HexStr(share.D_share),
+                       std::string(reinterpret_cast<const char*>(session_payload.data()),
+                                   session_payload.size()),
+                       (unsigned)session_payload.size());
             return false;
         }
     }

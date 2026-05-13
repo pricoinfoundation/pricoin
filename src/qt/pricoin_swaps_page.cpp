@@ -272,6 +272,60 @@ void PricoinSwapsPage::refreshTable()
         return;
     }
     m_swaps = m_model->wallet().adaptorSwapList();
+
+    // Detect state transitions and auto-fire the next-step UI so the
+    // user doesn't have to keep clicking "Advance state". Per the
+    // 2026-05-13 UX direction (memory: swap_ux_target.md), after a
+    // swap is matched and Start Trade is clicked, every state
+    // transition should drive itself forward; the user only sees
+    // progress, not buttons. Specifically: on BothFunded, we want
+    // the "Set pre-signatures" flow to open on BOTH sides so the
+    // cooperative ceremony fires without manual coordination.
+    std::vector<std::string> auto_advance_sids;
+    for (const auto& s : m_swaps) {
+        auto it = m_last_seen_state.find(s.swap_id);
+        const std::string prev = (it == m_last_seen_state.end()) ? "" : it->second;
+        m_last_seen_state[s.swap_id] = s.state;
+        // Only fire on the FIRST refresh that sees the new state, and
+        // only once per swap (m_auto_advance_fired guards re-entry).
+        if (s.state == "both_funded" && prev != "both_funded"
+            && !m_auto_advance_fired.contains(s.swap_id)) {
+            auto_advance_sids.push_back(s.swap_id);
+            m_auto_advance_fired.insert(s.swap_id);
+        }
+    }
+    // Defer the actual onAdvanceClicked invocation so we don't open a
+    // modal dialog from inside refreshTable (which would recurse via
+    // auto-refresh tick or block the table rebuild). Queued connection
+    // = next event loop spin.
+    for (const auto& sid : auto_advance_sids) {
+        QMetaObject::invokeMethod(this, [this, sid]() {
+            // Re-check the current state at fire time — user may have
+            // already clicked through manually, or the swap may have
+            // advanced past both_funded on its own.
+            for (const auto& s : m_swaps) {
+                if (s.swap_id != sid) continue;
+                if (s.state != "both_funded") return;
+                break;
+            }
+            // Select the row so onAdvanceClicked picks it up via
+            // selectedSwapId(). Falls back to a no-op if the row isn't
+            // selectable (e.g. terminal-filter hides it).
+            for (int row = 0; row < m_table_model->rowCount(); ++row) {
+                auto* item = m_table_model->item(row, 0);
+                if (!item) continue;
+                bool ok = false;
+                const auto src_idx = item->data(Qt::UserRole + 1)
+                                         .toULongLong(&ok);
+                if (!ok || src_idx >= m_swaps.size()) continue;
+                if (m_swaps[src_idx].swap_id != sid) continue;
+                m_table->selectRow(row);
+                onAdvanceClicked();
+                return;
+            }
+        }, Qt::QueuedConnection);
+    }
+
     // Apply the "hide terminal" filter so the table doesn't bloat with
     // completed / aborted / refunded swaps once an operator has run a
     // few. m_swaps still holds the full list so the row-id↔snapshot
@@ -1167,6 +1221,7 @@ void PricoinSwapsPage::onAdvanceClicked()
             [this, &dlg, sid, pric_p]() {
             PricCoopSignDialog d(m_model, PricCoopSignDialog::Mode::PricAdaptor,
                                  tr("PRIC claim adaptor pre-sig"), sid, &dlg);
+            d.setProgressOnlyMode(true);
             d.exec();
             if (!d.finalBlobHex().isEmpty()) {
                 pric_p->setPlainText(d.finalBlobHex());
@@ -1198,6 +1253,7 @@ void PricoinSwapsPage::onAdvanceClicked()
             [this, &dlg, sid, pric_r]() {
             PricCoopSignDialog d(m_model, PricCoopSignDialog::Mode::PricPlain,
                                  tr("PRIC refund cooperative sig"), sid, &dlg);
+            d.setProgressOnlyMode(true);
             d.exec();
             if (!d.finalBlobHex().isEmpty()) {
                 pric_r->setPlainText(d.finalBlobHex());
