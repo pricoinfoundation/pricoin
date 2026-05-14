@@ -117,6 +117,17 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
     m_relay_urls = PricoinRelaySettingsDialog::loadFromSettings();
     buildLayout(title);
 
+    // Pin session strings to swap_id IMMEDIATELY after layout build,
+    // before any session-restore or DM handler can touch them. These
+    // are deterministic; nothing should ever load a different value.
+    // 2026-05-14: tightened after a Mac wallet was found running with
+    // a leaked self-test value 'ml-coop-adap-t-1' that had been
+    // persisted from a prior session and was overriding the live
+    // swap_id even after the load-time force-reset. Setting here
+    // makes the value correct from the moment the member exists.
+    m_session_label   = m_swap_id;
+    m_session_payload = m_swap_id;
+
     // Pre-fill from the swap record where we can: adaptor materials
     // (claim leg only) + buildtx-helper joint-funding fields + the
     // refund nlocktime (refund leg).
@@ -1140,6 +1151,12 @@ void PricCoopSignDialog::loadSessionFromRecord(const std::string& json)
     // to swap_id is the only way to guarantee bilateral agreement
     // without a sync DM. Side-channels through the persisted blob
     // are exactly how 2026-05-13's "dleq_z verify failed" snuck in.
+    // We re-pin here too (ctor pins immediately post-buildLayout)
+    // because loadSessionFromRecord runs as part of dialog
+    // construction and is the most likely place a stale value would
+    // sneak in (load_str is now a no-op for these keys, but defense
+    // in depth — if ANY future code path mutates these mid-restore,
+    // this catches it).
     m_session_label   = m_swap_id;
     m_session_payload = m_swap_id;
     if (m_in_session_label)   m_in_session_label->setText(m_swap_id);
@@ -1606,17 +1623,29 @@ void PricCoopSignDialog::setStatus(const QString& msg, bool error)
     // that already track ceremony progress. Cheaper than threading
     // explicit state updates through every setStatus call site.
     if (m_progress_state) {
+        // States ordered most-advanced → least-advanced; first match
+        // wins. "fired" means we kicked off the RPC for that step;
+        // having the step's OUTPUT in a member shadow doesn't bump
+        // us forward (the next step has to actually fire). Earlier
+        // version mislabeled "Step 3 done, waiting for peer s_share"
+        // as "Step 4" because m_my_s_share-non-empty looked like 4.
         QString state;
         if (!m_final_blob_hex.isEmpty()) {
             state = tr("Done — cooperative signature produced.");
-        } else if (m_auto_step4_fired || !m_my_s_share.isEmpty()) {
+        } else if (m_auto_step4_fired) {
             state = tr("Step 4 of 4 — assembling pre-signature…");
-        } else if (m_auto_step3_fired || !m_KI.isEmpty()) {
-            state = tr("Step 3 of 4 — exchanging close shares…");
+        } else if (!m_my_s_share.isEmpty()) {
+            state = tr("Step 3 of 4 done — waiting for peer's close share…");
+        } else if (m_auto_step3_fired) {
+            state = tr("Step 3 of 4 — computing close share…");
+        } else if (!m_KI.isEmpty()) {
+            state = tr("Step 2 of 4 done — running Step 3…");
         } else if (m_auto_step2_fired) {
             state = tr("Step 2 of 4 — combining round-1 shares…");
-        } else if (m_auto_step1_fired || !m_my_commitment.isEmpty()) {
-            state = tr("Step 1 of 4 — exchanging round-1 shares…");
+        } else if (!m_my_commitment.isEmpty()) {
+            state = tr("Step 1 of 4 done — waiting for peer's round-1 share…");
+        } else if (m_auto_step1_fired) {
+            state = tr("Step 1 of 4 — computing my round-1 share…");
         } else if (m_auto_buildtx_fired) {
             state = tr("Building spend transaction…");
         } else if (m_auto_loadshare_fired) {
@@ -2099,10 +2128,12 @@ void PricCoopSignDialog::setProgressOnlyMode(bool on)
         m_btn_toggle_advanced->setChecked(!on);
         m_btn_toggle_advanced->setText(on ? tr("Show advanced…") : tr("Hide advanced"));
     }
-    // Smaller, less-imposing window in progress-only mode.
+    // Compact window in progress-only mode, but tall enough to show
+    // the header + state + status + bottom button bar without the
+    // status line getting clipped under the buttons.
     if (on) {
-        resize(560, 220);
-        setMinimumSize(420, 160);
+        resize(640, 360);
+        setMinimumSize(560, 320);
     }
 }
 

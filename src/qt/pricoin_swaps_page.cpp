@@ -286,12 +286,54 @@ void PricoinSwapsPage::refreshTable()
         auto it = m_last_seen_state.find(s.swap_id);
         const std::string prev = (it == m_last_seen_state.end()) ? "" : it->second;
         m_last_seen_state[s.swap_id] = s.state;
-        // Only fire on the FIRST refresh that sees the new state, and
-        // only once per swap (m_auto_advance_fired guards re-entry).
-        if (s.state == "both_funded" && prev != "both_funded"
-            && !m_auto_advance_fired.contains(s.swap_id)) {
+        // Re-entry guard: m_auto_advance_fired tracks "we already
+        // fired auto-advance at LEAST ONCE for this swap during this
+        // session". We need to allow a follow-up auto-advance after
+        // state changes — e.g., setup → adaptor_ready (Bob's t/T_G
+        // generation) and later both_funded → pre_signed (cooperative
+        // ceremony). Track per-state instead.
+        const std::string fire_key = s.swap_id + "@" + s.state;
+        if (m_auto_advance_fired.contains(fire_key)) continue;
+
+        bool should_fire = false;
+        if (s.state == "setup" && s.role == "bob") {
+            // Bob (PRIC buyer) is the only side that needs to act at
+            // setup state: derive r/t/T_G/T_H/dleq_t, set adaptor
+            // materials, DM Alice. Alice's onAdvanceClicked at setup
+            // just sets a "waiting" status, so firing it would be a
+            // no-op. Fire only for Bob.
+            should_fire = true;
+        }
+        if (s.state == "adaptor_ready" && s.role == "bob") {
+            // Bob also funds the foreign chain (BTC/LTC). His
+            // onAdvanceClicked at adaptor_ready estimates fee, calls
+            // pricoin_btc_fund_swap, broadcasts the 2-of-2 funding
+            // tx, and DMs Alice the txid for her watcher. Alice's
+            // path at this state is just "wait for tx-announce DM",
+            // so fire only for Bob.
+            should_fire = true;
+        }
+        // NOTE: btc_funded → both_funded (Alice's PRIC funding) is
+        // intentionally NOT auto-fired. The current protocol order
+        // (funding before PreSigned) means Alice's onAdvanceClicked
+        // at btc_funded surfaces an "I ACCEPT" safety dialog warning
+        // that PRIC funds may be unrecoverable if the swap stalls
+        // before refund presigs are exchanged. Auto-firing would
+        // either trigger that dialog (worse UX than the current
+        // manual click) or, if we suppress the dialog, silently
+        // accept the strand-funds risk on the user's behalf. Wait
+        // for the protocol-order restructure (PreSigned BEFORE
+        // funding — see swap_automation memory) before this step
+        // becomes safe to auto-fire.
+        if (s.state == "both_funded" && prev != "both_funded") {
+            // Both legs confirmed — open the "Set pre-signatures" flow
+            // on BOTH sides so the cooperative ceremony fires without
+            // manual coordination. Per-state key gate guards re-entry.
+            should_fire = true;
+        }
+        if (should_fire) {
             auto_advance_sids.push_back(s.swap_id);
-            m_auto_advance_fired.insert(s.swap_id);
+            m_auto_advance_fired.insert(fire_key);
         }
     }
     // Defer the actual onAdvanceClicked invocation so we don't open a
