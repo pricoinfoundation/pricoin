@@ -249,7 +249,18 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
             accept();
             return;
         }
+        // Always start from the top of the chain — each tryAuto step
+        // is gated on its own preconditions, so calling them in order
+        // gracefully resumes whatever was in flight. Important on
+        // dialog reopen after a binary upgrade or daemon restart,
+        // where m_my_commitment / m_in_peer_share_json may be present
+        // but the auto-fire flags are false (they aren't persisted),
+        // so the next-step would otherwise sit idle.
         tryAutoComputeJointscanPartial();
+        tryAutoStep1();
+        tryAutoStep2();
+        tryAutoStep3();
+        tryAutoStep4();
     }, Qt::QueuedConnection);
 
     // Nostr-connectivity gate: the entire auto-coord chain is gated
@@ -867,25 +878,19 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
     if (!env.exists("round")) return;
     const int round = env["round"].getInt<int>();
     if (round == 1 && env.exists("share") && m_in_peer_share_json) {
-        // Overwrite when (a) the field is empty, or (b) the field is
-        // populated with a STALE share that's missing the multi-layer
-        // dleq_z field but the incoming share has it. Case (b) covers
-        // the binary-upgrade-mid-ceremony scenario (a pre-_ml binary
-        // sent the first DM, then the upgraded binary sends a complete
-        // one — without this, the upgraded share is ignored and Step 2
-        // keeps failing on a stale cache).
+        // When we haven't yet run Step 2 (m_KI empty), the peer share
+        // hasn't been consumed — accept any incoming. This matters
+        // after a binary upgrade where the persisted blob still has
+        // an old share bound to a stale session_payload: the
+        // dleq_z-presence check we used to do is necessary-but-not-
+        // sufficient (both old and new shares can have dleq_z; what
+        // matters is which one is bound to the CURRENT session
+        // strings on the peer's running dialog).
         const std::string current = m_in_peer_share_json->toPlainText().trimmed().toStdString();
-        bool replace = current.empty();
+        bool replace = current.empty() || m_KI.isEmpty();
         if (!replace) {
-            UniValue cur, incoming;
-            if (cur.read(current) && cur.isObject()) {
-                const bool cur_has_dleq_z =
-                    cur.exists("dleq_z") && cur["dleq_z"].isStr();
-                const UniValue& sh = env["share"];
-                const bool inc_has_dleq_z =
-                    sh.isObject() && sh.exists("dleq_z") && sh["dleq_z"].isStr();
-                if (!cur_has_dleq_z && inc_has_dleq_z) replace = true;
-            }
+            // Step 2 already ran successfully and produced KI. The
+            // peer should not be sending more round-1 shares; ignore.
         }
         if (replace) {
             m_in_peer_share_json->setPlainText(
