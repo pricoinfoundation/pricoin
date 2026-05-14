@@ -724,10 +724,20 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
             if (!env.exists("partial") || !env["partial"].isStr()) return;
             const std::string partial = env["partial"].get_str();
             if (partial.size() != 66) return;  // 33-byte hex
-            if (m_in_ls_peer_partial && m_in_ls_peer_partial->text().trimmed().isEmpty()) {
-                m_in_ls_peer_partial->setText(QString::fromStdString(partial));
+            // Accept overwrites until loadshare has consumed the
+            // partials (m_x_share set). After loadshare runs, the
+            // partials have been baked into x_share / blind; replacing
+            // them would just be ignored. Same staleness fix class
+            // as round-1 / round-3 (2026-05-14).
+            if (!m_in_ls_peer_partial) return;
+            const QString incoming = QString::fromStdString(partial);
+            const QString current  = m_in_ls_peer_partial->text().trimmed();
+            const bool consumed = !m_x_share.isEmpty();
+            if (!consumed && (current.isEmpty() || current != incoming)) {
+                m_in_ls_peer_partial->setText(incoming);
                 setStatus(tr("Peer scan partial auto-pasted from DM."));
                 persistSession();
+                m_auto_loadshare_fired = false;
                 tryAutoLoadshare();
                 // Bilateral resend: if I sent my partial before peer's
                 // dialog was subscribed, peer never received it. Now
@@ -746,21 +756,34 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
             if (!env.exists("x_pub") || !env["x_pub"].isStr()) return;
             const std::string xpub = env["x_pub"].get_str();
             if (xpub.size() != 66) return;
+            // Accept overwrites until Step 2 has consumed X_pub_peer
+            // / Z_pub_peer (m_KI set). After that, replacing them
+            // would just produce inconsistent state.
+            const bool consumed = !m_KI.isEmpty();
             bool any_change = false;
-            if (m_in_X_pub_peer && m_in_X_pub_peer->text().trimmed().isEmpty()) {
-                m_in_X_pub_peer->setText(QString::fromStdString(xpub));
-                any_change = true;
+            if (!consumed && m_in_X_pub_peer) {
+                const QString incoming = QString::fromStdString(xpub);
+                const QString current  = m_in_X_pub_peer->text().trimmed();
+                if (current.isEmpty() || current != incoming) {
+                    m_in_X_pub_peer->setText(incoming);
+                    any_change = true;
+                }
             }
-            if (env.exists("z_pub") && env["z_pub"].isStr()
-                && m_in_Z_pub_peer && m_in_Z_pub_peer->text().trimmed().isEmpty()) {
+            if (!consumed && env.exists("z_pub") && env["z_pub"].isStr()
+                && m_in_Z_pub_peer) {
                 const std::string zpub = env["z_pub"].get_str();
                 if (zpub.size() == 66) {
-                    m_in_Z_pub_peer->setText(QString::fromStdString(zpub));
-                    any_change = true;
+                    const QString incoming = QString::fromStdString(zpub);
+                    const QString current  = m_in_Z_pub_peer->text().trimmed();
+                    if (current.isEmpty() || current != incoming) {
+                        m_in_Z_pub_peer->setText(incoming);
+                        any_change = true;
+                    }
                 }
             }
             if (any_change) {
                 setStatus(tr("Peer X_pub/Z_pub auto-pasted from DM."));
+                m_auto_step1_fired = false;
                 tryAutoStep1();
                 // Bilateral resend (see jointscan above).
                 m_auto_xpub_announced = false;
@@ -771,24 +794,40 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
 
         if (kind == "buildtx") {
             // Cosigner-side auto-fill from spender's buildtx output.
-            // Only meaningful if I'm the cosigner — but we can fill
-            // even if I'm spender (idempotent: skip if my fields
-            // already non-empty).
-            if (env.exists("sighash") && env["sighash"].isStr()
-                && m_in_msg && m_in_msg->text().trimmed().isEmpty()) {
-                m_in_msg->setText(QString::fromStdString(env["sighash"].get_str()));
+            // Accept overwrites until Step 2 has consumed these
+            // (m_KI set) — afterwards changing them would just
+            // produce inconsistent state. The session_id / ring_hash
+            // / joint_output_id paths already overwrite
+            // unconditionally because they MUST agree across both
+            // sides; we keep that behavior. (2026-05-14 staleness
+            // hardening — same class as round-1 / round-3.)
+            const bool consumed_for_step2 = !m_KI.isEmpty();
+            auto set_if_changed_le = [&](QLineEdit* w, const QString& incoming) {
+                if (!w) return;
+                if (consumed_for_step2) return;
+                const QString current = w->text().trimmed();
+                if (current.isEmpty() || current != incoming) w->setText(incoming);
+            };
+            auto set_if_changed_txt = [&](QPlainTextEdit* w, const QString& incoming) {
+                if (!w) return;
+                if (consumed_for_step2) return;
+                const QString current = w->toPlainText().trimmed();
+                if (current.isEmpty() || current != incoming) w->setPlainText(incoming);
+            };
+            if (env.exists("sighash") && env["sighash"].isStr()) {
+                set_if_changed_le(m_in_msg,
+                    QString::fromStdString(env["sighash"].get_str()));
             }
-            if (env.exists("pi") && m_in_pi && m_in_pi->text().trimmed().isEmpty()) {
-                m_in_pi->setText(QString::number(env["pi"].getInt<int>()));
+            if (env.exists("pi")) {
+                set_if_changed_le(m_in_pi,
+                    QString::number(env["pi"].getInt<int>()));
             }
-            if (env.exists("ring_or_ml") && m_in_ring_or_ring_ml
-                && m_in_ring_or_ring_ml->toPlainText().trimmed().isEmpty()) {
-                m_in_ring_or_ring_ml->setPlainText(
+            if (env.exists("ring_or_ml")) {
+                set_if_changed_txt(m_in_ring_or_ring_ml,
                     QString::fromStdString(env["ring_or_ml"].write(2)));
             }
-            if (env.exists("joint_pubkey") && env["joint_pubkey"].isStr()
-                && m_in_joint_pubkey && m_in_joint_pubkey->text().trimmed().isEmpty()) {
-                m_in_joint_pubkey->setText(
+            if (env.exists("joint_pubkey") && env["joint_pubkey"].isStr()) {
+                set_if_changed_le(m_in_joint_pubkey,
                     QString::fromStdString(env["joint_pubkey"].get_str()));
             }
             if (env.exists("session_id") && env["session_id"].isStr()
@@ -812,27 +851,21 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
             // z_other → cosigner's z_share, for BOTH modes. adaptor_ml
             // needs z_X to compute D_share at round1; without it the
             // sig fails consensus VerifyMultiLayer.
-            if (env.exists("z_other") && env["z_other"].isStr()
-                && m_in_z_share && m_in_z_share->text().trimmed().isEmpty()) {
-                m_in_z_share->setText(
-                    QString::fromStdString(env["z_other"].get_str()));
-                if (m_in_Z_pub_X && m_mode == Mode::PricAdaptor
-                    && m_in_Z_pub_X->text().trimmed().isEmpty()) {
-                    const QString zpub = DerivePubkeyHex(m_in_z_share->text().trimmed());
-                    if (!zpub.isEmpty()) m_in_Z_pub_X->setText(zpub);
+            if (env.exists("z_other") && env["z_other"].isStr()) {
+                const QString incoming = QString::fromStdString(env["z_other"].get_str());
+                set_if_changed_le(m_in_z_share, incoming);
+                if (m_in_Z_pub_X && m_mode == Mode::PricAdaptor) {
+                    const QString zpub = DerivePubkeyHex(incoming);
+                    if (!zpub.isEmpty()) set_if_changed_le(m_in_Z_pub_X, zpub);
                 }
             }
             if (m_mode == Mode::PricAdaptor) {
-                if (env.exists("x_pub_spender") && env["x_pub_spender"].isStr()
-                    && m_in_X_pub_peer && m_in_X_pub_peer->text().trimmed().isEmpty()) {
-                    // Cosigner: peer's X_pub goes into the X_pub_peer
-                    // field (which the existing Step 2 logic reads).
-                    m_in_X_pub_peer->setText(
+                if (env.exists("x_pub_spender") && env["x_pub_spender"].isStr()) {
+                    set_if_changed_le(m_in_X_pub_peer,
                         QString::fromStdString(env["x_pub_spender"].get_str()));
                 }
-                if (env.exists("z_pub_spender") && env["z_pub_spender"].isStr()
-                    && m_in_Z_pub_peer && m_in_Z_pub_peer->text().trimmed().isEmpty()) {
-                    m_in_Z_pub_peer->setText(
+                if (env.exists("z_pub_spender") && env["z_pub_spender"].isStr()) {
+                    set_if_changed_le(m_in_Z_pub_peer,
                         QString::fromStdString(env["z_pub_spender"].get_str()));
                 }
                 // Validate (don't adopt) peer's session_label / payload.
@@ -909,11 +942,20 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
             tryAutoSendRound1();
         }
     } else if (round == 3 && env.exists("s_share") && m_in_peer_s_share) {
-        if (m_in_peer_s_share->text().trimmed().isEmpty()) {
-            m_in_peer_s_share->setText(
-                QString::fromStdString(env["s_share"].get_str()));
+        // Accept any incoming s_share until Step 4 has produced the
+        // final blob. Same staleness class as round 1 — a peer's
+        // s_share restored from yesterday's blob blocks today's
+        // fresh DM under the empty-only check. (2026-05-14 fix.)
+        const QString incoming = QString::fromStdString(env["s_share"].get_str());
+        const QString current  = m_in_peer_s_share->text().trimmed();
+        if (m_final_blob_hex.isEmpty() &&
+            (current.isEmpty() || current != incoming)) {
+            m_in_peer_s_share->setText(incoming);
             setStatus(tr("Peer s_share auto-pasted from DM."));
             persistSession();
+            // Reset auto-fire flag so a stale earlier attempt that
+            // failed under a different s_share doesn't block re-fire.
+            m_auto_step4_fired = false;
             tryAutoStep4();
             // Bilateral resend (same reasoning as round 1).
             m_auto_step3_dm_sent = false;
