@@ -69,8 +69,19 @@ bool Add(::wallet::CWallet& wallet,
     }
     WalletBatch batch(wallet.GetDatabase());
     if (!batch.WritePricoinBroadcastedKi(key_image, txid)) {
-        LOCK(g_mutex);
-        g_cache[&wallet].erase(key_image);
+        // 2026-05-14: DO NOT erase the in-memory entry on DB-write
+        // failure. The in-memory cache is the picker's first line of
+        // defense against same-session re-picks; dropping it because
+        // the wallet DB had a transient hiccup means the very next
+        // walletsendct_ring call would re-pick this same input and
+        // produce a BIP125 RBF conflict (or, on chain, a double-
+        // spend). The DB write is for persistence across restarts;
+        // forfeiting that on failure is fine. A subsequent successful
+        // Add for any future spend will rewrite the row.
+        LogWarning("Pricoin broadcasted-KI store: DB write failed for "
+                   "ki=%s tx=%s — keeping in-memory entry; "
+                   "persistence may not survive restart\n",
+                   HexStr(key_image), txid.ToString());
         return false;
     }
     return true;

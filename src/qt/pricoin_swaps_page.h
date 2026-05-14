@@ -122,6 +122,18 @@ private:
     // accepted the event.
     bool sendSwapCoordDM(const std::string& swap_id,
                           const QJsonObject& msg);
+
+    // Headless companion to onAdaptPricClaimClicked: adapts the PRIC
+    // claim pre-sig with the stored t_secret and broadcasts, with no
+    // dialog. Used by the pre_signed auto-trigger so Bob doesn't have
+    // to click "Adapt + broadcast PRIC claim" manually.
+    bool autoAdaptPricClaim(const std::string& swap_id);
+
+    // Headless Alice-side LTC HTLC claim. Pulls dest from
+    // -pricoinltcclaimaddr config + t from the swap's snap.t_secret
+    // (set by the wallet's tx-scan extractor when Bob's PRIC claim
+    // hit chain). Used by the pric_claimed auto-trigger.
+    bool autoLtcClaim(const std::string& swap_id);
 };
 
 #endif // BITCOIN_QT_PRICOIN_SWAPS_PAGE_H

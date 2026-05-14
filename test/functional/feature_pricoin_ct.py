@@ -242,14 +242,23 @@ class PricoinCTTest(BitcoinTestFramework):
                                first["txid"], True)["ct_bundle"]["ring_inputs"]}
         second = bob.walletsendct_ring(carol_stealth, 1.0, 0.01, 4)
         mempool_after = node.getrawmempool()
-        assert second["txid"] in mempool_after, "second tx must accept"
-        assert first["txid"] in mempool_after, \
-            "first tx must NOT be evicted (no RBF replacement happens)"
         second_input_kis = {ri["key_image"]
                             for ri in node.getrawtransaction(
                                 second["txid"], True)["ct_bundle"]["ring_inputs"]}
+        # Diagnostic dump on failure — CI ran into this 2026-05-14
+        # and we couldn't tell whether it was an actual filter miss
+        # (same KI) or a non-RBF eviction (different KI but first
+        # evicted anyway). Print enough to discriminate.
+        diag = (
+            f"first.txid={first['txid']} kis={sorted(first_input_kis)}\n"
+            f"second.txid={second['txid']} kis={sorted(second_input_kis)}\n"
+            f"mempool_after={sorted(mempool_after)}\n"
+            f"ki_overlap={first_input_kis & second_input_kis}\n")
+        assert second["txid"] in mempool_after, f"second tx must accept\n{diag}"
+        assert first["txid"] in mempool_after, \
+            f"first tx must NOT be evicted (no RBF replacement happens)\n{diag}"
         assert first_input_kis.isdisjoint(second_input_kis), \
-            "second tx must pick disjoint inputs from first"
+            f"second tx must pick disjoint inputs from first\n{diag}"
         # Confirm both and mine forward so subsequent sections see a
         # clean mempool + the expected balances.
         self.generatetoaddress(node, 1, alice_addr)

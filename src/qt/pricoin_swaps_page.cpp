@@ -331,6 +331,31 @@ void PricoinSwapsPage::refreshTable()
             // manual coordination. Per-state key gate guards re-entry.
             should_fire = true;
         }
+        if (s.state == "pre_signed" && s.role == "bob") {
+            // Bob (PRIC buyer) holds t_secret. At pre_signed he can
+            // adapt the cooperative PRIC claim pre-sig and broadcast.
+            // Alice's path at pre_signed is "wait for Bob's PRIC claim
+            // to confirm" — handled by her chain watcher, no UI
+            // action. Headless variant skips the dialog.
+            QMetaObject::invokeMethod(this, [this, sid = s.swap_id]() {
+                autoAdaptPricClaim(sid);
+            }, Qt::QueuedConnection);
+            m_auto_advance_fired.insert(fire_key);
+            continue;  // bypass the onAdvanceClicked path below
+        }
+        if (s.state == "pric_claimed" && s.role == "alice"
+            && s.foreign_chain == "ltc") {
+            // Alice extracts t from Bob's on-chain PRIC claim (handled
+            // by the wallet tx-scan path → SetTSecret → SetPricClaimed)
+            // and now needs to spend the LTC HTLC. Headless if
+            // -pricoinltcclaimaddr is configured; otherwise leaves
+            // the manual button as the fallback.
+            QMetaObject::invokeMethod(this, [this, sid = s.swap_id]() {
+                autoLtcClaim(sid);
+            }, Qt::QueuedConnection);
+            m_auto_advance_fired.insert(fire_key);
+            continue;
+        }
         if (should_fire) {
             auto_advance_sids.push_back(s.swap_id);
             m_auto_advance_fired.insert(fire_key);
@@ -2121,6 +2146,113 @@ void PricoinSwapsPage::onAdaptPricClaimClicked()
         .arg(txid.left(16)));
     refreshTable();
     onSwapwatchRefresh();
+}
+
+bool PricoinSwapsPage::autoLtcClaim(const std::string& sid)
+{
+    // Alice's headless LTC HTLC claim. Pulls t_secret from the swap
+    // record (set by the wallet's tx-scan extractor when Bob's PRIC
+    // claim hit chain), the destination from -pricoinltcclaimaddr,
+    // and a sane default fee. No dialog. Skipped if config is missing
+    // — the user can still click the manual button.
+    if (!m_model) return false;
+    auto snap_opt = m_model->wallet().adaptorSwapGet(sid);
+    if (!snap_opt) return false;
+    if (snap_opt->role != "alice") return false;
+    if (snap_opt->foreign_chain != "ltc") return false;
+    if (!snap_opt->has_t) {
+        // Wallet auto-extractor hasn't yet seen Bob's claim tx; will
+        // be re-checked on the next refreshTable tick.
+        return false;
+    }
+    const std::string dest = gArgs.GetArg("-pricoinltcclaimaddr", "");
+    if (dest.empty()) {
+        setStatus(tr("Auto: LTC claim — no -pricoinltcclaimaddr set in "
+                      "pricoin.conf; click \"Adapt + broadcast LTC claim\" "
+                      "manually, or set the config and restart."), true);
+        return false;
+    }
+    UniValue p{UniValue::VARR};
+    p.push_back(sid);
+    p.push_back("");        // empty t_hex → use stored t_secret (has_t == true)
+    p.push_back(dest);
+    p.push_back(1000);      // fee_sat
+    std::string err;
+    auto r = CallWalletRpc(m_model, "pricoin_ltc_claim_swap", p, &err);
+    if (!r) {
+        setStatus(tr("Auto: LTC claim failed: %1")
+            .arg(QString::fromStdString(err)), true);
+        return false;
+    }
+    const QString txid = QString::fromStdString((*r)["txid"].get_str());
+    setStatus(tr("Auto: LTC claim broadcast — txid %1… (watching for confirmations).")
+        .arg(txid.left(16)));
+    refreshTable();
+    onSwapwatchRefresh();
+    return true;
+}
+
+bool PricoinSwapsPage::autoAdaptPricClaim(const std::string& sid)
+{
+    // Headless variant of onAdaptPricClaimClicked — same RPC call,
+    // no dialog. Used by the pre_signed auto-trigger so Bob's PRIC
+    // claim broadcasts without manual button-click. Returns true on
+    // success.
+    if (!m_model) return false;
+    auto snap_opt = m_model->wallet().adaptorSwapGet(sid);
+    if (!snap_opt) return false;
+    const std::string& blob = snap_opt->pric_claim_adaptor_session_json;
+    if (blob.empty()) {
+        setStatus(tr("Auto: PRIC claim — coopsign session JSON missing on "
+                      "swap record; can't extract tx_hex/ring/msg."), true);
+        return false;
+    }
+    UniValue j;
+    if (!j.read(blob) || !j.isObject()) {
+        setStatus(tr("Auto: PRIC claim — coopsign session JSON unparseable."), true);
+        return false;
+    }
+    if (!j.exists("unsigned_tx_hex") || !j["unsigned_tx_hex"].isStr()) {
+        setStatus(tr("Auto: PRIC claim — session missing unsigned_tx_hex."), true);
+        return false;
+    }
+    if (!j.exists("msg_hex") || !j["msg_hex"].isStr()) {
+        setStatus(tr("Auto: PRIC claim — session missing msg_hex."), true);
+        return false;
+    }
+    // Prefer session's ring_json (multi-layer {P,W} format).
+    UniValue ring_v;
+    if (j.exists("ring_json") && j["ring_json"].isStr()
+        && ring_v.read(j["ring_json"].get_str()) && ring_v.isArray()) {
+        // ok
+    } else if (!snap_opt->pric_claim_ring_hex.empty()) {
+        ring_v = UniValue{UniValue::VARR};
+        for (const auto& h : snap_opt->pric_claim_ring_hex) {
+            ring_v.push_back(h);
+        }
+    } else {
+        setStatus(tr("Auto: PRIC claim — no ring data available."), true);
+        return false;
+    }
+    UniValue p{UniValue::VARR};
+    p.push_back(sid);
+    p.push_back(j["unsigned_tx_hex"].get_str());
+    p.push_back(ring_v);
+    p.push_back(j["msg_hex"].get_str());
+    p.push_back(1);  // min_confirmations
+    std::string err;
+    auto r = CallWalletRpc(m_model, "pricoin_swapwatch_adapt_pric_claim", p, &err);
+    if (!r) {
+        setStatus(tr("Auto: Adapt+broadcast PRIC failed: %1")
+            .arg(QString::fromStdString(err)), true);
+        return false;
+    }
+    const QString txid = QString::fromStdString((*r)["txid"].get_str());
+    setStatus(tr("Auto: PRIC claim broadcast — txid %1… (watching for confirmations).")
+        .arg(txid.left(16)));
+    refreshTable();
+    onSwapwatchRefresh();
+    return true;
 }
 
 void PricoinSwapsPage::onSwapwatchRemoveClicked()
