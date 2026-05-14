@@ -243,10 +243,40 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
         // restore set m_final_blob_hex), auto-accept on construction
         // so the outer dialog's Phase-4 chain proceeds without
         // forcing the user to re-run the ceremony.
+        //
+        // BUT: before closing, re-send any DMs the peer might be
+        // waiting on. The most common stuck scenario is "our side
+        // completed, peer stuck at Step-3-done because our s_share
+        // DM was lost." Resending our own round-1 share + round-3
+        // s_share + buildtx envelope is idempotent on the peer (the
+        // staleness checks in their receive handler will accept the
+        // overwrite while their step hasn't been consumed). Fixes
+        // the 2026-05-14 case where Mac's claim completed but
+        // Linux's claim was stuck waiting for Mac's s_share.
         if (!m_final_blob_hex.isEmpty()) {
-            setStatus(tr("Auto: previous session completed — final blob "
-                          "restored, dialog closing."));
-            accept();
+            // Wait until Nostr connects (m_relay_connected_count>0)
+            // before declaring "previous session done" — otherwise
+            // we close before any resend DM has gone out. Hand off
+            // to a short delayed retry.
+            auto try_resend_then_accept = [this]() {
+                m_auto_buildtx_sent = false;
+                m_auto_step1_dm_sent = false;
+                m_auto_step3_dm_sent = false;
+                tryAutoSendBuildtx();
+                tryAutoSendRound1();
+                tryAutoSendRound3();
+            };
+            try_resend_then_accept();
+            // Retry once after the Nostr-connect grace, in case the
+            // first attempt fired before relays attached.
+            QTimer::singleShot(kNostrConnectGraceMs,
+                this, [this, try_resend_then_accept]() {
+                if (m_final_blob_hex.isEmpty()) return;
+                try_resend_then_accept();
+                setStatus(tr("Auto: previous session completed — final blob "
+                              "restored, dialog closing."));
+                accept();
+            });
             return;
         }
         // Always start from the top of the chain — each tryAuto step
@@ -255,11 +285,23 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
         // dialog reopen after a binary upgrade or daemon restart,
         // where m_my_commitment / m_in_peer_share_json may be present
         // but the auto-fire flags are false (they aren't persisted),
-        // so the next-step would otherwise sit idle.
+        // so the next-step would otherwise sit idle. The cascade has
+        // to include EVERY intermediate step — earlier versions
+        // skipped tryAutoLoadshare and tryAutoBuildtx and ended up
+        // with dialogs stuck at "Scanning joint stealth output…"
+        // after a session restore that had both jointscan partials
+        // present but never re-ran loadshare.
         tryAutoComputeJointscanPartial();
+        tryAutoSendJointscanPartial();
+        tryAutoSendXpubAnnounce();
+        tryAutoLoadshare();
+        tryAutoBuildtx();
+        tryAutoSendBuildtx();
         tryAutoStep1();
+        tryAutoSendRound1();
         tryAutoStep2();
         tryAutoStep3();
+        tryAutoSendRound3();
         tryAutoStep4();
     }, Qt::QueuedConnection);
 
