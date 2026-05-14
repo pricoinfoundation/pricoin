@@ -10,6 +10,7 @@
 #include <secp256k1.h>
 #include <span.h>
 #include <sync.h>
+#include <logging.h>
 #include <util/strencodings.h>
 
 #include <cstring>
@@ -538,16 +539,32 @@ bool VerifyMultiLayer(
     const Signature& sig,
     const uint256& msg)
 {
-    if (ring.empty()) return false;
-    if (sig.s.size() != ring.size()) return false;
-    if (HasDuplicateMembers(ring)) return false;
+    if (ring.empty()) {
+        LogWarning("Pricoin VerifyMultiLayer: empty ring");
+        return false;
+    }
+    if (sig.s.size() != ring.size()) {
+        LogWarning("Pricoin VerifyMultiLayer: sig.s.size=%u != ring.size=%u",
+                   (unsigned)sig.s.size(), (unsigned)ring.size());
+        return false;
+    }
+    if (HasDuplicateMembers(ring)) {
+        LogWarning("Pricoin VerifyMultiLayer: ring has duplicate members");
+        return false;
+    }
     LOCK(g_mutex);
 
     // Validate KI and D parse.
     {
         secp256k1_pubkey tmp;
-        if (!ParsePoint(sig.key_image, tmp)) return false;
-        if (!ParsePoint(sig.commitment_image, tmp)) return false;
+        if (!ParsePoint(sig.key_image, tmp)) {
+            LogWarning("Pricoin VerifyMultiLayer: KI parse failed");
+            return false;
+        }
+        if (!ParsePoint(sig.commitment_image, tmp)) {
+            LogWarning("Pricoin VerifyMultiLayer: D parse failed");
+            return false;
+        }
     }
 
     // Recompute μ_P, μ_C from ring + KI + D.
@@ -556,33 +573,67 @@ bool VerifyMultiLayer(
     // Recompute T_i and I_agg.
     std::vector<Point> T(ring.size());
     for (size_t i = 0; i < ring.size(); ++i) {
-        if (!AggregateMember(ring[i], mu_P, mu_C, T[i])) return false;
+        if (!AggregateMember(ring[i], mu_P, mu_C, T[i])) {
+            LogWarning("Pricoin VerifyMultiLayer: AggregateMember(ring[%u]) failed",
+                       (unsigned)i);
+            return false;
+        }
     }
     Point I_agg;
     {
         MultiLayerMember imgs{sig.key_image, sig.commitment_image};
-        if (!AggregateMember(imgs, mu_P, mu_C, I_agg)) return false;
+        if (!AggregateMember(imgs, mu_P, mu_C, I_agg)) {
+            LogWarning("Pricoin VerifyMultiLayer: AggregateMember(I_agg) failed");
+            return false;
+        }
     }
 
     const size_t N = ring.size();
     Scalar c = sig.c0;
+    Scalar c_start = c;
     for (size_t i = 0; i < N; ++i) {
         // L_i = s_i · G + c_i · T_i
         Point L_i;
         {
             secp256k1_pubkey T_pub;
-            if (!ParsePoint(T[i], T_pub)) return false;
-            if (!LinComb_sG_plus_cP(sig.s[i], c, T_pub, L_i)) return false;
+            if (!ParsePoint(T[i], T_pub)) {
+                LogWarning("Pricoin VerifyMultiLayer: T[%u] parse failed",
+                           (unsigned)i);
+                return false;
+            }
+            if (!LinComb_sG_plus_cP(sig.s[i], c, T_pub, L_i)) {
+                LogWarning("Pricoin VerifyMultiLayer: LinComb_sG_plus_cP at i=%u failed",
+                           (unsigned)i);
+                return false;
+            }
         }
         // R_i = s_i · H_p(P_i) + c_i · I_agg
         Point Hp_P_i = HashToPointInternal(std::span<const unsigned char>{ring[i].P.data(), ring[i].P.size()});
         Point R_i;
-        if (!LinComb_sQ_plus_cR(sig.s[i], Hp_P_i, c, I_agg, R_i)) return false;
+        if (!LinComb_sQ_plus_cR(sig.s[i], Hp_P_i, c, I_agg, R_i)) {
+            LogWarning("Pricoin VerifyMultiLayer: LinComb_sQ_plus_cR at i=%u failed",
+                       (unsigned)i);
+            return false;
+        }
 
         c = StepChallengeML(ring, msg, L_i, R_i, sig.key_image, sig.commitment_image);
     }
     // Ring closes when the recomputed c after N steps matches the published c0.
-    return c == sig.c0;
+    const bool ok = (c == sig.c0);
+    if (!ok) {
+        // Per-step diagnostic on close failure: print c_start (sig.c0)
+        // and recomputed c. The deltas in mu_P/mu_C/T_pi/I_agg from a
+        // wrong ring or msg will produce a c that's not even close.
+        // ring_size + pi are useful for cross-checking against the
+        // signing-side log dump.
+        LogWarning("Pricoin VerifyMultiLayer: walk did not close. "
+                   "sig.c0=%s recomputed_c=%s mu_P=%s mu_C=%s "
+                   "ring_size=%u",
+                   HexStr(c_start), HexStr(c),
+                   HexStr(mu_P), HexStr(mu_C),
+                   (unsigned)N);
+    }
+    return ok;
 }
 
 void RunSelfTest()
