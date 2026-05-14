@@ -2573,11 +2573,28 @@ void PricCoopSignDialog::onStep3Compute()
         return;
     }
     // pricoin_jointspend_share(alpha, c_pi, x_share, [z_share, mu_P, mu_C])
+    //
+    // Multi-layer signing — BOTH PricPlain (plain CLSAG-ML) and
+    // PricAdaptor (adaptor-CLSAG-ML) — needs the z_share + μ_P + μ_C
+    // triple appended so the close share is computed as
+    //   close = α - c_pi · (μ_P · x_share + μ_C · z_share)
+    // i.e. the multi-layer aggregated form. Without it, the close
+    // share collapses to the single-layer `α - c_pi · x_share`, and
+    // when assembled the presig's s_pi is missing the μ_C · z term.
+    // VerifyMultiLayer's walk then fails to close at index pi.
+    //
+    // 2026-05-14: this gate used to require `m_mode == PricPlain`.
+    // That was correct pre-ML-adaptor-port (when PricAdaptor was
+    // single-layer). After the ML port (v0.1.73), PricAdaptor is
+    // multi-layer too — the mode check was a leftover. Symptom in
+    // live testing: every PRIC claim adapt+broadcast failed with
+    // "Adapt failed (... ring/msg mismatch)" because the recomputed
+    // walk diverged at the signer index.
     std::string params = std::string("[\"")
         + m_alpha.toStdString()  + "\",\""
         + m_c_pi.toStdString()   + "\",\""
         + m_x_share.toStdString() + "\"";
-    if (m_mode == Mode::PricPlain && !m_z_share.isEmpty()
+    if (!m_z_share.isEmpty()
         && !m_mu_P.isEmpty() && !m_mu_C.isEmpty()) {
         params += std::string(",\"") + m_z_share.toStdString() + "\"";
         params += std::string(",\"") + m_mu_P.toStdString()    + "\"";
