@@ -2243,8 +2243,22 @@ bool PricoinSwapsPage::autoAdaptPricClaim(const std::string& sid)
     std::string err;
     auto r = CallWalletRpc(m_model, "pricoin_swapwatch_adapt_pric_claim", p, &err);
     if (!r) {
-        setStatus(tr("Auto: Adapt+broadcast PRIC failed: %1")
-            .arg(QString::fromStdString(err)), true);
+        // 2026-05-14: surface what we passed so we can correlate
+        // with the on-side adapt diagnostics. The adapt RPC's failure
+        // message is opaque (3 possible causes); pairing it with the
+        // ring shape + msg here narrows the search space.
+        const std::string ring_summary =
+            ring_v.isArray() && !ring_v.empty() && ring_v[0].isObject()
+                ? "ring_ml({P,W})"
+                : "ring_singlelayer(P)";
+        setStatus(tr("Auto: Adapt+broadcast PRIC failed: %1\n"
+                      "  swap_id=%2  msg=%3  ring=%4 size=%5")
+            .arg(QString::fromStdString(err))
+            .arg(QString::fromStdString(sid).left(12) + "…")
+            .arg(QString::fromStdString(j["msg_hex"].get_str()).left(16) + "…")
+            .arg(QString::fromStdString(ring_summary))
+            .arg(static_cast<int>(ring_v.size())),
+            true);
         return false;
     }
     const QString txid = QString::fromStdString((*r)["txid"].get_str());

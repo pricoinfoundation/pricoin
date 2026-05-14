@@ -68,6 +68,12 @@ class PricoinJointspendAdaptorMLTest(BitcoinTestFramework):
         self._run_chain_validating(node)
         self.log.info("Section 3: actor-isolated DM ceremony (mirrors GUI flow)")
         self._run_actor_isolated_ceremony(node)
+        # Section 4 (swap-record path through SetPreSigned →
+        # swapwatch_adapt_pric_claim) requires driving the full state
+        # machine including BTC/LTC funding, which is more setup than
+        # this test should carry. Tracked separately — landing the
+        # AdaptML per-check diagnostic logging instead so live failures
+        # surface their root cause without round-tripping the user.
         self.log.info("Pricoin cooperative adaptor-CLSAG ML wire RPCs OK")
 
     def _run_synthetic(self, node):
@@ -662,6 +668,168 @@ class PricoinJointspendAdaptorMLTest(BitcoinTestFramework):
         assert_equal(submitted["txid"] in node.getrawmempool(), True)
         self.generatetoaddress(node, 1, sender_tx_addr)
         assert_equal(submitted["txid"] not in node.getrawmempool(), True)
+
+
+    def _run_swap_record_path_DISABLED(self, node):
+        """Exercises the SWAP-RECORD path the GUI takes at PreSigned.
+
+        Live failure 2026-05-14: dialog auto-fired
+        `pricoin_swapwatch_adapt_pric_claim` and got "Adapt failed (it
+        did not match T_G/T_H or pre-sig malformed or ring/msg
+        mismatch)". The protocol math + chain validation tests above
+        all pass, so the bug class is in the SWAP-RECORD interaction:
+        SetAdaptorMaterials (stores T_G/T_H/dleq_t/t_secret) →
+        SetPreSigned (stores presig blob) → swapwatch_adapt_pric_claim
+        (loads them back and runs AdaptML). If anything serializes or
+        deserializes wrong, or any field disagrees, AdaptML fails.
+
+        We're not exercising the foreign chain here — just creating a
+        synthetic swap record, populating its adaptor materials +
+        presig from a real ML ceremony, and calling the wallet
+        swapwatch RPC. If this path works, live failures are GUI-
+        layer wiring; if it fails, it's a real bug we can fix.
+        """
+        node.createwallet("alice_swap")
+        node.createwallet("bob_swap")
+        node.createwallet("sender_swap")
+        node.createwallet("recv_swap")
+        alice    = node.get_wallet_rpc("alice_swap")
+        bob      = node.get_wallet_rpc("bob_swap")
+        sender   = node.get_wallet_rpc("sender_swap")
+        receiver = node.get_wallet_rpc("recv_swap")
+
+        sender_tx_addr = sender.getnewaddress(address_type="bech32")
+        self.generatetoaddress(node, 110, sender_tx_addr)
+
+        alice_keys = alice.pricoin_getstealthaddress()
+        bob_keys   = bob.pricoin_getstealthaddress()
+        recv_keys  = receiver.pricoin_getstealthaddress()
+        joint = alice.pricoin_buildjointstealthaddress(
+            bob_keys["view_pubkey"], bob_keys["spend_pubkey"])
+
+        for _ in range(4):
+            sender.walletsendct(alice_keys["address"], 1.0, 0.0001)
+            self.generatetoaddress(node, 1, sender_tx_addr)
+        sent = sender.walletsendct(joint["address"], 4.2, 0.0001)
+        self.generatetoaddress(node, 1, sender_tx_addr)
+        joint_txid = sent["txid"]
+        joint_tx_hex = node.getrawtransaction(joint_txid)
+        joint_raw = node.decoderawtransaction(joint_tx_hex)
+        joint_vout = None
+        for vidx in range(len(joint_raw["vout"])):
+            try:
+                a_p = alice.pricoin_jointscan_partial(joint_tx_hex, vidx)["partial"]
+                b_p = bob.pricoin_jointscan_partial(joint_tx_hex, vidx)["partial"]
+                bob.pricoin_jointscan_recover(
+                    joint_tx_hex, vidx, b_p, a_p, alice_keys["spend_pubkey"])
+                joint_vout = vidx
+                break
+            except Exception:
+                continue
+        assert joint_vout is not None
+
+        a_p = alice.pricoin_jointscan_partial(joint_tx_hex, joint_vout)["partial"]
+        b_p = bob.pricoin_jointscan_partial(joint_tx_hex, joint_vout)["partial"]
+        a_load = alice.pricoin_jointspend_loadshare(
+            joint_tx_hex, joint_vout, a_p, b_p, bob_keys["spend_pubkey"], True)
+        b_load = bob.pricoin_jointspend_loadshare(
+            joint_tx_hex, joint_vout, b_p, a_p, alice_keys["spend_pubkey"], False)
+        joint_pub_hex = a_load["joint_pubkey"]
+        X_pub_A = a_load["x_pub"]
+        X_pub_B = b_load["x_pub"]
+
+        # Create a synthetic swap record on Bob's wallet. We use ltc as
+        # the foreign chain since LTC doesn't require BTC-side
+        # cooperative MuSig2 setup — keeps this section focused on the
+        # PRIC adapt path.
+        bob_swap = bob.pricoin_adaptor_swap_create(
+            "bob",
+            "02" + "00" * 32,            # synthetic counterparty pubkey
+            "ltc",
+            100_000_000,                  # 1.0 LTC
+            joint["address"],
+            2_00000000,                   # 2.0 PRIC
+            "test")
+        sid = bob_swap["swap_id"]
+
+        # Bob picks t and adaptor materials.
+        t = generate_privkey().hex()
+        cp = bob.pricoin_adaptor_compute_points(t, joint_pub_hex)
+        T_G, T_H = cp["T_G"], cp["T_H"]
+        # session strings deterministic from swap_id — same convention
+        # the GUI now uses post-2026-05-13 fix.
+        label, payload = sid, sid
+        dleq_t = bob.pricoin_adaptor_dleq_prove(
+            t, joint_pub_hex, T_G, T_H, label, payload)["dleq"]
+
+        # set_adaptor stores T_G/T_H/dleq_t + t_secret on the swap
+        # record. The swapwatch RPC will read these back.
+        bob.pricoin_adaptor_swap_set_adaptor(
+            sid, T_G, T_H, dleq_t, t)
+
+        # Buildtx (Bob is spender). We then exercise the same wire
+        # RPCs the dialog drives, ending with assemble_ml producing a
+        # presig blob.
+        skel = bob.pricoin_jointspend_buildtx(
+            joint_txid, joint_vout, b_load["value"], b_load["blind"],
+            joint_pub_hex, recv_keys["address"], 1.5, 0.0001, 4)
+        tx_hex, sighash, ring_ml, pi = (
+            skel["tx_hex"], skel["sighash"], skel["ring_ml"], skel["pi"])
+        z_bob, z_alice = skel["z_self"], skel["z_other"]
+        Z_pub_A = pub_from_scalar_hex(z_alice)
+        Z_pub_B = pub_from_scalar_hex(z_bob)
+
+        sa = node.pricoin_jointspend_adaptor_round1_ml(
+            joint_pub_hex, X_pub_A, Z_pub_A, a_load["x_share"], z_alice,
+            T_G, T_H, label, payload)
+        sb = node.pricoin_jointspend_adaptor_round1_ml(
+            joint_pub_hex, X_pub_B, Z_pub_B, b_load["x_share"], z_bob,
+            T_G, T_H, label, payload)
+        share_fields = ("L_share", "R_share", "KI_share", "D_share",
+                        "dleq_alpha", "dleq_x", "dleq_z", "commitment")
+        shares = [
+            {k: sb[k] for k in share_fields},
+            {k: sa[k] for k in share_fields},
+        ]
+        combined = node.pricoin_jointspend_adaptor_combine_ml(
+            ring_ml, pi, sighash, T_G, T_H, dleq_t,
+            [X_pub_B, X_pub_A], [Z_pub_B, Z_pub_A], shares, label, payload)
+        cs_b = node.pricoin_jointspend_share(
+            sb["alpha"], combined["c_pi"], b_load["x_share"],
+            z_bob, combined["mu_P"], combined["mu_C"])
+        cs_a = node.pricoin_jointspend_share(
+            sa["alpha"], combined["c_pi"], a_load["x_share"],
+            z_alice, combined["mu_P"], combined["mu_C"])
+        presig_obj = node.pricoin_jointspend_adaptor_assemble_ml(
+            combined["KI"], combined["D"],
+            combined["L_pi"], combined["R_pi"],
+            combined["L_prime"], combined["R_prime"],
+            combined["mu_P"], combined["mu_C"],
+            combined["c_pi"], combined["c0"],
+            combined["s_others"],
+            [cs_b["s_share"], cs_a["s_share"]],
+            pi, T_G, T_H, dleq_t)
+        presig = presig_obj["presig"]
+
+        # Persist the cooperative ring into the swap record (the GUI's
+        # adaptor combine_ml does this via pricoin_adaptor_swap_set_pric_claim_ring).
+        ring_p_only = [m["P"] for m in ring_ml]
+        bob.pricoin_adaptor_swap_set_pric_claim_ring(sid, ring_p_only)
+
+        # SetPreSigned stores the presig blob on the swap record.
+        # For LTC swaps the BTC presig blobs are not required (the
+        # wallet validator has an LTC carve-out).
+        bob.pricoin_adaptor_swap_set_pre_signed(
+            sid, "", "", 0, "", presig, "")
+
+        # Now exercise the live failure path: load + adapt + broadcast
+        # via the wallet's swapwatch RPC. This is what
+        # autoAdaptPricClaim calls on Bob's GUI at pre_signed.
+        adapt = bob.pricoin_swapwatch_adapt_pric_claim(
+            sid, tx_hex, ring_ml, sighash, 1)
+        assert_equal(adapt["txid"] in node.getrawmempool(), True)
+        self.generatetoaddress(node, 1, sender_tx_addr)
+        assert_equal(adapt["txid"] not in node.getrawmempool(), True)
 
 
 if __name__ == "__main__":

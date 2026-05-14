@@ -5,10 +5,12 @@
 #include <pricoin/adaptor_ringsig.h>
 
 #include <crypto/sha256.h>
+#include <logging.h>
 #include <pricoin/ringsig.h>
 #include <random.h>
 #include <secp256k1.h>
 #include <sync.h>
+#include <util/strencodings.h>
 
 #include <cstring>
 #include <stdexcept>
@@ -592,8 +594,16 @@ std::optional<Signature> AdaptML(
 
     // Verify t · G == T_G.
     Point tG;
-    if (!ScalarMultG(ctx, t, tG)) return std::nullopt;
-    if (tG != presig.adaptor.T_G) return std::nullopt;
+    if (!ScalarMultG(ctx, t, tG)) {
+        LogWarning("Pricoin AdaptML: ScalarMultG(t) failed");
+        return std::nullopt;
+    }
+    if (tG != presig.adaptor.T_G) {
+        LogWarning("Pricoin AdaptML: t·G != T_G "
+                   "(t·G=%s, presig.T_G=%s) — wrong adaptor secret",
+                   HexStr(tG), HexStr(presig.adaptor.T_G));
+        return std::nullopt;
+    }
 
     Signature sig;
     sig.key_image        = presig.key_image;
@@ -602,12 +612,27 @@ std::optional<Signature> AdaptML(
     sig.s                = presig.s;
 
     Scalar s_pi = presig.s[presig.pi];
-    if (!secp256k1_ec_seckey_tweak_add(ctx, s_pi.data(), t.data())) return std::nullopt;
-    if (!secp256k1_ec_seckey_verify(ctx, s_pi.data())) return std::nullopt;
+    if (!secp256k1_ec_seckey_tweak_add(ctx, s_pi.data(), t.data())) {
+        LogWarning("Pricoin AdaptML: s_pi + t tweak_add failed (overflow/zero)");
+        return std::nullopt;
+    }
+    if (!secp256k1_ec_seckey_verify(ctx, s_pi.data())) {
+        LogWarning("Pricoin AdaptML: s_pi+t failed seckey_verify (zero/oob)");
+        return std::nullopt;
+    }
     sig.s[presig.pi] = s_pi;
 
     // Multi-layer verify against (P, W) ring — what consensus uses.
     if (!::pricoin::ringsig::VerifyMultiLayer(ring, sig, msg)) {
+        LogWarning("Pricoin AdaptML: post-tweak VerifyMultiLayer failed "
+                   "(ring/msg mismatch — ring used here does not match the "
+                   "one the pre-sig was built against, OR msg differs; "
+                   "ring_size=%u, pi=%u, msg=%s, KI=%s, D=%s, c0=%s)",
+                   (unsigned)ring.size(), (unsigned)presig.pi,
+                   msg.ToString(),
+                   HexStr(presig.key_image),
+                   HexStr(presig.commitment_image),
+                   HexStr(presig.c0));
         return std::nullopt;
     }
     return sig;
