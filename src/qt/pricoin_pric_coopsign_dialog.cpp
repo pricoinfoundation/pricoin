@@ -544,6 +544,20 @@ void PricCoopSignDialog::onRunBuildtx()
         // to build via UniValue.
     }
 
+    // If the swap record has a pre-built (not yet broadcast) funding tx
+    // hex, pass it as the optional 11th param so the buildtx RPC can
+    // source the joint output's commitment + one-time pubkey from the
+    // hex instead of looking it up on-chain. Required for the
+    // post-2026-05-15 cooperative-sign-before-funding flow.
+    std::string funding_hex;
+    if (m_wm && !m_swap_id.isEmpty()) {
+        auto snap_bt = m_wm->wallet().adaptorSwapGet(m_swap_id.toStdString());
+        if (snap_bt && !snap_bt->pric_funding_unsigned_tx_hex.empty()
+            && snap_bt->pric_funding_height <= 0) {
+            funding_hex = snap_bt->pric_funding_unsigned_tx_hex;
+        }
+    }
+
     UniValue p{UniValue::VARR};
     p.push_back(joint_txid.toStdString());
     p.push_back(vout);
@@ -555,6 +569,7 @@ void PricCoopSignDialog::onRunBuildtx()
     p.push_back(fee.toStdString());
     p.push_back(rs);
     p.push_back(nl);
+    p.push_back(funding_hex);
     auto r = callRpc("pricoin_jointspend_buildtx", p.write(0));
     if (!r.ok) {
         setStatus(tr("buildtx failed: %1").arg(QString::fromStdString(r.error_msg)), true);

@@ -2978,6 +2978,13 @@ RPCMethod pricoin_jointspend_buildtx()
                 "Absolute block-height nLockTime to bake into the tx. 0 = no\n"
                 "timelock (default — claim-tx behaviour). Set ≥ T_pric_refund\n"
                 "(spec §6.2 step 7) to produce a refund-tx skeleton."},
+            {"funding_tx_hex", RPCArg::Type::STR_HEX, RPCArg::Default{""},
+                "Optional unsigned-but-signed funding tx hex. When provided, the\n"
+                "joint output's commitment + one-time pubkey are read from this\n"
+                "hex instead of the chain, allowing the cooperative ceremony to\n"
+                "run BEFORE the funding tx is broadcast. The funding_txid must\n"
+                "still match the hex's computed hash. Empty = legacy behaviour\n"
+                "(chain lookup required, funding must be confirmed)."},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -3020,6 +3027,8 @@ RPCMethod pricoin_jointspend_buildtx()
                 throw JSONRPCError(RPC_INVALID_PARAMETER,
                     "nlocktime must fit in uint32 (use 0 for no timelock)");
             }
+            const std::string funding_tx_hex =
+                request.params[10].isNull() ? std::string{} : request.params[10].get_str();
 
             auto joint_txid_opt = uint256::FromHex(joint_txid_hex);
             if (!joint_txid_opt) throw JSONRPCError(RPC_INVALID_PARAMETER, "joint_txid not hex");
@@ -3041,27 +3050,61 @@ RPCMethod pricoin_jointspend_buildtx()
             const auto* stealth_dest = &parsed_dest->address;
             const auto dest_kind = parsed_dest->kind;
 
-            // Sanity: prev coin's commitment must match Create(value, blind).
+            // Source the joint output's commitment + one_time_pubkey.
+            // Two paths:
+            //   1. Caller passed funding_tx_hex — decode it, verify the
+            //      computed txid matches, and read commitment + otp from
+            //      the embedded ct_bundle. Lets the cooperative ceremony
+            //      run BEFORE the funding tx is broadcast (post-2026-05-15
+            //      protocol order).
+            //   2. Default — look the funding output up on chain via
+            //      findCoins. Requires the funding to be confirmed.
             const COutPoint joint_outpoint{Txid::FromUint256(*joint_txid_opt), joint_vout};
-            Coin joint_coin;
-            {
+            pricoin::ct::Commitment           joint_commitment{};
+            pricoin::ct::SerializedPubKey33   joint_coin_otp{};
+            if (!funding_tx_hex.empty()) {
+                CMutableTransaction fmtx;
+                if (!DecodeHexTx(fmtx, funding_tx_hex,
+                                  /*try_no_witness=*/true, /*try_witness=*/true)) {
+                    throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
+                        "funding_tx_hex failed to decode");
+                }
+                CTransaction ftx{std::move(fmtx)};
+                if (ftx.GetHash().ToUint256() != *joint_txid_opt) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        "funding_tx_hex hashes to a different txid than joint_txid");
+                }
+                if (ftx.version != PRICOIN_CT_VERSION) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        "funding_tx_hex is not a v4 confidential tx");
+                }
+                if (joint_vout >= ftx.ct_bundle.outputs.size()) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        "joint_vout out of range for funding_tx_hex");
+                }
+                joint_commitment = ftx.ct_bundle.outputs[joint_vout].commitment;
+                joint_coin_otp   = ftx.ct_bundle.outputs[joint_vout].one_time_pubkey;
+            } else {
+                Coin joint_coin;
                 std::map<COutPoint, Coin> coins{{joint_outpoint, Coin{}}};
                 chain.findCoins(coins);
                 joint_coin = coins[joint_outpoint];
-            }
-            if (joint_coin.IsSpent() || !joint_coin.IsConfidential()) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "joint outpoint not a confirmed v4 output");
+                if (joint_coin.IsSpent() || !joint_coin.IsConfidential()) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "joint outpoint not a confirmed v4 output");
+                }
+                joint_commitment = joint_coin.commitment;
+                joint_coin_otp   = joint_coin.one_time_pubkey;
             }
             {
                 auto rebuilt = pricoin::ct::Commitment::Create(static_cast<uint64_t>(joint_value), joint_blind);
-                if (!rebuilt || *rebuilt != joint_coin.commitment) {
+                if (!rebuilt || *rebuilt != joint_commitment) {
                     throw JSONRPCError(RPC_INVALID_PARAMETER,
-                        "joint_value+joint_blind do not reconstruct the on-chain commitment");
+                        "joint_value+joint_blind do not reconstruct the funding commitment");
                 }
             }
-            if (joint_coin.one_time_pubkey != joint_pubkey) {
+            if (joint_coin_otp != joint_pubkey) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER,
-                    "joint_pubkey does not match the on-chain one_time_pubkey");
+                    "joint_pubkey does not match the funding one_time_pubkey");
             }
 
             const CAmount target = dest_amount + fee;
@@ -3097,7 +3140,7 @@ RPCMethod pricoin_jointspend_buildtx()
                 if (k == pi) {
                     ring[k] = ChainCTOutput{
                         .ref = pricoin::ct::PrevoutRef{joint_outpoint.hash.ToUint256(), joint_outpoint.n},
-                        .commitment = joint_coin.commitment,
+                        .commitment = joint_commitment,
                         .one_time_pubkey = joint_pubkey,
                     };
                 } else {
