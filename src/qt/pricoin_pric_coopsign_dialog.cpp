@@ -343,6 +343,42 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
             }
         }
     });
+
+    // Periodic resend safety net. If a DM was dropped (race with relay
+    // attach, relay flake, peer not subscribed yet), the receive-side
+    // de-duplicates by content so blind resends are safe. Drop the
+    // m_auto_*_sent gates and replay any send whose precondition is
+    // still met; the standard tryAuto cascade picks back up. Stops on
+    // its own once the final pre-signature is produced. Fires every
+    // 10 seconds — fast enough to recover within one user-visible
+    // pause, slow enough not to spam relays.
+    auto* resend = new QTimer(this);
+    resend->setInterval(10 * 1000);
+    connect(resend, &QTimer::timeout, this, [this]() {
+        if (!m_final_blob_hex.isEmpty()) return;
+        if (m_relay_connected_count == 0) return;
+        if (m_peer_xonly.isEmpty()) return;
+        // Replay any send whose payload is ready but might not have
+        // landed on the peer. The receive-side `set_if_changed_*`
+        // / consumed-flag checks make this idempotent.
+        m_auto_partial_sent  = false;
+        m_auto_xpub_announced = false;
+        m_auto_buildtx_sent  = false;
+        m_auto_step1_dm_sent = false;
+        m_auto_step3_dm_sent = false;
+        tryAutoSendJointscanPartial();
+        tryAutoSendXpubAnnounce();
+        tryAutoSendBuildtx();
+        tryAutoSendRound1();
+        tryAutoSendRound3();
+        // Receive-side may have everything it needs but the cascade
+        // didn't progress — re-prod the cosigner-only steps.
+        tryAutoStep1();
+        tryAutoStep2();
+        tryAutoStep3();
+        tryAutoStep4();
+    });
+    resend->start();
 }
 
 void PricCoopSignDialog::onRunLoadshare()
