@@ -732,12 +732,28 @@ void PricCoopSignDialog::onNostrRelayStatus(const QString& url, bool connected)
     else --m_relay_connected_count;
     if (m_relay_connected_count < 0) m_relay_connected_count = 0;
     updateNostrStatus();
-    // Auto-coord retry: now that we're connected, try the jointscan
-    // partial path again. Either the partial wasn't yet computed (will
-    // compute now) or was computed but not sent (will send now).
+    // Auto-coord retry: now that we're connected, replay EVERY send
+    // step so any DM that fired before the relay attached gets
+    // delivered. The receive-side handlers already de-dup by content
+    // (set_if_changed pattern), so resending is safe. Without this,
+    // a dialog that auto-fires its full ceremony chain while Nostr
+    // is still connecting will silently drop buildtx / round1 /
+    // round3 DMs and the peer stays stuck at "Building spend
+    // transaction…" / "Step 1 of 4 — computing…".
     if (connected && m_relay_connected_count > 0) {
         tryAutoComputeJointscanPartial();
         tryAutoSendJointscanPartial();
+        tryAutoSendXpubAnnounce();
+        // Reset the "sent" gates so the resend actually fires. These
+        // gates exist to prevent intra-tick re-sends; they're not
+        // load-bearing for cross-event-loop idempotence (the peer
+        // de-dups).
+        m_auto_buildtx_sent  = false;
+        m_auto_step1_dm_sent = false;
+        m_auto_step3_dm_sent = false;
+        tryAutoSendBuildtx();
+        tryAutoSendRound1();
+        tryAutoSendRound3();
     }
 }
 
