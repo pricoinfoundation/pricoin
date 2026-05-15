@@ -80,6 +80,20 @@ struct AddressBalance {
     int     utxo_count{0};
 };
 
+// Spend status of a specific (txid, vout). Returned by
+// `/tx/<txid>/outspend/<vout>` — used by swap watchers so a party
+// can detect their counterparty's claim broadcast without
+// depending on a peer-to-peer DM.
+struct OutspendStatus {
+    // True iff the output has been spent (mempool or confirmed).
+    bool        spent{false};
+    // Set iff spent — the tx that spends this output.
+    std::string spending_txid;
+    int32_t     spending_vin{-1};
+    // Confirmation status of the spending tx.
+    TxStatus    status;
+};
+
 class ChainBackend {
 public:
     virtual ~ChainBackend() = default;
@@ -117,6 +131,12 @@ public:
     // the txid the backend assigned (typically the same hash the
     // caller computed locally; we surface what the backend says).
     virtual std::string Broadcast(const std::string& tx_hex) = 0;
+
+    // Spend status of (txid, vout). Esplora exposes this as
+    // `/tx/<txid>/outspend/<vout>` — { spent: bool, txid?, vin?,
+    // status? }. Used by Bob-side swap polling to detect Alice's
+    // foreign claim independent of any peer-to-peer DM.
+    virtual OutspendStatus GetOutspend(const std::string& txid, int32_t vout) = 0;
 
     // Fee-rate estimates from the backend, in sat/vB, keyed by the
     // confirmation target in blocks. Esplora's `/fee-estimates`

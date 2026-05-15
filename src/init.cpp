@@ -1665,6 +1665,30 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                     try { return m_backend->GetFeeEstimates(); }
                     catch (const ::pricoin::swap::ChainBackendError&) { return {}; }
                 }
+                std::optional<Outspend> GetOutspend(
+                    const std::string& txid, int32_t vout) override {
+                    try {
+                        const auto os = m_backend->GetOutspend(txid, vout);
+                        Outspend out;
+                        out.spent = os.spent;
+                        out.spending_txid = os.spending_txid;
+                        out.spending_vin = os.spending_vin;
+                        out.confirmed = os.status.confirmed;
+                        out.block_height = os.status.block_height;
+                        return out;
+                    } catch (const ::pricoin::swap::ChainBackendError& e) {
+                        const std::string m = e.what();
+                        // Esplora returns 404 for outspend queries on
+                        // unknown txids — treat as "not spent" rather
+                        // than backend unreachable.
+                        if (m.find("404") != std::string::npos
+                            || m.find("not found") != std::string::npos
+                            || m.find("Not Found") != std::string::npos) {
+                            return Outspend{};
+                        }
+                        return std::nullopt;
+                    }
+                }
             private:
                 std::shared_ptr<::pricoin::swap::ChainBackend> m_backend;
             };

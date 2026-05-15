@@ -158,6 +158,21 @@ public:
     // to a hardcoded default in that case. See Esplora's
     // `/fee-estimates` for the source format.
     virtual std::map<int, double> GetFeeEstimates() = 0;
+
+    // Spend status of a specific funding output. Lets the swap
+    // watcher detect when a counterparty has claimed the HTLC
+    // without needing a peer-to-peer DM. Returns std::nullopt on
+    // backend unreachability (caller treats that like other transient
+    // failures and retries on the next tick).
+    struct Outspend {
+        bool        spent{false};
+        std::string spending_txid;
+        int32_t     spending_vin{-1};
+        bool        confirmed{false};
+        int         block_height{-1};
+    };
+    virtual std::optional<Outspend> GetOutspend(
+        const std::string& txid, int32_t vout) = 0;
 };
 
 // Pluggable factory for resolving a foreign-chain client by chain
@@ -187,6 +202,8 @@ public:
     std::vector<Utxo>    GetAddressUtxos(const std::string& address) override;
     Balance              GetAddressBalance(const std::string& address) override;
     std::map<int, double> GetFeeEstimates() override;
+    std::optional<Outspend> GetOutspend(
+        const std::string& txid, int32_t vout) override;
 
     // Test config — protected by an internal mutex.
     void SetTipHeight(std::optional<int> h);
@@ -296,6 +313,24 @@ private:
     std::set<uint256> m_refund_attempted;
     std::set<uint256> m_btc_refund_attempted;
     std::set<uint256> m_pric_refund_attempted;
+
+    // Bob-side spend detection. For each swap in PricClaimed where this
+    // wallet is Bob and no ForeignClaim watch is already registered,
+    // poll `client->GetOutspend(foreign_funding_txid, vout)`. When the
+    // funding output is spent on the foreign chain, register a
+    // ForeignClaim watch entry pointing at the spending txid so the
+    // next tick fires SetComplete via HandleEntry. Removes the
+    // dependency on Alice's `foreign_claim` DM arriving — important
+    // when Alice's wallet has already moved past the terminal state
+    // (e.g. completed earlier and not online to re-DM us).
+    void TryAutoDetectForeignClaim();
+    // Order self-heal — runs each Tick after the standard pipeline.
+    // For each Matched order whose linked swap is in any terminal
+    // state (Complete or Refunded), apply Fill / Unmatch even if the
+    // transition itself didn't fire on this wallet (e.g. user advanced
+    // manually, or the swap completed before the post-terminal hook
+    // existed). Idempotent against already-Filled/Cancelled orders.
+    void TryReconcileMatchedOrders();
 
     ::wallet::CWallet& m_wallet;
     ForeignClientMap m_clients;

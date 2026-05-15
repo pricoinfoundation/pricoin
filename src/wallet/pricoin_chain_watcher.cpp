@@ -329,6 +329,12 @@ std::map<int, double> MockForeignChainClient::GetFeeEstimates()
     return {};  // mock has no fee state
 }
 
+std::optional<IForeignChainClient::Outspend>
+MockForeignChainClient::GetOutspend(const std::string& /*txid*/, int32_t /*vout*/)
+{
+    return Outspend{};  // unspent
+}
+
 std::string MockForeignChainClient::Broadcast(const std::string& tx_hex)
 {
     std::lock_guard<std::mutex> lk(m_mu);
@@ -638,11 +644,130 @@ void ChainWatcher::Tick()
         }
     }
     if (m_stopping.load()) return;
+    TryAutoDetectForeignClaim();
+    if (m_stopping.load()) return;
     TryAutoRefundLtc();
     if (m_stopping.load()) return;
     TryAutoRefundBtc();
     if (m_stopping.load()) return;
     TryAutoRefundPric();
+    if (m_stopping.load()) return;
+    TryReconcileMatchedOrders();
+}
+
+// Bob-side spend detection. See header for the design rationale.
+// Runs each Tick before the auto-refund passes. Cheap on the happy
+// path: skipped entirely when no Bob swap is at PricClaimed.
+void ChainWatcher::TryAutoDetectForeignClaim()
+{
+    using namespace ::wallet::pricoin_adaptor_swap;
+    std::vector<AdaptorSwap> swaps;
+    if (List(m_wallet, swaps) != LookupResult::Ok) return;
+
+    for (const auto& s : swaps) {
+        if (m_stopping.load()) return;
+        if (s.role != Role::Bob) continue;
+        if (s.state != State::PricClaimed) continue;
+        if (s.foreign_funding_txid.empty()) continue;
+        if (s.foreign_funding_vout < 0) continue;
+
+        // Skip if a ForeignClaim watch entry is already pending — the
+        // normal path is doing the work for us. We only fill in when
+        // the DM never arrived.
+        WatchEntry existing;
+        if (Get(m_wallet, s.swap_id, WatchKind::ForeignClaim, existing) == StoreResult::Ok) {
+            continue;
+        }
+
+        std::shared_ptr<IForeignChainClient> client;
+        auto it = m_clients.find(s.foreign_chain);
+        if (it != m_clients.end()) client = it->second;
+        else client = MakeForeignClientFromRegistry(s.foreign_chain);
+        if (!client) continue;
+        if (IsChainCoolingDown(s.foreign_chain)) continue;
+
+        auto os = client->GetOutspend(s.foreign_funding_txid, s.foreign_funding_vout);
+        if (!os) {
+            RecordChainError(s.foreign_chain);
+            continue;
+        }
+        if (!os->spent) continue;
+        if (os->spending_txid.empty()) continue;
+
+        // Register a ForeignClaim watch entry; min_confirmations=1 so
+        // we don't act until the spending tx is in a block. HandleEntry
+        // on the next tick will fire SetComplete and the post-terminal
+        // order bookkeeping.
+        WatchEntry we;
+        we.swap_id = s.swap_id;
+        we.kind = WatchKind::ForeignClaim;
+        we.txid_hex = os->spending_txid;
+        we.vout = -1;
+        we.min_confirmations = 1;
+        we.added_unix = GetTime();
+        if (Add(m_wallet, we) == StoreResult::Ok) {
+            LogInfo("Pricoin chainwatch: auto-detected foreign-claim spend of "
+                    "funding %s:%d by %s for swap %s — registered ForeignClaim "
+                    "watch (no DM required)\n",
+                    s.foreign_funding_txid, s.foreign_funding_vout,
+                    we.txid_hex.substr(0, 12),
+                    s.swap_id.ToString().substr(0, 12));
+        }
+    }
+}
+
+// Order self-heal. For each Matched order whose linked swap has
+// already reached a terminal state, apply Fill (on Complete) or
+// Unmatch (on Refunded/Aborted) even if the transition didn't fire
+// on this wallet during this run. The standard post-terminal hook
+// in HandleEntry handles fresh transitions; this pass recovers
+// orders that were left in Matched because the transition happened
+// outside the watcher (manual advance, pre-fix completion, etc.).
+void ChainWatcher::TryReconcileMatchedOrders()
+{
+    using namespace ::wallet::pricoin_adaptor_swap;
+    using OS = ::wallet::pricoin_offer::Status;
+    using MR = ::wallet::pricoin_offer::MutateResult;
+
+    std::vector<::wallet::pricoin_offer::Order> orders;
+    if (::wallet::pricoin_offer::List(m_wallet, orders)
+        != ::wallet::pricoin_offer::LookupResult::Ok) return;
+
+    bool any_matched = false;
+    for (const auto& o : orders) {
+        if (o.status == OS::Matched) { any_matched = true; break; }
+    }
+    if (!any_matched) return;
+
+    std::vector<AdaptorSwap> swaps;
+    if (List(m_wallet, swaps) != LookupResult::Ok) return;
+
+    for (const auto& o : orders) {
+        if (m_stopping.load()) return;
+        if (o.status != OS::Matched) continue;
+        if (o.pric_in_flight_sat == 0) continue;
+        // Find a swap whose pric_amount_sat matches the order's
+        // in-flight amount and which is in a terminal state.
+        for (const auto& s : swaps) {
+            if (s.pric_amount_sat != o.pric_in_flight_sat) continue;
+            const bool complete = (s.state == State::Complete);
+            const bool refunded = (s.state == State::Refunded
+                                    || s.state == State::Aborted);
+            if (!complete && !refunded) continue;
+            MR mr = complete
+                ? ::wallet::pricoin_offer::Fill(m_wallet, o.payload.order_id)
+                : ::wallet::pricoin_offer::Unmatch(m_wallet, o.payload.order_id);
+            if (mr == MR::Ok) {
+                LogInfo("Pricoin order self-heal: %s applied to order %s "
+                        "(swap %s already in terminal state %u)\n",
+                        complete ? "Fill" : "Unmatch",
+                        o.payload.order_id.ToString().substr(0, 12),
+                        s.swap_id.ToString().substr(0, 12),
+                        static_cast<unsigned>(s.state));
+            }
+            break;
+        }
+    }
 }
 
 // PRIC-leg confirmation lookup via interfaces::Chain. Equivalent

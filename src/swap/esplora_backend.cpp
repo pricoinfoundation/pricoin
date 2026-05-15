@@ -630,6 +630,52 @@ public:
         return Trim(reply.body);
     }
 
+    OutspendStatus GetOutspend(const std::string& txid, int32_t vout) override
+    {
+        ValidateTxid(txid);
+        if (vout < 0) {
+            throw ChainBackendError("vout must be non-negative");
+        }
+        const std::string path =
+            "/tx/" + txid + "/outspend/" + std::to_string(vout);
+        auto reply = DoRequest(m_url, m_opts.timeout_seconds, EVHTTP_REQ_GET, path);
+        Require2xx(reply, path);
+        const UniValue v = ParseJSON(reply.body, path);
+        if (!v.isObject()) {
+            throw ChainBackendError(strprintf(
+                "Esplora %s expected JSON object", path));
+        }
+        OutspendStatus out;
+        if (const auto& s = v.find_value("spent"); s.isBool()) {
+            out.spent = s.get_bool();
+        }
+        if (out.spent) {
+            if (const auto& t = v.find_value("txid"); t.isStr()) {
+                out.spending_txid = t.get_str();
+            }
+            if (const auto& vi = v.find_value("vin"); vi.isNum()) {
+                out.spending_vin = vi.getInt<int32_t>();
+            }
+            if (const auto& st = v.find_value("status"); st.isObject()) {
+                if (const auto& c = st.find_value("confirmed"); c.isBool()) {
+                    out.status.confirmed = c.get_bool();
+                }
+                if (out.status.confirmed) {
+                    if (const auto& h = st.find_value("block_height"); h.isNum()) {
+                        out.status.block_height = h.getInt<int>();
+                    }
+                    if (const auto& bh = st.find_value("block_hash"); bh.isStr()) {
+                        out.status.block_hash = bh.get_str();
+                    }
+                    if (const auto& bt = st.find_value("block_time"); bt.isNum()) {
+                        out.status.block_time = bt.getInt<int64_t>();
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
 private:
     void ValidateTxid(const std::string& txid)
     {

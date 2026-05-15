@@ -557,6 +557,17 @@ MutateResult MutateMatchedPair(
 
 } // namespace
 
+// Dust threshold for post-fill remainder. PRIC v4 CT txs are ~3KB
+// with rangeproofs; at typical fee markets a transparent dust amount
+// like 546 sats is well under the cost of broadcasting a CT tx, so
+// any sub-10000-sat remainder is effectively unspendable as a swap
+// leg. Auto-Filled rather than left Active to avoid 0.00000001-PRIC
+// remainders surviving as "open orders" in the UI.
+//
+// Adjustable if needed; chosen conservatively rather than tied to
+// the current minrelayfee since per-broadcast economics change.
+static constexpr int64_t kOrderDustRemainderSat = 10'000;  // 0.0001 PRIC
+
 MutateResult Fill(CWallet& wallet, const uint256& order_id)
 {
     return MutateMatchedPair(wallet, order_id,
@@ -567,7 +578,7 @@ MutateResult Fill(CWallet& wallet, const uint256& order_id)
             target.pric_remaining_sat -= consumed;
             target.pric_in_flight_sat = 0;
             target.matched_with_order_id = uint256{};
-            target.status = (target.pric_remaining_sat == 0)
+            target.status = (target.pric_remaining_sat <= kOrderDustRemainderSat)
                 ? Status::Filled : Status::Active;
             if (peer && peer->status == Status::Matched) {
                 if (peer->pric_in_flight_sat != consumed) {
@@ -576,7 +587,7 @@ MutateResult Fill(CWallet& wallet, const uint256& order_id)
                 peer->pric_remaining_sat -= consumed;
                 peer->pric_in_flight_sat = 0;
                 peer->matched_with_order_id = uint256{};
-                peer->status = (peer->pric_remaining_sat == 0)
+                peer->status = (peer->pric_remaining_sat <= kOrderDustRemainderSat)
                     ? Status::Filled : Status::Active;
             }
             return MutateResult::Ok;
