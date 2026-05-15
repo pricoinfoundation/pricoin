@@ -966,6 +966,52 @@ void PricCoopSignDialog::onDmReceived(const QString& from_xonly_hex,
             // unconditionally because they MUST agree across both
             // sides; we keep that behavior. (2026-05-14 staleness
             // hardening — same class as round-1 / round-3.)
+            //
+            // Cross-session reset: if the incoming sighash differs
+            // from what we have on file AND we don't yet have a final
+            // signature, the spender re-ran buildtx (typically after a
+            // restart with fresh random decoys → new sighash). All
+            // Step-1/2/3 intermediates were bound to the OLD sighash
+            // and are now stale; clearing them lets the cascade
+            // restart cleanly. Without this, m_KI from a prior partial
+            // attempt would set `consumed_for_step2` and block field
+            // updates indefinitely.
+            const std::string new_sighash =
+                env.exists("sighash") && env["sighash"].isStr()
+                    ? env["sighash"].get_str() : std::string{};
+            const std::string cur_sighash = m_in_msg
+                ? m_in_msg->text().trimmed().toStdString() : std::string{};
+            if (m_final_blob_hex.isEmpty()
+                && !new_sighash.empty()
+                && !cur_sighash.empty()
+                && new_sighash != cur_sighash) {
+                // Drop Step-1/2/3 intermediates so the cascade can rebuild
+                // them against the new sighash. Loadshare outputs
+                // (m_x_share, m_z_share, m_X_pub_X, m_Z_pub_X) stay —
+                // they're deterministic over inputs that haven't changed.
+                m_alpha.clear();
+                m_my_L_share.clear(); m_my_R_share.clear();
+                m_my_KI_share.clear(); m_my_D_share.clear();
+                m_my_commitment.clear();
+                m_my_dleq_alpha.clear(); m_my_dleq_x.clear(); m_my_dleq_z.clear();
+                m_KI.clear(); m_D.clear();
+                m_L_pi.clear(); m_R_pi.clear();
+                m_L_prime.clear(); m_R_prime.clear();
+                m_c_pi.clear(); m_c0.clear();
+                m_mu_P.clear(); m_mu_C.clear();
+                m_s_others_json.clear();
+                m_my_s_share.clear();
+                if (m_in_peer_share_json) m_in_peer_share_json->clear();
+                if (m_in_peer_s_share) m_in_peer_s_share->clear();
+                m_auto_step1_fired = false;
+                m_auto_step2_fired = false;
+                m_auto_step3_fired = false;
+                m_auto_step4_fired = false;
+                m_auto_step1_dm_sent = false;
+                m_auto_step3_dm_sent = false;
+                setStatus(tr("Spender re-ran buildtx (new sighash) — "
+                             "clearing stale Step-1/2/3 intermediates."));
+            }
             const bool consumed_for_step2 = !m_KI.isEmpty();
             auto set_if_changed_le = [&](QLineEdit* w, const QString& incoming) {
                 if (!w) return;
