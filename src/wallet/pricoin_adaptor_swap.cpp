@@ -4,6 +4,8 @@
 
 #include <wallet/pricoin_adaptor_swap.h>
 
+#include <core_io.h>
+#include <primitives/transaction.h>
 #include <random.h>
 #include <streams.h>
 #include <swap/refund.h>
@@ -560,6 +562,19 @@ TransitionResult SetPricFundingPlanned(
         return TransitionResult::InvalidInput;
     }
     if (planned_vout < 0) return TransitionResult::InvalidInput;
+    // Compute the deterministic txid from the signed hex up front so
+    // the dialog + watcher can reference the funding output by txid
+    // before broadcast. PRIC ringsig CT txs have no signature
+    // malleability once signed, so this txid is final.
+    uint256 planned_txid;
+    {
+        CMutableTransaction mtx;
+        if (!DecodeHexTx(mtx, unsigned_tx_hex,
+                         /*try_no_witness=*/true, /*try_witness=*/true)) {
+            return TransitionResult::InvalidInput;
+        }
+        planned_txid = mtx.GetHash().ToUint256();
+    }
     return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
         // Pre-funding states only — once the swap is past funding the
         // hex on disk is moot (the on-chain tx is authoritative).
@@ -579,6 +594,14 @@ TransitionResult SetPricFundingPlanned(
         }
         s.pric_funding_unsigned_tx_hex = unsigned_tx_hex;
         s.pric_funding_planned_vout    = planned_vout;
+        // Pin the funding txid + vout so existing buildtx / dialog
+        // prefill paths (which read pric_funding_txid_hex) work for
+        // the pre-broadcast ceremony. pric_funding_height stays 0
+        // until the tx confirms on chain.
+        if (s.pric_funding_txid.IsNull()) {
+            s.pric_funding_txid = planned_txid;
+            s.pric_funding_vout = planned_vout;
+        }
         return TransitionResult::Ok;
     });
 }

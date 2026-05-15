@@ -347,17 +347,47 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
 
 void PricCoopSignDialog::onRunLoadshare()
 {
-    const QString joint_txid = m_in_bt_joint_txid ? m_in_bt_joint_txid->text().trimmed() : QString{};
-    const QString joint_vout = m_in_bt_joint_vout ? m_in_bt_joint_vout->text().trimmed() : QString{};
-    if (joint_txid.size() != 64) {
-        setStatus(tr("Joint txid must be 32-byte hex (fill it in the Buildtx helper above first)"), true);
-        return;
+    const QString joint_txid_field = m_in_bt_joint_txid ? m_in_bt_joint_txid->text().trimmed() : QString{};
+    const QString joint_vout_field = m_in_bt_joint_vout ? m_in_bt_joint_vout->text().trimmed() : QString{};
+
+    // Resolve the joint output's tx hex + vout. Two sources, in
+    // preference order — same dispatch as tryAutoComputeJointscanPartial:
+    //   1. snap->pric_funding_unsigned_tx_hex / pric_funding_planned_vout
+    //      — Alice's pre-built funding tx, persisted before broadcast.
+    //   2. Form field `joint_txid` + on-chain getrawtransaction —
+    //      fallback for the legacy/post-funding ceremony order.
+    std::string tx_hex_resolved;
+    int vout = -1;
+    bool used_planned = false;
+    if (m_wm && !m_swap_id.isEmpty()) {
+        auto snap_pre = m_wm->wallet().adaptorSwapGet(m_swap_id.toStdString());
+        if (snap_pre
+            && !snap_pre->pric_funding_unsigned_tx_hex.empty()
+            && snap_pre->pric_funding_planned_vout >= 0) {
+            tx_hex_resolved = snap_pre->pric_funding_unsigned_tx_hex;
+            vout = snap_pre->pric_funding_planned_vout;
+            used_planned = true;
+        }
     }
-    bool vout_ok = false;
-    int vout = joint_vout.toInt(&vout_ok);
-    if (!vout_ok || vout < 0) {
-        setStatus(tr("Joint vout invalid"), true);
-        return;
+    if (!used_planned) {
+        if (joint_txid_field.size() != 64) {
+            setStatus(tr("Joint txid must be 32-byte hex (fill it in the Buildtx helper above first), "
+                         "or wait for the pre-built funding tx hex to land on the swap record."), true);
+            return;
+        }
+        bool vout_ok = false;
+        vout = joint_vout_field.toInt(&vout_ok);
+        if (!vout_ok || vout < 0) {
+            setStatus(tr("Joint vout invalid"), true);
+            return;
+        }
+    } else {
+        // Best-effort: also surface the planned vout in the form so a
+        // user inspecting the dialog sees what was used.
+        if (m_in_bt_joint_vout
+            && m_in_bt_joint_vout->text().trimmed().isEmpty()) {
+            m_in_bt_joint_vout->setText(QString::number(vout));
+        }
     }
     const QString my_p   = m_in_ls_my_partial->text().trimmed();
     const QString peer_p = m_in_ls_peer_partial->text().trimmed();
@@ -388,19 +418,26 @@ void PricCoopSignDialog::onRunLoadshare()
         return;
     }
 
-    // Need the joint tx_hex. Fetch via getrawtransaction; works with
-    // -txindex=1 (now defaulted) for any historical tx.
-    UniValue params_get_v{UniValue::VARR};
-    params_get_v.push_back(joint_txid.toStdString());
-    params_get_v.push_back(1);
-    auto rg = callRpc("getrawtransaction", params_get_v.write(0));
-    if (!rg.ok) {
-        setStatus(tr("getrawtransaction failed: %1").arg(QString::fromStdString(rg.error_msg)), true);
-        return;
+    // Need the joint tx_hex. If we sourced it from the swap record
+    // (pre-funding ceremony order, post-2026-05-15), reuse it. Otherwise
+    // fetch via getrawtransaction (works with -txindex=1, now defaulted,
+    // for any historical tx).
+    std::string tx_hex;
+    if (used_planned) {
+        tx_hex = tx_hex_resolved;
+    } else {
+        UniValue params_get_v{UniValue::VARR};
+        params_get_v.push_back(joint_txid_field.toStdString());
+        params_get_v.push_back(1);
+        auto rg = callRpc("getrawtransaction", params_get_v.write(0));
+        if (!rg.ok) {
+            setStatus(tr("getrawtransaction failed: %1").arg(QString::fromStdString(rg.error_msg)), true);
+            return;
+        }
+        UniValue gv;
+        gv.read(rg.json);
+        tx_hex = gv["hex"].get_str();
     }
-    UniValue gv;
-    gv.read(rg.json);
-    const std::string tx_hex = gv["hex"].get_str();
 
     UniValue params_v{UniValue::VARR};
     params_v.push_back(tx_hex);

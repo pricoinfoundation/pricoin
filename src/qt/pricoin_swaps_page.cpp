@@ -355,15 +355,22 @@ void PricoinSwapsPage::refreshTable()
         //   btc_funded    → BothFunded  (Alice broadcasts pre-built, role-gated)
         //   both_funded   → PricClaimed (Bob auto-adapt+broadcast claim)
         //   pric_claimed  → Complete    (Alice auto-LTC-claim)
-        if (s.state == "adaptor_ready"
-            && prev != "adaptor_ready") {
+        if (s.state == "adaptor_ready") {
             // Cooperative-sign ceremony fires on BOTH roles. Alice's
-            // path inside onAdvanceClicked first runs walletsendct_ring
-            // (broadcast=false) and DMs Bob the hex; both then open
-            // the coopsign dialog. Bob's path waits inside that
-            // handler until his swap record receives the hex DM (so a
-            // tick race doesn't open the dialog before the DM lands).
-            should_fire = true;
+            // path runs walletsendct_ring (broadcast=false) and DMs
+            // Bob the hex; both then open the coopsign dialog. Bob
+            // can ONLY fire once the hex DM has landed — otherwise
+            // his onAdvanceClicked returns early ("waiting…") and the
+            // fire_key would mark him as already-fired, blocking the
+            // re-try when the DM eventually arrives. Gate his fire on
+            // hex presence; the fire_key is only inserted when fired,
+            // so subsequent ticks retry the check naturally.
+            // No prev-state guard — we want every tick to re-evaluate
+            // until the prerequisite (hex for Bob) becomes available.
+            if (s.role == "alice"
+                || !s.pric_funding_unsigned_tx_hex.empty()) {
+                should_fire = true;
+            }
         }
         if (s.state == "pre_signed" && s.role == "bob") {
             // Bob auto-funds the foreign chain (BTC/LTC) once presigs
