@@ -414,12 +414,21 @@ void PricoinSwapsPage::refreshTable()
         QMetaObject::invokeMethod(this, [this, sid]() {
             // Re-check the current state at fire time — user may have
             // already clicked through manually, or the swap may have
-            // advanced past both_funded on its own.
+            // advanced on its own. The queued invocation must accept
+            // every state we auto-advance from (setup, adaptor_ready,
+            // both_funded). 2026-05-15: this used to hardcode
+            // "both_funded" — leftover from when only the BothFunded
+            // transition auto-fired. After setup + adaptor_ready
+            // were added, the early-return kept blocking them.
+            bool eligible = false;
             for (const auto& s : m_swaps) {
                 if (s.swap_id != sid) continue;
-                if (s.state != "both_funded") return;
+                eligible = (s.state == "setup"
+                            || s.state == "adaptor_ready"
+                            || s.state == "both_funded");
                 break;
             }
+            if (!eligible) return;
             // Select the row so onAdvanceClicked picks it up via
             // selectedSwapId(). Falls back to a no-op if the row isn't
             // selectable (e.g. terminal-filter hides it).
