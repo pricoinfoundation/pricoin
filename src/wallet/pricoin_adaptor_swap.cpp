@@ -110,6 +110,25 @@ bool LoadFromDBLocked(CWallet& wallet, WalletCache& cache)
             ++dropped;
             continue;
         }
+        // Back-fill: pre-2026-05-15 builds wrote `pric_funding_unsigned_tx_hex`
+        // and `pric_funding_planned_vout` without pinning the deterministic
+        // `pric_funding_txid` derived from the hex. The cooperative-sign
+        // dialog reads pric_funding_txid via the snapshot prefill, so an
+        // empty value blocks buildtx. Decode the hex here once on load
+        // and pin both fields if the record predates the pinning fix.
+        // Idempotent: skip if either the hex is empty or the txid is
+        // already set.
+        if (!s.pric_funding_unsigned_tx_hex.empty()
+            && s.pric_funding_txid.IsNull()) {
+            CMutableTransaction back_mtx;
+            if (DecodeHexTx(back_mtx, s.pric_funding_unsigned_tx_hex,
+                             /*try_no_witness=*/true, /*try_witness=*/true)) {
+                s.pric_funding_txid = back_mtx.GetHash().ToUint256();
+                if (s.pric_funding_vout < 0 && s.pric_funding_planned_vout >= 0) {
+                    s.pric_funding_vout = s.pric_funding_planned_vout;
+                }
+            }
+        }
         cache.by_id[sid] = std::move(s);
     }
     if (dropped > 0) {
@@ -585,19 +604,25 @@ TransitionResult SetPricFundingPlanned(
             return TransitionResult::InvalidState;
         }
         if (!s.pric_funding_unsigned_tx_hex.empty()) {
-            // Idempotent re-set with same value is OK.
-            if (s.pric_funding_unsigned_tx_hex == unsigned_tx_hex
-                && s.pric_funding_planned_vout == planned_vout) {
-                return TransitionResult::Ok;
+            // Idempotent re-set with same value is OK. Reject only
+            // when a conflicting hex/vout is offered (don't clobber
+            // a value already committed).
+            if (s.pric_funding_unsigned_tx_hex != unsigned_tx_hex
+                || s.pric_funding_planned_vout != planned_vout) {
+                return TransitionResult::InvalidInput;
             }
-            return TransitionResult::InvalidInput;
+            // Fall through: even when the hex matches, we may still
+            // need to back-fill pric_funding_txid for swap records
+            // written by an earlier code path that didn't pin it.
+        } else {
+            s.pric_funding_unsigned_tx_hex = unsigned_tx_hex;
+            s.pric_funding_planned_vout    = planned_vout;
         }
-        s.pric_funding_unsigned_tx_hex = unsigned_tx_hex;
-        s.pric_funding_planned_vout    = planned_vout;
         // Pin the funding txid + vout so existing buildtx / dialog
         // prefill paths (which read pric_funding_txid_hex) work for
         // the pre-broadcast ceremony. pric_funding_height stays 0
-        // until the tx confirms on chain.
+        // until the tx confirms on chain. Idempotent: if already
+        // pinned (and to the same value), this is a no-op.
         if (s.pric_funding_txid.IsNull()) {
             s.pric_funding_txid = planned_txid;
             s.pric_funding_vout = planned_vout;
