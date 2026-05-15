@@ -4,7 +4,9 @@
 
 #include <wallet/pricoin_chain_watcher.h>
 
+#include <cmath>
 #include <common/args.h>
+#include <wallet/pricoin_offer.h>
 #include <crypto/sha256.h>
 #include <interfaces/chain.h>
 #include <logging.h>
@@ -472,8 +474,25 @@ void ChainWatcher::TryAutoRefundLtc()
                 *tip, s.foreign_refund_height,
                 s.swap_id.ToString().substr(0, 12));
 
+        // Estimate fee dynamically from the LTC chain backend. 6-block
+        // target; fall back to 10000 sat if the backend doesn't return
+        // estimates (overpay slightly is fine on a refund — better
+        // than producing a tx no miner includes during congestion).
+        int64_t fee_sat = 10000;
+        {
+            const auto est = client->GetFeeEstimates();
+            for (int target : {6, 10, 3, 20, 144, 2, 1}) {
+                auto it_e = est.find(target);
+                if (it_e != est.end() && it_e->second > 0.0) {
+                    // LTC HTLC refund tx ≈ 155 vB.
+                    fee_sat = static_cast<int64_t>(
+                        std::ceil(155.0 * it_e->second));
+                    break;
+                }
+            }
+        }
         auto r = ::wallet::pricoin_swap_refund::AutoBroadcastLtcRefund(
-            m_wallet, s.swap_id, dest, /*fee_sat=*/1000);
+            m_wallet, s.swap_id, dest, fee_sat);
         if (r.ok) {
             LogInfo("Pricoin auto-refund: LTC refund broadcast for swap %s, "
                     "txid %s\n",
@@ -788,6 +807,47 @@ bool ChainWatcher::HandleEntry(const WatchEntry& e)
     case WatchKind::ForeignRefund:
         r = SetRefunded(m_wallet, e.swap_id, /*pric=*/uint256{}, e.txid_hex);
         break;
+    }
+
+    // Post-terminal order bookkeeping: when a swap reaches a
+    // terminal state, the matched order should auto-update:
+    //   * complete  → Fill (decrements remaining; → Filled if 0 left,
+    //                 else → Active for partial fills)
+    //   * refunded  → Unmatch (release back to Active without
+    //                 consuming any of the order's amount)
+    //   * aborted   → Unmatch (same — funds never moved)
+    // Without an order_id field on the swap record, we identify the
+    // matched order by checking this wallet's Matched orders for one
+    // whose pric_in_flight_sat matches the swap's pric_amount_sat.
+    // In the common case there's at most one Matched order per swap,
+    // so this disambiguates cleanly.
+    if (r == TR::Ok && (e.kind == WatchKind::ForeignClaim
+                        || e.kind == WatchKind::PricRefund
+                        || e.kind == WatchKind::ForeignRefund)) {
+        AdaptorSwap snap;
+        if (Get(m_wallet, e.swap_id, snap) == LookupResult::Ok) {
+            std::vector<::wallet::pricoin_offer::Order> orders;
+            if (::wallet::pricoin_offer::List(m_wallet, orders)
+                == ::wallet::pricoin_offer::LookupResult::Ok) {
+                for (const auto& o : orders) {
+                    using OS = ::wallet::pricoin_offer::Status;
+                    if (o.status != OS::Matched) continue;
+                    if (o.pric_in_flight_sat != snap.pric_amount_sat) continue;
+                    using MR = ::wallet::pricoin_offer::MutateResult;
+                    MR mr = (e.kind == WatchKind::ForeignClaim)
+                        ? ::wallet::pricoin_offer::Fill(m_wallet, o.payload.order_id)
+                        : ::wallet::pricoin_offer::Unmatch(m_wallet, o.payload.order_id);
+                    if (mr == MR::Ok) {
+                        LogInfo("Pricoin order bookkeeping: %s applied to "
+                                "order %s after swap %s reached terminal state\n",
+                                (e.kind == WatchKind::ForeignClaim ? "Fill" : "Unmatch"),
+                                o.payload.order_id.ToString().substr(0, 12),
+                                e.swap_id.ToString().substr(0, 12));
+                    }
+                    break;  // one matched order per swap; stop after first hit.
+                }
+            }
+        }
     }
 
     if (r != TR::Ok) {

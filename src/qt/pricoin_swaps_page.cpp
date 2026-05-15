@@ -59,6 +59,51 @@ QString FormatSat(int64_t sat) {
                               static_cast<long long>(frac));
 }
 
+// Per-tx vbyte estimates for foreign-chain transactions in the swap
+// flow. Approximate; the exact byte count depends on segwit
+// witness sizes and BIP341 control-block lengths, but these are
+// within ~10% which is fine for fee estimation.
+constexpr int kVbForeignFunding   = 155;  // 1-in / 2-out P2TR or P2WPKH
+constexpr int kVbForeignClaim     = 155;  // 1-in P2TR/P2WPKH + 1-out (claim path)
+constexpr int kVbForeignRefund    = 155;  // similar shape (refund path)
+
+// Estimate a foreign-chain fee in sats. Calls the chain backend's
+// fee-estimator (Esplora), picks a 6-block-target rate, multiplies
+// by the supplied vbyte estimate. Falls back to a high hardcode if
+// the backend is unreachable — overpaying by a small amount is
+// better than producing a tx no miner will include during a fee
+// spike. Used by every swap-page broadcast site so users don't see
+// a 1000-sat hardcode silently produce stuck txs.
+int64_t EstimateForeignFeeSat(::interfaces::Node& node,
+                               const std::string& chain,
+                               int est_vb,
+                               int64_t fallback_sat = 10000)
+{
+    UniValue pe{UniValue::VARR};
+    pe.push_back(chain);
+    try {
+        UniValue est = node.executeRpc(
+            "pricoin_chainwatch_fee_estimates", pe, "");
+        double sat_per_vb = -1.0;
+        if (est.isObject()) {
+            for (int t : {6, 10, 3, 20, 144, 2, 1}) {
+                const auto v = est[strprintf("%d", t)];
+                if (v.isNum() && v.get_real() > 0) {
+                    sat_per_vb = v.get_real();
+                    break;
+                }
+            }
+        }
+        if (sat_per_vb > 0.0) {
+            return static_cast<int64_t>(
+                std::ceil(static_cast<double>(est_vb) * sat_per_vb));
+        }
+    } catch (...) {
+        // Backend unreachable — fall through to fallback.
+    }
+    return fallback_sat;
+}
+
 QColor StateColor(const std::string& s) {
     if (s == "setup")         return QColor(0x70, 0x70, 0x70); // grey — gathering data
     if (s == "adaptor_ready") return QColor(0x14, 0x4f, 0xc9); // blue
@@ -987,33 +1032,8 @@ void PricoinSwapsPage::onAdvanceClicked()
             // hardcode (10000 sats) than the old 1000 — better to
             // overpay slightly than to broadcast a tx that no miner
             // includes during congestion.
-            int64_t fund_fee_sat = 10000;
-            {
-                UniValue pe{UniValue::VARR};
-                pe.push_back(snap.foreign_chain);
-                try {
-                    UniValue est = m_model->node().executeRpc(
-                        "pricoin_chainwatch_fee_estimates", pe, "");
-                    double sat_per_vb = -1.0;
-                    if (est.isObject()) {
-                        for (int t : {6, 10, 3, 20, 144, 2, 1}) {
-                            const auto v = est[strprintf("%d", t)];
-                            if (v.isNum() && v.get_real() > 0) {
-                                sat_per_vb = v.get_real();
-                                break;
-                            }
-                        }
-                    }
-                    if (sat_per_vb > 0.0) {
-                        // 1-in / 2-out P2TR funding tx ≈ 155 vB. Round up.
-                        const int est_vb = 155;
-                        fund_fee_sat = static_cast<int64_t>(
-                            std::ceil(static_cast<double>(est_vb) * sat_per_vb));
-                    }
-                } catch (...) {
-                    // Backend unreachable — keep the conservative fallback.
-                }
-            }
+            const int64_t fund_fee_sat = EstimateForeignFeeSat(
+                m_model->node(), snap.foreign_chain, kVbForeignFunding);
             UniValue p{UniValue::VARR};
             p.push_back(sid);
             p.push_back(fund_fee_sat);
@@ -1792,8 +1812,9 @@ void PricoinSwapsPage::onAdaptBtcClaimClicked()
         }
         form->addRow(tr("Destination LTC address:"), dest_in);
         auto* fee_in  = new QLineEdit(&dlg);
-        fee_in->setText(QStringLiteral("1000"));
-        form->addRow(tr("Fee (sats):"), fee_in);
+        fee_in->setText(QString::number(
+            EstimateForeignFeeSat(m_model->node(), "ltc", kVbForeignRefund)));
+        form->addRow(tr("Fee (sats — backend-estimated):"), fee_in);
         auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
         QObject::connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
         QObject::connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -1830,6 +1851,25 @@ void PricoinSwapsPage::onAdaptBtcClaimClicked()
         const QString txid = QString::fromStdString((*r)["txid"].get_str());
         setStatus(tr("LTC claim broadcast — txid %1… (watching for confirmations).")
             .arg(txid.left(16)));
+        // DM the PRIC buyer so his wallet auto-advances pric_claimed
+        // → complete on confirmation (same logic as autoLtcClaim).
+        for (const auto& s2 : m_swaps) {
+            if (s2.swap_id != sid) continue;
+            if (s2.counterparty_pubkey_hex.size() < 66) break;
+            const QString peer_xonly = QString::fromStdString(
+                s2.counterparty_pubkey_hex.substr(2));
+            auto* nostr = m_model->getOrCreateNostrClient();
+            if (nostr) {
+                nostr->publishBroadcastAnnouncement(
+                    peer_xonly,
+                    QString::fromStdString(sid),
+                    QStringLiteral("foreign_claim"),
+                    txid,
+                    /*vout=*/0,
+                    /*min_confirmations=*/1);
+            }
+            break;
+        }
         refreshTable();
         onSwapwatchRefresh();
         return;
@@ -2014,8 +2054,9 @@ void PricoinSwapsPage::onLtcRefundClicked()
     }
     form->addRow(tr("Destination LTC address:"), dest_in);
     auto* fee_in = new QLineEdit(&dlg);
-    fee_in->setText(QStringLiteral("1000"));
-    form->addRow(tr("Fee (sats):"), fee_in);
+    fee_in->setText(QString::number(
+        EstimateForeignFeeSat(m_model->node(), "ltc", kVbForeignClaim)));
+    form->addRow(tr("Fee (sats — backend-estimated):"), fee_in);
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     QObject::connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     QObject::connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -2165,18 +2206,36 @@ bool PricoinSwapsPage::autoLtcClaim(const std::string& sid)
         // be re-checked on the next refreshTable tick.
         return false;
     }
-    const std::string dest = gArgs.GetArg("-pricoinltcclaimaddr", "");
+    // Destination resolution: explicit config wins, otherwise fall
+    // back to the wallet's holding LTC address. The holding address
+    // is derived locally (no chain-backend dependency) so this
+    // always populates when the wallet has stealth identity, which
+    // it must to have reached this state.
+    std::string dest = gArgs.GetArg("-pricoinltcclaimaddr", "");
     if (dest.empty()) {
-        setStatus(tr("Auto: LTC claim — no -pricoinltcclaimaddr set in "
-                      "pricoin.conf; click \"Adapt + broadcast LTC claim\" "
-                      "manually, or set the config and restart."), true);
+        UniValue p_ha{UniValue::VARR};
+        p_ha.push_back(std::string{"ltc"});
+        std::string ha_err;
+        auto r_ha = CallWalletRpc(m_model, "pricoin_btc_getaddress",
+                                   p_ha, &ha_err);
+        if (r_ha && (*r_ha).exists("address") && (*r_ha)["address"].isStr()) {
+            dest = (*r_ha)["address"].get_str();
+        }
+    }
+    if (dest.empty()) {
+        setStatus(tr("Auto: LTC claim — destination unknown. Set "
+                      "-pricoinltcclaimaddr in pricoin.conf or ensure "
+                      "the holding LTC address is available, then click "
+                      "\"Adapt + broadcast LTC claim\" manually."), true);
         return false;
     }
+    const int64_t fee_sat = EstimateForeignFeeSat(
+        m_model->node(), "ltc", kVbForeignClaim);
     UniValue p{UniValue::VARR};
     p.push_back(sid);
     p.push_back("");        // empty t_hex → use stored t_secret (has_t == true)
     p.push_back(dest);
-    p.push_back(1000);      // fee_sat
+    p.push_back(fee_sat);
     std::string err;
     auto r = CallWalletRpc(m_model, "pricoin_ltc_claim_swap", p, &err);
     if (!r) {
@@ -2187,6 +2246,26 @@ bool PricoinSwapsPage::autoLtcClaim(const std::string& sid)
     const QString txid = QString::fromStdString((*r)["txid"].get_str());
     setStatus(tr("Auto: LTC claim broadcast — txid %1… (watching for confirmations).")
         .arg(txid.left(16)));
+    // DM Bob the LTC claim txid so his wallet also registers a
+    // ForeignClaim watch — that's what advances his side from
+    // pric_claimed → complete (his wallet didn't broadcast and
+    // wouldn't otherwise know the LTC claim txid to monitor).
+    // Bob's wallet's tx_announce DM handler (walletmodel.cpp:656)
+    // calls pricoin_swapwatch_add with this txid + kind=foreign_claim.
+    if (snap_opt->counterparty_pubkey_hex.size() >= 66) {
+        const QString peer_xonly = QString::fromStdString(
+            snap_opt->counterparty_pubkey_hex.substr(2));
+        auto* nostr = m_model->getOrCreateNostrClient();
+        if (nostr) {
+            nostr->publishBroadcastAnnouncement(
+                peer_xonly,
+                QString::fromStdString(sid),
+                QStringLiteral("foreign_claim"),
+                txid,
+                /*vout=*/0,
+                /*min_confirmations=*/1);
+        }
+    }
     refreshTable();
     onSwapwatchRefresh();
     return true;

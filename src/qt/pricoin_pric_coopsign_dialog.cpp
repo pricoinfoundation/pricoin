@@ -172,12 +172,17 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
                 && snap->pric_refund_height > 0) {
                 m_in_bt_nlocktime->setText(QString::number(snap->pric_refund_height));
             }
-            // Destination: PRIC claim (adaptor) → Alice's stealth,
-            // PRIC refund (plain) → Bob's stealth.
+            // Destination convention: the CLAIM leg pays the PRIC
+            // buyer (Bob); the REFUND leg returns PRIC to the seller
+            // (Alice). Earlier this was inverted — claim went to
+            // pric_alice_recipient_stealth and refund to bob's. That
+            // meant Bob's PRIC claim broadcast paid into Alice's
+            // stealth instead of his own; recovery requires Alice's
+            // wallet to manually return the PRIC. 2026-05-15 fix.
             if (m_in_bt_dest) {
                 const std::string& dest =
-                    (m_mode == Mode::PricAdaptor) ? snap->pric_alice_recipient_stealth
-                                                   : snap->pric_bob_recipient_stealth;
+                    (m_mode == Mode::PricAdaptor) ? snap->pric_bob_recipient_stealth
+                                                   : snap->pric_alice_recipient_stealth;
                 if (!dest.empty()) {
                     m_in_bt_dest->setText(QString::fromStdString(dest));
                 }
@@ -1965,7 +1970,7 @@ void PricCoopSignDialog::buildLayout(const QString& title)
         form->addRow(tr("Joint blind:"), m_in_bt_joint_blind);
 
         m_in_bt_dest = new QLineEdit(box);
-        m_in_bt_dest->setPlaceholderText(tr("Recipient PRIC stealth address (Alice's for claim, Bob's for refund)"));
+        m_in_bt_dest->setPlaceholderText(tr("Recipient PRIC stealth address (Bob's for claim, Alice's for refund)"));
         form->addRow(tr("Destination:"), m_in_bt_dest);
 
         m_in_bt_dest_amount = new QLineEdit(box);

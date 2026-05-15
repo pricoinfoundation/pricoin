@@ -164,22 +164,25 @@ void PricoinHoldingPage::buildLayout()
         addr_row->addWidget(panel.btn_copy);
         form->addRow(tr("Address:"), addr_row);
 
+        // Balance + Sweep on a single row — wide screens were leaving
+        // a lot of horizontal whitespace beside the bold balance text;
+        // putting the "Sweep all to…" button to the right of the
+        // balance uses that real estate without forcing a separate
+        // button row at the bottom.
         panel.balance = new QLabel(tr("(loading…)"), box);
         QFont bf = panel.balance->font();
         bf.setBold(true);
         panel.balance->setFont(bf);
-        form->addRow(tr("Balance:"), panel.balance);
+        panel.btn_sweep = new QPushButton(tr("Sweep all to…"), box);
+        auto* bal_row = new QHBoxLayout();
+        bal_row->addWidget(panel.balance, /*stretch=*/1);
+        bal_row->addWidget(panel.btn_sweep);
+        form->addRow(tr("Balance:"), bal_row);
 
         panel.hint = new QLabel(box);
         panel.hint->setStyleSheet(QStringLiteral("QLabel { color: #555; }"));
         panel.hint->setWordWrap(true);
         form->addRow(QString(), panel.hint);
-
-        auto* btn_row = new QHBoxLayout();
-        panel.btn_sweep = new QPushButton(tr("Sweep all to…"), box);
-        btn_row->addWidget(panel.btn_sweep);
-        btn_row->addStretch();
-        form->addRow(QString(), btn_row);
         return box;
     };
 
