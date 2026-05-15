@@ -349,44 +349,43 @@ void PricoinSwapsPage::refreshTable()
             // no-op. Fire only for Bob.
             should_fire = true;
         }
-        if (s.state == "adaptor_ready" && s.role == "bob") {
-            // Bob also funds the foreign chain (BTC/LTC). His
-            // onAdvanceClicked at adaptor_ready estimates fee, calls
-            // pricoin_btc_fund_swap, broadcasts the 2-of-2 funding
-            // tx, and DMs Alice the txid for her watcher. Alice's
-            // path at this state is just "wait for tx-announce DM",
-            // so fire only for Bob.
-            should_fire = true;
-        }
-        // NOTE: btc_funded → both_funded (Alice's PRIC funding) is
-        // intentionally NOT auto-fired. The current protocol order
-        // (funding before PreSigned) means Alice's onAdvanceClicked
-        // at btc_funded surfaces an "I ACCEPT" safety dialog warning
-        // that PRIC funds may be unrecoverable if the swap stalls
-        // before refund presigs are exchanged. Auto-firing would
-        // either trigger that dialog (worse UX than the current
-        // manual click) or, if we suppress the dialog, silently
-        // accept the strand-funds risk on the user's behalf. Wait
-        // for the protocol-order restructure (PreSigned BEFORE
-        // funding — see swap_automation memory) before this step
-        // becomes safe to auto-fire.
-        if (s.state == "both_funded" && prev != "both_funded") {
-            // Both legs confirmed — open the "Set pre-signatures" flow
-            // on BOTH sides so the cooperative ceremony fires without
-            // manual coordination. Per-state key gate guards re-entry.
+        // Post-2026-05-15 protocol order:
+        //   adaptor_ready → PreSigned (cooperative ceremony, BEFORE funding)
+        //   pre_signed    → BtcFunded   (Bob funds LTC, role-gated)
+        //   btc_funded    → BothFunded  (Alice broadcasts pre-built, role-gated)
+        //   both_funded   → PricClaimed (Bob auto-adapt+broadcast claim)
+        //   pric_claimed  → Complete    (Alice auto-LTC-claim)
+        if (s.state == "adaptor_ready"
+            && prev != "adaptor_ready") {
+            // Cooperative-sign ceremony fires on BOTH roles. Alice's
+            // path inside onAdvanceClicked first runs walletsendct_ring
+            // (broadcast=false) and DMs Bob the hex; both then open
+            // the coopsign dialog. Bob's path waits inside that
+            // handler until his swap record receives the hex DM (so a
+            // tick race doesn't open the dialog before the DM lands).
             should_fire = true;
         }
         if (s.state == "pre_signed" && s.role == "bob") {
-            // Bob (PRIC buyer) holds t_secret. At pre_signed he can
-            // adapt the cooperative PRIC claim pre-sig and broadcast.
-            // Alice's path at pre_signed is "wait for Bob's PRIC claim
-            // to confirm" — handled by her chain watcher, no UI
-            // action. Headless variant skips the dialog.
+            // Bob auto-funds the foreign chain (BTC/LTC) once presigs
+            // are in hand. Alice's path at this state is "wait for
+            // tx-announce DM", handled inline by the wallet-tier
+            // chainwatch DM handler.
+            should_fire = true;
+        }
+        if (s.state == "btc_funded" && s.role == "alice") {
+            // Alice auto-broadcasts the pre-built PRIC funding tx via
+            // pricoin_ct_relay_prebuilt. No I-ACCEPT typed gate — she
+            // already holds Bob's cooperative refund presig.
+            should_fire = true;
+        }
+        if (s.state == "both_funded" && s.role == "bob") {
+            // Bob auto-adapts + broadcasts the PRIC claim using the
+            // pre-signed claim adaptor sig. Bypasses onAdvanceClicked.
             QMetaObject::invokeMethod(this, [this, sid = s.swap_id]() {
                 autoAdaptPricClaim(sid);
             }, Qt::QueuedConnection);
             m_auto_advance_fired.insert(fire_key);
-            continue;  // bypass the onAdvanceClicked path below
+            continue;
         }
         if (s.state == "pric_claimed" && s.role == "alice"
             && s.foreign_chain == "ltc") {
@@ -423,9 +422,16 @@ void PricoinSwapsPage::refreshTable()
             bool eligible = false;
             for (const auto& s : m_swaps) {
                 if (s.swap_id != sid) continue;
+                // Post-2026-05-15 ordering: the queued auto-advance
+                // fires onAdvanceClicked for setup, adaptor_ready (the
+                // coopsign ceremony), pre_signed (Bob funds LTC) and
+                // btc_funded (Alice broadcasts pre-built PRIC). The
+                // both_funded → pric_claimed path goes through the
+                // direct autoAdaptPricClaim continue above.
                 eligible = (s.state == "setup"
                             || s.state == "adaptor_ready"
-                            || s.state == "both_funded");
+                            || s.state == "pre_signed"
+                            || s.state == "btc_funded");
                 break;
             }
             if (!eligible) return;
@@ -1015,8 +1021,14 @@ void PricoinSwapsPage::onAdvanceClicked()
         return;
     }
 
-    // ─── AdaptorReady → BtcFunded ───
-    if (snap.state == "adaptor_ready") {
+    // ─── PreSigned → BtcFunded ───
+    // Post-2026-05-15 protocol order: the cooperative refund + claim
+    // presigs are exchanged BEFORE any on-chain funding, so PreSigned
+    // precedes BtcFunded. Bob's LTC funding is the first locked-value
+    // step; Bob's unilateral CLTV refund covers the trivial case
+    // where Alice never broadcasts. Alice already has Bob's PRIC
+    // refund presig in hand at this point — no I-ACCEPT gate later.
+    if (snap.state == "pre_signed") {
         // Hands-free funding for the PRIC buyer (Bob): foreign-chain
         // 2-of-2 funding tx is built, signed, broadcast, and watch-
         // registered in one shot via pricoin_btc_fund_swap. Then we
@@ -1104,131 +1116,61 @@ void PricoinSwapsPage::onAdvanceClicked()
     }
 
     // ─── BtcFunded → BothFunded ───
+    // Post-2026-05-15 protocol order: Alice already holds Bob's PRIC
+    // refund presig (gathered at AdaptorReady, before any funding).
+    // The I-ACCEPT typed-confirmation gate is GONE — there is no
+    // "strand-funds risk" to acknowledge, because Alice has a presigned
+    // cooperative refund that she can broadcast unilaterally after the
+    // PRIC refund timelock.
+    // Alice's only action here is to release the pre-built funding tx
+    // she signed at AdaptorReady. pricoin_ct_relay_prebuilt does the
+    // network broadcast + persists the spent KI (skipped during
+    // pre-build).
     if (snap.state == "btc_funded") {
-        // Hands-free PRIC funding for Alice. Sends the swap's
-        // pric_amount_sat into the joint stealth address with a pinned
-        // ephemeral matching Bob's adaptor binding (snap.pric_ephemeral_r),
-        // registers a pric_funding watch (auto via the ScanTxForCTReceives
-        // / wallet machinery), and DMs Bob a tx_announce so his watcher
-        // tracks the same txid.
         if (snap.role == "bob") {
-            setStatus(tr("Waiting for PRIC seller to fund the joint stealth "
-                          "output. Your wallet will auto-advance when their "
-                          "tx-announce DM arrives and the funding tx confirms."));
+            setStatus(tr("Waiting for PRIC seller to broadcast the pre-built "
+                          "PRIC funding tx. Your wallet will auto-advance when "
+                          "the tx-announce DM arrives and the funding confirms."));
             return;
         }
         if (snap.role == "alice") {
-            if (!snap.has_pric_ephemeral_r ||
-                snap.pric_ephemeral_r_hex.size() != 64) {
-                setStatus(tr("Cannot auto-fund PRIC: missing ephemeral r from "
-                              "counterparty. Wait for the adaptor_setup DM, or "
-                              "abort and retry from a fresh match."), true);
+            if (snap.pric_funding_unsigned_tx_hex.empty()
+                || snap.pric_funding_planned_vout < 0) {
+                setStatus(tr("Cannot broadcast PRIC funding: pre-built tx hex "
+                              "not on the swap record. Was the AdaptorReady "
+                              "pre-build step skipped?"), true);
                 return;
             }
-            // SAFETY GATE: warn loudly if PRIC refund presig isn't in
-            // place. Funding now means: if the swap stalls before the
-            // PreSigned ceremony completes, the PRIC funding output is
-            // stuck in the joint stealth — recoverable only via a
-            // cooperative joint-spend ceremony with the counterparty
-            // (or, soon, the new "Recover PRIC" button). The current
-            // protocol order puts PreSigned AFTER funding, so this
-            // warning will fire on every initial swap until the order
-            // is restructured. Until then, ack the risk explicitly.
-            if (!snap.has_pric_refund_presig) {
-                QString warn = tr(
-                    "<b>PRIC refund pre-signature is NOT in place.</b><br><br>"
-                    "Funding %1 sats now means: if the protocol stalls before "
-                    "the PreSigned ceremony completes, the PRIC funding output "
-                    "will be locked in the joint stealth address. Recovery is "
-                    "only possible via a cooperative signing ceremony with the "
-                    "counterparty.<br><br>"
-                    "<b>Foreign-chain side</b> (%2): "
-                    "%3<br><br>"
-                    "If you're testing on small amounts and your counterparty "
-                    "is online and cooperating, this is acceptable. For real "
-                    "value, complete PreSigned before funding (current "
-                    "protocol order makes this awkward — fix is in progress).<br><br>"
-                    "Type <b>I ACCEPT</b> below to proceed with PRIC funding.")
-                    .arg(QString::number(snap.pric_amount_sat))
-                    .arg(QString::fromStdString(snap.foreign_chain))
-                    .arg(snap.foreign_chain == "ltc"
-                         ? tr("LTC HTLC has built-in CLTV unilateral refund — "
-                              "funder can recover after foreign_refund_height.")
-                         : tr("BTC 2-of-2 has NO unilateral refund — funder is "
-                              "at the mercy of the counterparty until refund "
-                              "presig exists."));
-                bool ok_typed = false;
-                const QString confirm = QInputDialog::getText(
-                    this, tr("⚠ PRIC funding without refund pre-sig"),
-                    warn, QLineEdit::Normal, QString(), &ok_typed);
-                if (!ok_typed) return;
-                if (confirm.trimmed() != QStringLiteral("I ACCEPT")) {
-                    setStatus(tr("PRIC fund cancelled — confirmation phrase mismatch."));
-                    return;
-                }
-            }
-            // Modest fixed fee — Pricoin doesn't have a fee-estimator
-            // yet on a fresh chain. Tx is ~3.5 KB; 10000 sats ≈ 3 sat/B,
-            // safe for an experimental chain at low traffic.
-            const CAmount fee_sats = 10000;
-            // Use walletsendct_ring (CT inputs + ring sig) rather than
-            // the transparent-input variant — production Pricoin users
-            // hold confidential outputs, not P2WPKH. The pinned_eph_priv
-            // param threads the swap's ephemeral r through to the
-            // recipient output's stealth derivation so on-chain P_pi
-            // matches the adaptor binding.
-            UniValue p_send{UniValue::VARR};
-            p_send.push_back(snap.pric_joint_stealth_address);
-            p_send.push_back(ValueFromAmount(snap.pric_amount_sat));
-            p_send.push_back(ValueFromAmount(fee_sats));
-            p_send.push_back(/*ring_size=*/4);
-            p_send.push_back(snap.pric_ephemeral_r_hex);
-            UniValue r_send;
+            UniValue p_relay{UniValue::VARR};
+            p_relay.push_back(snap.pric_funding_unsigned_tx_hex);
+            UniValue r_relay;
             try {
-                r_send = m_model->node().executeRpc("walletsendct_ring", p_send,
+                r_relay = m_model->node().executeRpc(
+                    "pricoin_ct_relay_prebuilt", p_relay,
                     "/wallet/" + m_model->getWalletName().toStdString());
             } catch (const UniValue& e) {
-                setStatus(tr("PRIC fund failed: %1").arg(
+                setStatus(tr("PRIC broadcast failed: %1").arg(
                     e.isObject() && e.exists("message")
                         ? QString::fromStdString(e["message"].get_str())
                         : QString::fromStdString(e.write())), true);
                 return;
             } catch (const std::exception& e) {
-                setStatus(tr("PRIC fund failed: %1").arg(e.what()), true);
+                setStatus(tr("PRIC broadcast failed: %1").arg(e.what()), true);
                 return;
             }
-            const std::string txid_hex = r_send["txid"].get_str();
-            // walletsendct_ring shuffles outputs internally for
-            // privacy, so the recipient can land at vout 0/1/2.
-            // Hard-coding 0 here caused the cooperative-sign
-            // loadshare to fail with "scriptPubKey mismatch" when
-            // the joint stealth output ended up at a different vout
-            // (the wrong output gets scanned, math doesn't agree).
-            // Use the recipient_vout returned by walletsendct_ring.
-            int recipient_vout = 0;
-            if (r_send.exists("recipient_vout") && r_send["recipient_vout"].isNum()) {
-                recipient_vout = r_send["recipient_vout"].getInt<int>();
-                if (recipient_vout < 0) recipient_vout = 0;
-            }
-            // Register a local pric_funding watch so the chain watcher
-            // ticks the swap forward when this tx confirms — symmetric
-            // with what pricoin_btc_fund_swap does for the foreign leg.
-            // (walletsendct_ring just broadcasts; it doesn't know about
-            // swap state.)
+            const std::string txid_hex = r_relay["txid"].get_str();
+            const int recipient_vout = snap.pric_funding_planned_vout;
+            // Register the local pric_funding watch.
             try {
                 UniValue p_watch{UniValue::VARR};
                 p_watch.push_back(sid);
                 p_watch.push_back("pric_funding");
                 p_watch.push_back(txid_hex);
                 p_watch.push_back(recipient_vout);
-                p_watch.push_back(1);  // min_confirmations
+                p_watch.push_back(1);
                 m_model->node().executeRpc("pricoin_swapwatch_add", p_watch,
                     "/wallet/" + m_model->getWalletName().toStdString());
             } catch (...) {
-                // Watch already exists or other backend issue. Not fatal —
-                // the counterparty's watcher will still flip its side via
-                // the tx_announce, and a manual SetPricFunded works as
-                // fallback. Surface a soft warning.
                 setStatus(tr("PRIC fund broadcast but local watcher entry "
                               "could not be registered — state may need a "
                               "manual SetPricFunded after confirmation."), true);
@@ -1272,8 +1214,89 @@ void PricoinSwapsPage::onAdvanceClicked()
         return;
     }
 
-    // ─── BothFunded → PreSigned ───
-    if (snap.state == "both_funded") {
+    // ─── AdaptorReady → PreSigned ───
+    // Post-2026-05-15 protocol order: cooperative presigs are gathered
+    // BEFORE any on-chain funding. Alice's wallet first pre-builds
+    // (but does NOT broadcast) her PRIC funding tx via
+    // walletsendct_ring(broadcast=false), persists the hex + planned
+    // vout via adaptorSwapSetPricFundingPlanned, and DMs the hex to
+    // Bob (he needs it to compute his half of the cooperative scan
+    // partials). Both wallets then run the cooperative-sign dialog
+    // against the planned funding output. SetPreSigned advances state
+    // when both presigs are in hand.
+    if (snap.state == "adaptor_ready") {
+        // Alice's pre-build step — only runs if not already done.
+        if (snap.role == "alice"
+            && snap.pric_funding_unsigned_tx_hex.empty()) {
+            if (!snap.has_pric_ephemeral_r
+                || snap.pric_ephemeral_r_hex.size() != 64) {
+                setStatus(tr("Cannot pre-build PRIC funding: missing ephemeral r "
+                             "from counterparty. Wait for the adaptor_setup DM."), true);
+                return;
+            }
+            // Modest fixed fee — same as the post-funding path. Tx is
+            // ~3.5 KB; 10000 sats ≈ 3 sat/B on the experimental chain.
+            const CAmount fee_sats = 10000;
+            UniValue p_send{UniValue::VARR};
+            p_send.push_back(snap.pric_joint_stealth_address);
+            p_send.push_back(ValueFromAmount(snap.pric_amount_sat));
+            p_send.push_back(ValueFromAmount(fee_sats));
+            p_send.push_back(/*ring_size=*/4);
+            p_send.push_back(snap.pric_ephemeral_r_hex);
+            p_send.push_back(false);  // broadcast=false: build + sign only
+            UniValue r_send;
+            try {
+                r_send = m_model->node().executeRpc("walletsendct_ring", p_send,
+                    "/wallet/" + m_model->getWalletName().toStdString());
+            } catch (const UniValue& e) {
+                setStatus(tr("PRIC pre-build failed: %1").arg(
+                    e.isObject() && e.exists("message")
+                        ? QString::fromStdString(e["message"].get_str())
+                        : QString::fromStdString(e.write())), true);
+                return;
+            } catch (const std::exception& e) {
+                setStatus(tr("PRIC pre-build failed: %1").arg(e.what()), true);
+                return;
+            }
+            if (!r_send.exists("tx_hex") || !r_send["tx_hex"].isStr()) {
+                setStatus(tr("PRIC pre-build returned no tx_hex"), true);
+                return;
+            }
+            const std::string built_hex = r_send["tx_hex"].get_str();
+            int recipient_vout = 0;
+            if (r_send.exists("recipient_vout") && r_send["recipient_vout"].isNum()) {
+                recipient_vout = r_send["recipient_vout"].getInt<int>();
+                if (recipient_vout < 0) recipient_vout = 0;
+            }
+            auto sp = m_model->wallet().adaptorSwapSetPricFundingPlanned(
+                sid, built_hex, recipient_vout);
+            if (!sp) {
+                setStatus(tr("Persist planned funding failed: %1")
+                    .arg(QString::fromStdString(util::ErrorString(sp).original)), true);
+                return;
+            }
+            // DM Bob the hex so his coopsign can compute scan partials.
+            if (snap.counterparty_pubkey_hex.size() >= 66) {
+                auto* nostr = m_model->getOrCreateNostrClient();
+                if (nostr) {
+                    nostr->publishPricFundingPlanned(
+                        QString::fromStdString(snap.counterparty_pubkey_hex.substr(2)),
+                        QString::fromStdString(sid),
+                        QString::fromStdString(built_hex),
+                        recipient_vout);
+                }
+            }
+            // Refresh snapshot so the dialog sees the new fields.
+            auto snap_after = m_model->wallet().adaptorSwapGet(sid);
+            if (snap_after) snap = *snap_after;
+        }
+        // Bob waits until the DM lands and the swap record has the hex.
+        if (snap.role == "bob"
+            && snap.pric_funding_unsigned_tx_hex.empty()) {
+            setStatus(tr("Waiting for PRIC seller's pre-built funding hex DM "
+                         "(needed for cooperative-sign scan partials)."));
+            return;
+        }
         const bool is_ltc = (snap.foreign_chain == "ltc");
         dlg.setWindowTitle(tr("Set pre-signatures"));
         form->addRow(new QLabel(is_ltc
@@ -1398,8 +1421,12 @@ void PricoinSwapsPage::onAdvanceClicked()
         return;
     }
 
-    // ─── PreSigned → PricClaimed ───
-    if (snap.state == "pre_signed") {
+    // ─── BothFunded → PricClaimed ───
+    // Post-2026-05-15 protocol order: PRIC claim happens once BOTH
+    // legs are funded. Bob's wallet auto-fires `autoAdaptPricClaim`
+    // from refreshTable's auto-advance pass; this manual paste is a
+    // fallback for advanced users.
+    if (snap.state == "both_funded") {
         dlg.setWindowTitle(tr("Set PRIC claimed"));
         form->addRow(new QLabel(tr("PRIC buyer's claim tx is on-chain — t is now "
                                     "extractable. Record the claim txid."), &dlg));

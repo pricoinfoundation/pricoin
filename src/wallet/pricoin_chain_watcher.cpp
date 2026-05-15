@@ -451,9 +451,11 @@ void ChainWatcher::TryAutoRefundLtc()
         if (s.foreign_chain != "ltc") continue;
         // Refund only meaningful for states where on-chain LTC
         // exists but the swap hasn't completed/refunded already.
+        // Post-2026-05-15 ordering: PreSigned now precedes BtcFunded
+        // (presigs gathered before any funding), so it is NOT a
+        // funded state.
         if (s.state != State::BtcFunded
             && s.state != State::BothFunded
-            && s.state != State::PreSigned
             && s.state != State::PricClaimed) continue;
         if (s.foreign_funding_txid.empty()) continue;
         if (!s.foreign_refund_txid.empty()) continue;  // already refunded
@@ -533,7 +535,8 @@ void ChainWatcher::TryAutoRefundBtc()
     for (const auto& s : swaps) {
         if (m_stopping.load()) return;
         if (s.foreign_chain != "btc") continue;
-        if (s.state != State::PreSigned
+        // Post-2026-05-15 ordering: PreSigned is pre-funding now.
+        if (s.state != State::BtcFunded
             && s.state != State::PricClaimed
             && s.state != State::BothFunded) continue;
         if (s.btc_refund_unsigned_tx_hex.empty()) continue;
@@ -600,8 +603,9 @@ void ChainWatcher::TryAutoRefundPric()
     for (const auto& s : swaps) {
         if (m_stopping.load()) return;
         if (s.role != Role::Alice) continue;
-        if (s.state != State::PreSigned
-            && s.state != State::PricClaimed
+        // Post-2026-05-15 ordering: PRIC is funded at BothFunded /
+        // PricClaimed only. PreSigned is now pre-funding.
+        if (s.state != State::PricClaimed
             && s.state != State::BothFunded) continue;
         if (s.pric_refund_unsigned_tx_hex.empty()) continue;
         if (s.presigs.pric_refund_sig_blob.empty()) continue;

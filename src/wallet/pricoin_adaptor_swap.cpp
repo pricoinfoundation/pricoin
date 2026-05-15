@@ -346,7 +346,17 @@ TransitionResult SetBtcFunded(
         return TransitionResult::InvalidInput;
     }
     return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
-        if (s.state != State::AdaptorReady) return TransitionResult::InvalidState;
+        // Post-2026-05-15 protocol ordering: presigs are gathered
+        // BEFORE the foreign-chain funding so Alice has Bob's PRIC
+        // refund presig in hand before any of her PRIC is locked.
+        // Bob's LTC funding therefore advances from AdaptorReady; for
+        // safety, we still accept the same transition if the swap is
+        // already past PreSigned (rare race: Alice's coopsign ack
+        // arrives milliseconds before Bob's chainwatch event).
+        if (s.state != State::AdaptorReady
+            && s.state != State::PreSigned) {
+            return TransitionResult::InvalidState;
+        }
         s.foreign_funding_txid    = foreign_funding_txid;
         s.foreign_funding_vout    = foreign_funding_vout;
         s.foreign_funding_height  = foreign_funding_height;
@@ -382,7 +392,13 @@ TransitionResult SetPreSigned(
     const AdaptorSwapPreSigs& presigs)
 {
     return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
-        if (s.state != State::BothFunded) return TransitionResult::InvalidState;
+        // Post-2026-05-15 protocol ordering: presigs are gathered
+        // before any on-chain funding, so the source state is now
+        // AdaptorReady (not BothFunded). Removes the legacy
+        // "I ACCEPT" gate at btc_funded — once we're in PreSigned,
+        // Alice already holds Bob's PRIC refund presig and can
+        // safely broadcast her funding.
+        if (s.state != State::AdaptorReady) return TransitionResult::InvalidState;
         if (!presigs.IsComplete(s.foreign_chain)) return TransitionResult::InvalidInput;
         // Chain-specific size invariants. LTC HTLC swaps don't use
         // the BTC-side MuSig2 / Schnorr-adaptor fields at all, so
@@ -405,7 +421,9 @@ TransitionResult SetPricClaimed(
 {
     if (pric_claim_txid.IsNull()) return TransitionResult::InvalidInput;
     return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
-        if (s.state != State::PreSigned) return TransitionResult::InvalidState;
+        // Post-2026-05-15: PRIC claim happens once both legs are
+        // funded (and the presigs were already gathered earlier).
+        if (s.state != State::BothFunded) return TransitionResult::InvalidState;
         s.pric_claim_txid = pric_claim_txid;
         // Bob: t was published on-chain, so the in-wallet copy is no
         // longer secret. Wipe it so backups don't carry an obsolete
@@ -532,6 +550,39 @@ TransitionResult SetBtcRefundTx(
     });
 }
 
+TransitionResult SetPricFundingPlanned(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::string& unsigned_tx_hex,
+    int32_t planned_vout)
+{
+    if (unsigned_tx_hex.empty() || unsigned_tx_hex.size() < 20) {
+        return TransitionResult::InvalidInput;
+    }
+    if (planned_vout < 0) return TransitionResult::InvalidInput;
+    return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
+        // Pre-funding states only — once the swap is past funding the
+        // hex on disk is moot (the on-chain tx is authoritative).
+        if (s.state != State::Setup
+            && s.state != State::AdaptorReady
+            && s.state != State::PreSigned
+            && s.state != State::BtcFunded) {
+            return TransitionResult::InvalidState;
+        }
+        if (!s.pric_funding_unsigned_tx_hex.empty()) {
+            // Idempotent re-set with same value is OK.
+            if (s.pric_funding_unsigned_tx_hex == unsigned_tx_hex
+                && s.pric_funding_planned_vout == planned_vout) {
+                return TransitionResult::Ok;
+            }
+            return TransitionResult::InvalidInput;
+        }
+        s.pric_funding_unsigned_tx_hex = unsigned_tx_hex;
+        s.pric_funding_planned_vout    = planned_vout;
+        return TransitionResult::Ok;
+    });
+}
+
 TransitionResult SetPeerStealthPubkeys(
     CWallet& wallet,
     const uint256& swap_id,
@@ -584,9 +635,14 @@ TransitionResult SetRefunded(
     }
     return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
         // Refund is allowed once at least one funding has confirmed.
-        // Concretely: BothFunded, PreSigned, PricClaimed.
-        if (s.state != State::BothFunded
-            && s.state != State::PreSigned
+        // Post-2026-05-15 ordering, the funded states are:
+        //   BtcFunded   — Bob funded LTC, Alice not yet.
+        //   BothFunded  — both legs funded.
+        //   PricClaimed — Bob claimed; Alice may still need to claim/refund.
+        // PreSigned in the new ordering precedes any funding, so it is
+        // NOT a valid refund-source state.
+        if (s.state != State::BtcFunded
+            && s.state != State::BothFunded
             && s.state != State::PricClaimed) {
             return TransitionResult::InvalidState;
         }

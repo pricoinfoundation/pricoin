@@ -488,6 +488,8 @@ public:
         }
         o.has_pric_refund_presig = !s.presigs.pric_refund_sig_blob.empty();
         o.has_btc_refund_presig  = (s.presigs.btc_refund_sig.size() == 64);
+        o.pric_funding_unsigned_tx_hex = s.pric_funding_unsigned_tx_hex;
+        o.pric_funding_planned_vout    = s.pric_funding_planned_vout;
         return o;
     }
 
@@ -692,6 +694,18 @@ public:
         if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
         auto r = ::wallet::pricoin_adaptor_swap::SetBtcRefundTx(
             *m_wallet, *sid, unsigned_tx_hex);
+        return WrapTransition(r, this, *sid);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPricFundingPlanned(
+        const std::string& swap_id,
+        const std::string& unsigned_tx_hex,
+        int32_t planned_vout) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        auto r = ::wallet::pricoin_adaptor_swap::SetPricFundingPlanned(
+            *m_wallet, *sid, unsigned_tx_hex, planned_vout);
         return WrapTransition(r, this, *sid);
     }
 

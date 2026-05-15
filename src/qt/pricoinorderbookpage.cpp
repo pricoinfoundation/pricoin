@@ -13,6 +13,7 @@
 #include <qt/walletmodel.h>
 #include <interfaces/node.h>
 #include <tinyformat.h>
+#include <util/strencodings.h>
 #include <util/translation.h>
 #include <univalue.h>
 
@@ -142,27 +143,47 @@ public:
     }
 
     bool getParams(interfaces::Wallet::PricoinOfferCreateParams& out, QString& err) const {
-        bool ok_qty = false, ok_price = false;
-        const double qty   = m_qty->text().trimmed().toDouble(&ok_qty);
-        const double price = m_price->text().trimmed().toDouble(&ok_price);
-        if (!ok_qty   || qty   <= 0) { err = tr("quantity must be a positive number"); return false; }
-        if (!ok_price || price <= 0) { err = tr("price must be a positive number"); return false; }
+        // Parse user input as 8-decimal fixed-point integers. Doing the
+        // amount math in `double` and casting to int64 was producing
+        // off-by-one-sat artefacts (e.g. "0.005 / 0.00001" → 499.99999999
+        // instead of 500.00000000) because IEEE doubles can't exactly
+        // represent decimal fractions like 0.005 or 0.00001.
+        int64_t qty_sat = 0, price_sat = 0;
+        if (!ParseFixedPoint(m_qty->text().trimmed().toStdString(),   8, &qty_sat)
+            || qty_sat <= 0) {
+            err = tr("quantity must be a positive number with at most 8 decimal places");
+            return false;
+        }
+        if (!ParseFixedPoint(m_price->text().trimmed().toStdString(), 8, &price_sat)
+            || price_sat <= 0) {
+            err = tr("price must be a positive number with at most 8 decimal places");
+            return false;
+        }
+        constexpr int64_t kSatPerCoin = 100'000'000;
 
         out.side = m_side->currentData().toString().toStdString();
         out.foreign_chain = m_chain->currentData().toString().toStdString();
         // Qty interpretation:
-        //   sell_pric — qty is in PRIC; foreign side = qty * price.
-        //   buy_pric  — qty is in foreign; PRIC side = qty / price.
+        //   sell_pric — qty is in PRIC; foreign side = qty_pric * price_foreign_per_pric.
+        //   buy_pric  — qty is in foreign; PRIC side = qty_foreign / price_foreign_per_pric.
         // Both forms collapse to the same on-wire fields:
         //   max_pric_amount_sat       = the order's max PRIC quantity
         //   foreign_amount_at_max_sat = foreign paid at full fill
         // — i.e. the rate is foreign / pric.
+        // Use __int128 for the intermediate products to avoid overflow on
+        // large amounts (qty_sat up to ~9.2e18 / 1e8 = 9.2e10 coins is
+        // representable; the product can reach ~1e18 sat before saturating).
+        auto mul_div = [](int64_t a, int64_t b, int64_t d) -> int64_t {
+            __int128 prod = static_cast<__int128>(a) * static_cast<__int128>(b);
+            __int128 q = prod / static_cast<__int128>(d);
+            return static_cast<int64_t>(q);
+        };
         if (out.side == "sell_pric") {
-            out.max_pric_amount_sat       = static_cast<int64_t>(qty * 100'000'000.0);
-            out.foreign_amount_at_max_sat = static_cast<int64_t>(qty * price * 100'000'000.0);
+            out.max_pric_amount_sat       = qty_sat;
+            out.foreign_amount_at_max_sat = mul_div(qty_sat, price_sat, kSatPerCoin);
         } else {
-            out.max_pric_amount_sat       = static_cast<int64_t>((qty / price) * 100'000'000.0);
-            out.foreign_amount_at_max_sat = static_cast<int64_t>(qty * 100'000'000.0);
+            out.max_pric_amount_sat       = mul_div(qty_sat, kSatPerCoin, price_sat);
+            out.foreign_amount_at_max_sat = qty_sat;
         }
         if (out.max_pric_amount_sat <= 0 || out.foreign_amount_at_max_sat <= 0) {
             err = tr("computed amount underflowed to zero — increase qty or price");

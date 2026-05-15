@@ -619,7 +619,8 @@ void WalletModel::onAutoSwapwatchDM(const QString& from_xonly_hex,
     const std::string type = env["type"].get_str();
     // Skip non-coord DM types silently (orderbook handlers see them).
     if (type != "tx_announce" && type != "pricoin:swap_abort/v1" &&
-        type != "pricoin:adaptor_setup/v1") {
+        type != "pricoin:adaptor_setup/v1" &&
+        type != "pricoin:pric_funding_planned/v1") {
         return;
     }
     if (!env.exists("swap_id") || !env["swap_id"].isStr()) {
@@ -672,6 +673,23 @@ void WalletModel::onAutoSwapwatchDM(const QString& from_xonly_hex,
         } catch (const UniValue&) {
         } catch (const std::exception&) {
         }
+        return;
+    }
+
+    if (type == "pricoin:pric_funding_planned/v1") {
+        // Alice DMs Bob the pre-built (but not yet broadcast) PRIC
+        // funding tx hex + planned recipient_vout. Post-2026-05-15
+        // protocol order: cooperative refund + claim presigs run
+        // against this planned output BEFORE Alice broadcasts, so Bob
+        // needs the hex now to compute his half of the scan partials.
+        // Bob persists via adaptorSwapSetPricFundingPlanned.
+        if (snap->role != "bob") return;   // only Bob consumes this DM
+        if (!env.exists("hex") || !env["hex"].isStr()) return;
+        if (!env.exists("vout") || !env["vout"].isNum()) return;
+        const std::string hex     = env["hex"].get_str();
+        const int32_t     vout_p  = env["vout"].getInt<int32_t>();
+        if (hex.empty() || vout_p < 0) return;
+        wallet().adaptorSwapSetPricFundingPlanned(swap_id, hex, vout_p);
         return;
     }
 

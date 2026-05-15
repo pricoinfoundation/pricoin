@@ -273,6 +273,24 @@ struct AdaptorSwap {
     // BTC swaps that haven't reached PreSigned yet.
     std::string btc_refund_unsigned_tx_hex;
 
+    // PRIC funding unsigned-but-signed tx hex, captured by Alice's
+    // wallet at AdaptorReady time when the protocol pre-builds the
+    // funding tx so cooperative presigns can run before broadcast.
+    // Once the ceremony completes Alice broadcasts this hex and the
+    // watcher detects the funding output as it confirms. Bob also
+    // persists the hex (DM'd from Alice) so his side of the
+    // cooperative ceremony can compute scan partials without
+    // depending on `getrawtransaction` (the funding tx isn't on-chain
+    // until after the presigs are in hand). The signed hex is
+    // already final — Alice has signed her inputs locally; we just
+    // hold off on broadcast until the ceremony completes.
+    std::string pric_funding_unsigned_tx_hex;
+    // Planned recipient_vout for the joint stealth output inside the
+    // unsigned tx above. walletsendct_ring shuffles outputs at build
+    // time, so the vout is only known after the build. Persisted so
+    // the dialog + watcher know where to look.
+    int32_t     pric_funding_planned_vout{-1};
+
     // Cooperative-sign session state, persisted across dialog closes
     // so the user can quit/reopen mid-ceremony without losing alpha,
     // commitments, s_share, and other per-step intermediates. Each
@@ -399,6 +417,14 @@ struct AdaptorSwap {
         READWRITE(obj.pric_refund_session_json);
         READWRITE(obj.btc_claim_adaptor_session_json);
         READWRITE(obj.btc_refund_session_json);
+
+        // PRIC funding unsigned-but-signed tx hex + planned vout
+        // (appended 2026-05-15). Holds Alice's pre-built funding tx
+        // so the cooperative ceremony can run before broadcast.
+        // Same experimental/regtest-scope caveat as prior appends —
+        // pre-format records will fail to deserialize.
+        READWRITE(obj.pric_funding_unsigned_tx_hex);
+        READWRITE(obj.pric_funding_planned_vout);
     }
 };
 
@@ -585,6 +611,21 @@ TransitionResult SetBtcRefundTx(
     CWallet& wallet,
     const uint256& swap_id,
     const std::string& unsigned_tx_hex);
+
+// Pin Alice's pre-built (but not yet broadcast) PRIC funding tx
+// hex + the planned recipient_vout for the joint stealth output.
+// Captured by Alice's wallet right after walletsendct_ring(broadcast=false)
+// returns, and propagated to Bob's wallet via the funding-hex DM so
+// both sides can compute scan partials in the cooperative ceremony
+// before the funding tx hits the chain. State-restricted to non-
+// terminal pre-funding states (Setup, AdaptorReady, BtcFunded).
+// Idempotent re-set with same hex+vout is OK; clobber with different
+// values is rejected (refusing to forget a value already committed).
+TransitionResult SetPricFundingPlanned(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::string& unsigned_tx_hex,
+    int32_t planned_vout);
 
 // Cooperative-sign session legs. Selects which per-leg session JSON
 // field to read/write.

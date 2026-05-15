@@ -150,12 +150,26 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
                     m_in_dleq_t->setPlainText(QString::fromStdString(snap->adaptor_dleq_blob_hex));
                 }
             }
-            // Buildtx helper auto-pulls.
+            // Buildtx helper auto-pulls. Prefer the on-chain values
+            // once funding has broadcast; fall back to the pre-built
+            // funding tx (planned vout) when the protocol is running
+            // the cooperative ceremony BEFORE broadcast. Note: the
+            // pre-built path can't pre-fill `bt_joint_txid` until we
+            // compute the txid locally — that's a CHash on the
+            // serialized hex, which the dialog doesn't decode. The
+            // ceremony's loadshare path handles a missing txid by
+            // computing it from the supplied hex anyway, so we leave
+            // the field empty and rely on the auto-partial path to
+            // source from `pric_funding_unsigned_tx_hex` directly.
             if (m_in_bt_joint_txid && !snap->pric_funding_txid_hex.empty()) {
                 m_in_bt_joint_txid->setText(QString::fromStdString(snap->pric_funding_txid_hex));
             }
-            if (m_in_bt_joint_vout && snap->pric_funding_vout >= 0) {
-                m_in_bt_joint_vout->setText(QString::number(snap->pric_funding_vout));
+            if (m_in_bt_joint_vout) {
+                if (snap->pric_funding_vout >= 0) {
+                    m_in_bt_joint_vout->setText(QString::number(snap->pric_funding_vout));
+                } else if (snap->pric_funding_planned_vout >= 0) {
+                    m_in_bt_joint_vout->setText(QString::number(snap->pric_funding_planned_vout));
+                }
             }
             if (m_in_bt_joint_value && snap->pric_amount_sat > 0) {
                 // Joint output value in PRIC = sat / 1e8.
@@ -1298,51 +1312,67 @@ void PricCoopSignDialog::tryAutoComputeJointscanPartial()
     }
     auto snap = m_wm->wallet().adaptorSwapGet(m_swap_id.toStdString());
     if (!snap) return;
-    if (snap->pric_funding_txid_hex.empty() || snap->pric_funding_vout < 0
-        || snap->pric_funding_height <= 0) {
-        // Funding info not yet pinned — try again later (caller is
-        // safe to re-invoke once the swap record updates).
-        return;
-    }
 
-    // Resolve the funding tx hex via getrawtransaction. Prefer the
-    // blockhash-anchored form so it works without txindex (the case
-    // for the joint-stealth recipient who didn't broadcast).
-    std::string blockhash_hex;
-    {
-        UniValue p_h{UniValue::VARR};
-        p_h.push_back(snap->pric_funding_height);
-        auto rh = callRpc("getblockhash", p_h.write(0));
-        if (!rh.ok) {
-            setStatus(tr("Auto: getblockhash(%1) failed: %2")
-                .arg(snap->pric_funding_height)
-                .arg(QString::fromStdString(rh.error_msg)), true);
+    // Resolve the funding tx hex + vout. Two sources, in preference order:
+    //   1. snap->pric_funding_unsigned_tx_hex — set by Alice's wallet
+    //      after walletsendct_ring(broadcast=false) so cooperative
+    //      presigs can run BEFORE the funding tx hits the chain. This
+    //      is the post-2026-05-15 protocol order (presigs before
+    //      funding); the funding doesn't yet exist on-chain.
+    //   2. on-chain via getrawtransaction (pric_funding_txid_hex +
+    //      pric_funding_height) — fallback for already-funded swaps
+    //      or for the legacy ceremony order. The funding tx is in a
+    //      block and we look it up by blockhash so this works without
+    //      -txindex.
+    std::string tx_hex;
+    int32_t resolved_vout = -1;
+    if (!snap->pric_funding_unsigned_tx_hex.empty()
+        && snap->pric_funding_planned_vout >= 0) {
+        tx_hex = snap->pric_funding_unsigned_tx_hex;
+        resolved_vout = snap->pric_funding_planned_vout;
+    } else if (!snap->pric_funding_txid_hex.empty()
+               && snap->pric_funding_vout >= 0
+               && snap->pric_funding_height > 0) {
+        std::string blockhash_hex;
+        {
+            UniValue p_h{UniValue::VARR};
+            p_h.push_back(snap->pric_funding_height);
+            auto rh = callRpc("getblockhash", p_h.write(0));
+            if (!rh.ok) {
+                setStatus(tr("Auto: getblockhash(%1) failed: %2")
+                    .arg(snap->pric_funding_height)
+                    .arg(QString::fromStdString(rh.error_msg)), true);
+                return;
+            }
+            UniValue v_h;
+            v_h.read(rh.json);
+            if (v_h.isStr()) blockhash_hex = v_h.get_str();
+        }
+        if (blockhash_hex.empty()) return;
+
+        UniValue p_g{UniValue::VARR};
+        p_g.push_back(snap->pric_funding_txid_hex);
+        p_g.push_back(0);  // verbosity 0 → raw hex
+        p_g.push_back(blockhash_hex);
+        auto rg = callRpc("getrawtransaction", p_g.write(0));
+        if (!rg.ok) {
+            setStatus(tr("Auto: getrawtransaction failed: %1")
+                .arg(QString::fromStdString(rg.error_msg)), true);
             return;
         }
-        UniValue v_h;
-        v_h.read(rh.json);
-        if (v_h.isStr()) blockhash_hex = v_h.get_str();
-    }
-    if (blockhash_hex.empty()) return;
-
-    UniValue p_g{UniValue::VARR};
-    p_g.push_back(snap->pric_funding_txid_hex);
-    p_g.push_back(0);  // verbosity 0 → raw hex
-    p_g.push_back(blockhash_hex);
-    auto rg = callRpc("getrawtransaction", p_g.write(0));
-    if (!rg.ok) {
-        setStatus(tr("Auto: getrawtransaction failed: %1")
-            .arg(QString::fromStdString(rg.error_msg)), true);
+        UniValue v_g;
+        v_g.read(rg.json);
+        tx_hex = v_g.isStr() ? v_g.get_str() : std::string{};
+        resolved_vout = snap->pric_funding_vout;
+    } else {
+        // Neither source is ready — try again on the next refresh tick.
         return;
     }
-    UniValue v_g;
-    v_g.read(rg.json);
-    const std::string tx_hex = v_g.isStr() ? v_g.get_str() : std::string{};
-    if (tx_hex.empty()) return;
+    if (tx_hex.empty() || resolved_vout < 0) return;
 
     UniValue p_p{UniValue::VARR};
     p_p.push_back(tx_hex);
-    p_p.push_back(snap->pric_funding_vout);
+    p_p.push_back(resolved_vout);
     auto rp = callRpc("pricoin_jointscan_partial", p_p.write(0));
     if (!rp.ok) {
         setStatus(tr("Auto: pricoin_jointscan_partial failed: %1")

@@ -1306,6 +1306,12 @@ RPCMethod walletsendct_ring()
                 "Optional 32-byte hex secp256k1 priv to use as the per-output ephemeral r "
                 "for the recipient (NOT change/decoys). Required for atomic-swap PRIC "
                 "funding so on-chain P_pi matches the adaptor binding. Empty/omitted = random."},
+            {"broadcast", RPCArg::Type::BOOL, RPCArg::Default{true},
+                "If false, build + sign but do NOT broadcast. Returns `tx_hex` for the caller "
+                "to relay later via pricoin_ct_relay_prebuilt. Used by the atomic-swap PRIC "
+                "funding flow so cooperative refund presigs can be gathered against the "
+                "planned funding output before any value is locked on-chain. The wallet "
+                "does NOT persist the broadcasted-KI in this mode — the relay step does it."},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -1321,6 +1327,13 @@ RPCMethod walletsendct_ring()
                     "Needed by atomic-swap PRIC funding so the cooperative-sign "
                     "loadshare gets the correct vout. -1 if not found (shouldn't "
                     "happen for non-empty pending list)."},
+                {RPCResult::Type::STR_HEX, "tx_hex",
+                    "Hex of the signed transaction. Always set; required when broadcast=false "
+                    "so the caller can relay later. Same tx the broadcast=true path sends to "
+                    "the network."},
+                {RPCResult::Type::BOOL, "broadcast",
+                    "True if the tx was broadcast (default); false when broadcast=false was "
+                    "passed and the caller must relay via pricoin_ct_relay_prebuilt."},
             }
         },
         RPCExamples{HelpExampleCli("walletsendct_ring", "\"pricstl1...\" 5 0.0001 4")},
@@ -1347,6 +1360,8 @@ RPCMethod walletsendct_ring()
                     pinned_eph_priv = ParseHex(h);
                 }
             }
+            const bool broadcast_now =
+                request.params[5].isNull() ? true : request.params[5].get_bool();
 
             const auto parsed_dest = ::pricoin::stealth::ParseStealthAddress(dest_addr_str);
             if (!parsed_dest) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "dest_address must be a stealth address");
@@ -1679,25 +1694,31 @@ RPCMethod walletsendct_ring()
                 mtx.ct_bundle.ring_inputs[0].sig.key_image;
 
             CTransactionRef tx_ref = MakeTransactionRef(std::move(mtx));
-            std::string err_str;
-            if (!chain.broadcastTransaction(tx_ref, MAX_MONEY,
-                                             node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL,
-                                             err_str)) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "broadcast failed: " + err_str);
-            }
+            if (broadcast_now) {
+                std::string err_str;
+                if (!chain.broadcastTransaction(tx_ref, MAX_MONEY,
+                                                 node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL,
+                                                 err_str)) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "broadcast failed: " + err_str);
+                }
 
-            // Persist the spent keyimage with the txid that produced
-            // it. Future picker calls skip this KI outright — there's
-            // no RBF carve-out (2026-05-13). The txid is still stored
-            // for forensic / RPC inspection. Best-effort: broadcast
-            // already succeeded; persistence failure falls back to
-            // chain's keyimage set when the tx confirms.
-            if (!::wallet::pricoin_broadcasted_kis::Add(
-                    wallet, ki_to_persist, tx_ref->GetHash().ToUint256())) {
-                LogInfo("Pricoin walletsendct_ring: broadcasted-KI persist "
-                        "failed for tx %s — chain-set fallback only\n",
-                        tx_ref->GetHash().ToString());
+                // Persist the spent keyimage with the txid that produced
+                // it. Future picker calls skip this KI outright — there's
+                // no RBF carve-out (2026-05-13). The txid is still stored
+                // for forensic / RPC inspection. Best-effort: broadcast
+                // already succeeded; persistence failure falls back to
+                // chain's keyimage set when the tx confirms.
+                if (!::wallet::pricoin_broadcasted_kis::Add(
+                        wallet, ki_to_persist, tx_ref->GetHash().ToUint256())) {
+                    LogInfo("Pricoin walletsendct_ring: broadcasted-KI persist "
+                            "failed for tx %s — chain-set fallback only\n",
+                            tx_ref->GetHash().ToString());
+                }
             }
+            // When broadcast_now is false, intentionally skip the
+            // KI persist + chain broadcast — caller is expected to
+            // hold the tx, gather presigs against its output, then
+            // call pricoin_ct_relay_prebuilt which performs both.
 
             // Find the post-shuffle position of the recipient output.
             // Critical for atomic-swap PRIC funding: the cooperative-
@@ -1713,6 +1734,13 @@ RPCMethod walletsendct_ring()
                 }
             }
 
+            // Serialize the signed tx hex for the response. Always
+            // returned — caller may want it for storage even on the
+            // broadcast=true path (e.g. local logging).
+            DataStream ss_tx;
+            ss_tx << TX_WITH_WITNESS(*tx_ref);
+            const std::string tx_hex_out = HexStr(ss_tx);
+
             UniValue out{UniValue::VOBJ};
             out.pushKV("txid", tx_ref->GetHash().ToString());
             out.pushKV("ring_size", ring_size);
@@ -1721,6 +1749,75 @@ RPCMethod walletsendct_ring()
             out.pushKV("size", (int)::GetSerializeSize(TX_WITH_WITNESS(*tx_ref)));
             out.pushKV("bundle_size", (int)tx_ref->ct_bundle.SerializedSize());
             out.pushKV("recipient_vout", recipient_vout);
+            out.pushKV("tx_hex", tx_hex_out);
+            out.pushKV("broadcast", broadcast_now);
+            return out;
+        }
+    };
+}
+
+// Broadcast a previously-built (walletsendct_ring broadcast=false) signed
+// Pricoin CT transaction. Persists the input key-image to the wallet's
+// broadcasted-KI set on success, mirroring the integrated broadcast path
+// in walletsendct_ring. Used by the atomic-swap PRIC funding flow: the
+// builder pre-builds the funding tx, the cooperative-sign ceremony
+// gathers refund + claim presigs against the planned output, then this
+// RPC actually broadcasts. If the relay step is never reached (user
+// aborts before ceremony completes), no PRIC value is locked on-chain.
+RPCMethod pricoin_ct_relay_prebuilt()
+{
+    return RPCMethod{
+        "pricoin_ct_relay_prebuilt",
+        "Broadcast a previously-built pricoin CT transaction (built via "
+        "walletsendct_ring with broadcast=false). Persists the broadcasted "
+        "key-image on success.\n",
+        {
+            {"tx_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Hex of the signed tx as returned by walletsendct_ring."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "txid", ""},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_ct_relay_prebuilt", "<tx_hex>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+
+            const std::string tx_hex = request.params[0].get_str();
+            CMutableTransaction mtx;
+            if (!DecodeHexTx(mtx, tx_hex, /*try_no_witness=*/true, /*try_witness=*/true)) {
+                throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "tx decode failed");
+            }
+            if (mtx.ct_bundle.ring_inputs.empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "tx has no ring_inputs — not a pricoin CT ring-sig tx");
+            }
+
+            // Capture the input KI before MakeTransactionRef moves mtx.
+            const std::array<unsigned char, 33> ki_to_persist =
+                mtx.ct_bundle.ring_inputs[0].sig.key_image;
+
+            CTransactionRef tx_ref = MakeTransactionRef(std::move(mtx));
+            interfaces::Chain& chain = wallet.chain();
+            std::string err_str;
+            if (!chain.broadcastTransaction(tx_ref, MAX_MONEY,
+                                             node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL,
+                                             err_str)) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                    "broadcast failed: " + err_str);
+            }
+            if (!::wallet::pricoin_broadcasted_kis::Add(
+                    wallet, ki_to_persist, tx_ref->GetHash().ToUint256())) {
+                LogInfo("Pricoin pricoin_ct_relay_prebuilt: broadcasted-KI "
+                        "persist failed for tx %s — chain-set fallback only\n",
+                        tx_ref->GetHash().ToString());
+            }
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("txid", tx_ref->GetHash().ToString());
             return out;
         }
     };
@@ -8555,6 +8652,7 @@ RPCMethod pricoin_ltc_refund_swap_export()              { return pricoin_ltc_ref
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }
+RPCMethod pricoin_ct_relay_prebuilt_export() { return pricoin_ct_relay_prebuilt(); }
 
 std::vector<PricoinCTRecovery> ScanTxForCTReceives(
     CWallet& wallet,

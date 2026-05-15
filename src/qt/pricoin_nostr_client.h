@@ -123,6 +123,19 @@ public:
                                         int32_t vout,
                                         int32_t min_confirmations);
 
+    // Pre-funding helper: ship Alice's pre-built but not-yet-broadcast
+    // PRIC funding tx hex + planned vout to the peer. The peer's
+    // wallet auto-pins these via adaptorSwapSetPricFundingPlanned so
+    // the cooperative-sign ceremony can compute scan partials against
+    // the planned funding output BEFORE any value is locked on-chain.
+    // Envelope:
+    //   {"v":1,"type":"pricoin:pric_funding_planned/v1",
+    //    "swap_id":..., "hex":<tx_hex>, "vout":N}
+    bool publishPricFundingPlanned(const QString& peer_xonly_hex,
+                                     const QString& swap_id_hex,
+                                     const QString& unsigned_tx_hex,
+                                     int32_t planned_vout);
+
     // True if at least one relay is currently connected.
     bool anyConnected() const;
     // Count of currently-connected relays (0..relayUrls().size()).

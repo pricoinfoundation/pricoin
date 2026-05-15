@@ -300,6 +300,15 @@ public:
         // these before allowing auto-fund / state advance.
         bool        has_pric_refund_presig{false};
         bool        has_btc_refund_presig{false};
+
+        // Alice's pre-built but not-yet-broadcast PRIC funding tx hex
+        // + planned vout. Set when the protocol pre-builds the funding
+        // tx at AdaptorReady so cooperative presigs can be gathered
+        // before any value is locked. Empty before the pre-build step
+        // or after the funding has been broadcast (in which case the
+        // on-chain pric_funding_txid_hex is authoritative).
+        std::string pric_funding_unsigned_tx_hex;
+        int32_t     pric_funding_planned_vout{-1};
     };
 
     struct PricoinAdaptorSwapCreateParams {
@@ -385,6 +394,15 @@ public:
     virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetBtcRefundTx(
         const std::string& swap_id,
         const std::string& unsigned_tx_hex) = 0;
+
+    // Pin Alice's pre-built but not-yet-broadcast PRIC funding tx hex
+    // and the planned recipient_vout. Captured at AdaptorReady time
+    // before cooperative presigs are gathered. Idempotent on equal
+    // re-set; conflicting re-set rejected.
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPricFundingPlanned(
+        const std::string& swap_id,
+        const std::string& unsigned_tx_hex,
+        int32_t planned_vout) = 0;
 
     // Cooperative-sign session legs. Mirror of pricoin_adaptor_swap::CoopsignLeg.
     enum class CoopsignLeg : uint8_t {
