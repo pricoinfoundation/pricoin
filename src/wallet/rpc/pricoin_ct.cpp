@@ -8735,7 +8735,14 @@ std::vector<PricoinSwapClaimRecovery> ScanTxForSwapClaim(
     for (const auto& s : swaps) {
         if (s.role != Role::Alice) continue;
         if (s.has_t) continue;
-        if (s.state != State::PreSigned && s.state != State::PricClaimed) continue;
+        // Post-2026-05-15 state ordering: Alice's PRIC is locked from
+        // BothFunded onward (PreSigned now precedes any funding). She
+        // could observe Bob's claim spending her funding at:
+        //   * BothFunded — Bob has just claimed (most common path).
+        //   * PricClaimed — Alice already advanced state somehow, but
+        //                   t still hasn't been extracted.
+        if (s.state != State::BothFunded
+            && s.state != State::PricClaimed) continue;
         if (s.pric_claim_ring.empty()) continue;
         if (s.presigs.pric_claim_presig_blob.empty()) continue;
         if (s.pric_funding_txid.IsNull() || s.pric_funding_vout < 0) continue;

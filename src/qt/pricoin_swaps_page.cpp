@@ -2386,6 +2386,28 @@ bool PricoinSwapsPage::autoAdaptPricClaim(const std::string& sid)
     const QString txid = QString::fromStdString((*r)["txid"].get_str());
     setStatus(tr("Auto: PRIC claim broadcast — txid %1… (watching for confirmations).")
         .arg(txid.left(16)));
+    // DM Alice the PRIC claim txid so her watcher registers a
+    // pric_claim entry directly — fallback for the case where her
+    // wallet's tx-arrival ScanTxForSwapClaim path didn't see the tx
+    // (e.g. tx arrived before her wallet was scanning the new state).
+    // Alice's wallet's tx_announce DM handler in walletmodel.cpp:656
+    // calls pricoin_swapwatch_add with kind=pric_claim. Once the
+    // watcher's TxStatus returns confirmed, SetPricClaimed advances
+    // her state automatically.
+    if (snap_opt->counterparty_pubkey_hex.size() >= 66) {
+        const QString peer_xonly = QString::fromStdString(
+            snap_opt->counterparty_pubkey_hex.substr(2));
+        auto* nostr = m_model->getOrCreateNostrClient();
+        if (nostr) {
+            nostr->publishBroadcastAnnouncement(
+                peer_xonly,
+                QString::fromStdString(sid),
+                QStringLiteral("pric_claim"),
+                txid,
+                /*vout=*/0,
+                /*min_confirmations=*/1);
+        }
+    }
     refreshTable();
     onSwapwatchRefresh();
     return true;
