@@ -2289,6 +2289,24 @@ bool PricoinSwapsPage::autoLtcClaim(const std::string& sid)
     const QString txid = QString::fromStdString((*r)["txid"].get_str());
     setStatus(tr("Auto: LTC claim broadcast — txid %1… (watching for confirmations).")
         .arg(txid.left(16)));
+    // Register a local ForeignClaim watch entry on Alice's side too.
+    // Without this, her watcher never fires SetComplete on her own
+    // claim → her swap stays at pric_claimed forever → the
+    // post-terminal hook never runs → linked orders stay Matched.
+    // The watcher polls foreign tx confirmation and advances state on
+    // its own (same path Bob uses via the DM-registered watch).
+    try {
+        UniValue p_watch{UniValue::VARR};
+        p_watch.push_back(sid);
+        p_watch.push_back("foreign_claim");
+        p_watch.push_back(txid.toStdString());
+        p_watch.push_back(0);   // vout
+        p_watch.push_back(1);   // min_confirmations
+        m_model->node().executeRpc("pricoin_swapwatch_add", p_watch,
+            "/wallet/" + m_model->getWalletName().toStdString());
+    } catch (...) {
+        // Already present (race) or other backend issue — best-effort.
+    }
     // DM Bob the LTC claim txid so his wallet also registers a
     // ForeignClaim watch — that's what advances his side from
     // pric_claimed → complete (his wallet didn't broadcast and
