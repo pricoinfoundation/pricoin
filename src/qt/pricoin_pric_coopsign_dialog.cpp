@@ -1648,6 +1648,36 @@ void PricCoopSignDialog::tryAutoBuildtx()
         return;
     }
 
+    // Don't re-run buildtx if the ceremony already produced a
+    // committed pre-sig. The ring is built with random decoys, so a
+    // fresh buildtx yields a fresh ring + sighash → the stored
+    // pre-sig (bound to the original ring) no longer applies. The
+    // existing session_json values are authoritative; just re-publish
+    // the buildtx DM to the cosigner in case they missed it last time.
+    const bool have_claim_presig =
+        (m_mode == Mode::PricAdaptor) ? snap->has_pric_refund_presig
+                                       : snap->has_pric_refund_presig;
+    // Note: snapshot doesn't expose has_pric_claim_presig as a flag.
+    // Use unsigned_tx_hex on the persisted session as the proxy for
+    // "ceremony reached buildtx + the spender hasn't reset since".
+    bool buildtx_already_done = false;
+    if (m_in_msg && m_in_msg->text().trimmed().size() == 64
+        && m_in_pi && !m_in_pi->text().trimmed().isEmpty()
+        && m_in_ring_or_ring_ml
+        && !m_in_ring_or_ring_ml->toPlainText().trimmed().isEmpty()
+        && !m_unsigned_tx_hex.isEmpty()) {
+        buildtx_already_done = true;
+    }
+    (void)have_claim_presig;  // reserved for future stricter gating
+
+    if (buildtx_already_done) {
+        m_auto_buildtx_fired = true;
+        setStatus(tr("Auto: buildtx output already on session — skipping "
+                     "re-run (preserves ring/msg the pre-sig is bound to)."));
+        tryAutoSendBuildtx();
+        return;
+    }
+
     m_auto_buildtx_fired = true;
     setStatus(tr("Auto: I'm the spender — running buildtx."));
     onRunBuildtx();
