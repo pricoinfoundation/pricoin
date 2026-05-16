@@ -530,6 +530,34 @@ void PricoinOrderbookPage::refreshTable()
     }
     m_orders = m_model->wallet().offerList();
 
+    // Republish locally-owned orders whose pric_remaining_sat has
+    // decreased since the last announcement. Each refresh tick checks
+    // for changes against an in-memory tracker so we only DM peers
+    // when the order actually changed (not on every refresh). Peer-
+    // side offerApplyImportedUpdate is idempotent on equal max, so
+    // even a stray re-publish is harmless.
+    if (m_nostr && m_connected_relay_count > 0) {
+        for (const auto& o : m_orders) {
+            if (o.origin != "local") continue;
+            if (o.status != "active" && o.status != "matched") continue;
+            if (o.pric_remaining_sat >= o.max_pric_amount_sat) continue;
+            const QString oid_qs = QString::fromStdString(o.order_id);
+            const int64_t last = m_last_republished_remaining.value(oid_qs, -1);
+            if (last == o.pric_remaining_sat) continue;  // already announced
+            const std::string uri = m_model->wallet().offerRepublishUri(o.order_id);
+            if (uri.empty()) continue;
+            const bool ok = m_nostr->publishOfferUri(
+                QString::fromStdString(uri),
+                oid_qs,
+                o.expiry_unix_sec,
+                QString::fromStdString(o.foreign_chain),
+                QString::fromStdString(o.side));
+            if (ok) {
+                m_last_republished_remaining[oid_qs] = o.pric_remaining_sat;
+            }
+        }
+    }
+
     // Apply filters.
     const bool active_only = m_filter_active_only && m_filter_active_only->isChecked();
     const QString origin_f = m_filter_origin
@@ -1270,8 +1298,16 @@ void PricoinOrderbookPage::onNostrOfferReceived(const QString& uri)
     if (!m_model) return;
     auto r = m_model->wallet().offerImport(uri.toStdString());
     if (!r) {
-        // Most often: duplicate (already imported) or expired.
-        // Quietly absorb — duplicates from multiple relays are normal.
+        // Could be a duplicate (already imported once — common from
+        // multiple relays) OR a maker-republished URI carrying an
+        // updated max for an existing order. Try the update path; if
+        // that also fails, the duplicate is exact (no-op) and we
+        // quietly absorb.
+        auto upd = m_model->wallet().offerApplyImportedUpdate(uri.toStdString());
+        if (upd) {
+            refreshTable();
+            setStatus(tr("Maker shrank a peer offer — orderbook updated."));
+        }
         return;
     }
     refreshTable();

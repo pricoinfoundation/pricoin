@@ -245,6 +245,16 @@ struct AdaptorSwap {
     // the signer-index entry which is the joint stealth pub).
     std::vector<std::array<unsigned char, 33>> pric_claim_ring;
 
+    // W (commitment image) component of each multi-layer ring member.
+    // Paired position-wise with `pric_claim_ring`'s P side. Stored on
+    // the swap record so a session-JSON wipe (crash + re-buildtx)
+    // doesn't lose the ML ring the original PRIC claim pre-sig is
+    // bound to — without W the adapt path can only fall back to the
+    // legacy single-layer route which fails consensus VerifyMultiLayer.
+    // Empty when the swap predates this field or when buildtx hasn't
+    // run yet. Same length as `pric_claim_ring` once populated.
+    std::vector<std::array<unsigned char, 33>> pric_claim_ring_w;
+
     // Pricoin-stealth ephemeral private `r` chosen by Bob at adaptor-
     // setup. Bob uses it to compute P_pi = shared(r·A_J)·G + B_J;
     // T_G/T_H/DLEQ are bound to that P_pi. For the on-chain P_pi to
@@ -425,6 +435,12 @@ struct AdaptorSwap {
         // pre-format records will fail to deserialize.
         READWRITE(obj.pric_funding_unsigned_tx_hex);
         READWRITE(obj.pric_funding_planned_vout);
+
+        // W (commitment image) ring components paired with
+        // pric_claim_ring (appended 2026-05-16). Persisted so a
+        // session-JSON wipe doesn't lose the multi-layer ring the
+        // PRIC claim pre-sig is bound to.
+        READWRITE(obj.pric_claim_ring_w);
     }
 };
 
@@ -571,15 +587,18 @@ TransitionResult SetTSecret(
     const std::array<unsigned char, 32>& t);
 
 // Persist the cooperative ring used at PRIC adapt-round-1 time. Called
-// by Alice's coopsign dialog after a successful adaptor combine, so
-// that when Bob's claim later hits chain the watcher can run extract
-// without Alice re-pasting the ring. State-machine-neutral. Idempotent
-// if the supplied ring matches the stored one. Rejects with
-// InvalidInput if `ring` is empty.
+// by both wallets' coopsign dialogs after a successful adaptor combine,
+// so that when Bob's claim later hits chain the watcher can run extract
+// (Alice) or re-adapt (Bob, after a session-JSON wipe) without manually
+// re-running buildtx and invalidating the pre-sig. State-machine-neutral.
+// Idempotent if the supplied ring matches the stored one. Rejects with
+// InvalidInput if `ring` is empty or `ring_w` (when supplied) doesn't
+// match `ring` in length.
 TransitionResult SetPricClaimRing(
     CWallet& wallet,
     const uint256& swap_id,
-    const std::vector<std::array<unsigned char, 33>>& ring);
+    const std::vector<std::array<unsigned char, 33>>& ring,
+    const std::vector<std::array<unsigned char, 33>>& ring_w = {});
 
 // Record the pre-built unsigned PRIC refund tx hex. Captured by the
 // spender (Alice) during the PreSigned ceremony's buildtx step so

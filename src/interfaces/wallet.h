@@ -232,6 +232,21 @@ public:
     virtual util::Result<PricoinOfferSnapshot> offerFillFromLinkedSwap(
         const std::string& order_id, int64_t consumed_sat) = 0;
 
+    // Build a freshly-signed offer URI reflecting the LIVE remaining
+    // amount of a local order. Empty string on failure (not a local
+    // order, wallet locked, remaining ≤ 0). Caller publishes via
+    // Nostr; this method does NOT mutate any local state.
+    virtual std::string offerRepublishUri(const std::string& order_id) = 0;
+
+    // Apply a maker-supplied updated offer payload to an already-
+    // imported order. Validates same maker_pubkey + same side + chain
+    // + expiry, monotonically non-increasing max, and a valid sig.
+    // Replaces the import's payload + signature, clamps remaining to
+    // the new max. Returns InvalidInput on validation failure,
+    // NotFound when the order isn't in this wallet.
+    virtual util::Result<PricoinOfferSnapshot> offerApplyImportedUpdate(
+        const std::string& uri) = 0;
+
     //! Pricoin: find imported offers that price-cross with my order,
     //! sorted best-first.
     virtual std::vector<PricoinMatchCandidate> offerFindMatches(const std::string& my_order_id) = 0;
@@ -305,6 +320,11 @@ public:
         // ordered them). Empty before the ceremony stores it. The
         // Qt extract dialog auto-fills its ring field from this.
         std::vector<std::string> pric_claim_ring_hex;
+        // W (commitment image) components paired 1:1 with
+        // pric_claim_ring_hex. Required for the multi-layer adapt
+        // recovery path after a session-JSON wipe. Empty for swaps
+        // that predate the post-2026-05-16 persistence.
+        std::vector<std::string> pric_claim_ring_w_hex;
 
         // PRIC stealth ephemeral r (32-byte hex). Set when Bob has
         // committed adaptor materials; required for Alice's PRIC

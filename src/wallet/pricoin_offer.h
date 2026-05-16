@@ -306,6 +306,35 @@ MutateResult LinkSwap(
 MutateResult FillFromLinkedSwap(
     CWallet& wallet, const uint256& order_id, int64_t consumed_sat);
 
+// Build a freshly-signed offer URI for the LIVE remaining amount of
+// a local order. Uses the same maker priv as the original payload —
+// peer wallets validate the new sig against the existing
+// maker_pubkey, so the URI is a drop-in replacement. The new payload
+// keeps the same `order_id`, `side`, `foreign_chain`, `expiry`, and
+// `maker_pubkey`; only `max_pric_amount_sat` (= current
+// pric_remaining_sat) and `foreign_amount_at_max_sat` (scaled to
+// preserve the original rate) change. Returns empty string on
+// failure (wallet locked, not a local order, remaining ≤ 0, etc).
+//
+// Caller (typically the chain watcher's post-Fill hook or the
+// orderbook page) is responsible for publishing the URI to peers
+// via Nostr. The local order itself is NOT mutated by this call.
+std::string RepublishUri(CWallet& wallet, const uint256& order_id);
+
+// Receive-side counterpart to RepublishUri: apply a maker-supplied
+// updated offer payload to an already-imported order. Validates that:
+//   * The order exists locally with origin=Imported.
+//   * The new payload's maker_pubkey matches the stored one.
+//   * The new payload's signature verifies.
+//   * The new max_pric_amount_sat is ≤ the stored max (monotonic non-
+//     increase — peers can shrink offers via fills, never grow them).
+// On accept, the import record's max + foreign + payload + signature
+// are replaced and `pric_remaining_sat` is clamped to the new max.
+// `pric_in_flight_sat` / `matched_with_order_id` are NOT touched (an
+// active match against the order is unaffected by a shrink).
+MutateResult ApplyImportedUpdate(
+    CWallet& wallet, const std::string& uri);
+
 // Auto-expire (no-op if Active and not expired). Idempotent.
 // Useful as a periodic sweep; also called by List/Get internally.
 void SweepExpired(CWallet& wallet, int64_t now_unix_sec);

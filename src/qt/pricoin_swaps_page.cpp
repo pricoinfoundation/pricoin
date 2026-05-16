@@ -1390,7 +1390,12 @@ void PricoinSwapsPage::onAdvanceClicked()
             [this, &dlg, sid, pric_p]() {
             PricCoopSignDialog d(m_model, PricCoopSignDialog::Mode::PricAdaptor,
                                  tr("PRIC claim adaptor pre-sig"), sid, &dlg);
-            d.setProgressOnlyMode(true);
+            // Headless when auto-coord is driving — the swaps page row
+            // already shows progress, and the dialog otherwise pops up
+            // briefly during the ceremony. Falls back to visible
+            // progress-only mode when the user clicks the button
+            // directly (auto-coord won't drive a click from the user).
+            d.setHeadlessMode(true);
             d.exec();
             if (!d.finalBlobHex().isEmpty()) {
                 pric_p->setPlainText(d.finalBlobHex());
@@ -1422,7 +1427,7 @@ void PricoinSwapsPage::onAdvanceClicked()
             [this, &dlg, sid, pric_r]() {
             PricCoopSignDialog d(m_model, PricCoopSignDialog::Mode::PricPlain,
                                  tr("PRIC refund cooperative sig"), sid, &dlg);
-            d.setProgressOnlyMode(true);
+            d.setHeadlessMode(true);
             d.exec();
             if (!d.finalBlobHex().isEmpty()) {
                 pric_r->setPlainText(d.finalBlobHex());
@@ -1442,6 +1447,14 @@ void PricoinSwapsPage::onAdvanceClicked()
         // through the manual path until that dialog auto-coord
         // also lands.
         if (is_ltc) {
+            // Headless: keep the outer "Set pre-signatures" dialog
+            // off-screen too — combined with the inner dialogs being
+            // headless, the entire ceremony runs invisibly. The user
+            // only sees the row-level state on the Swaps page advance
+            // through Cooperative-signing → PreSigned.
+            dlg.setAttribute(Qt::WA_DontShowOnScreen, true);
+            dlg.setWindowFlag(Qt::Tool, true);
+            dlg.setWindowFlag(Qt::FramelessWindowHint, true);
             QMetaObject::invokeMethod(&dlg, [pric_claim_helper, pric_p,
                                               pric_refund_helper, pric_r,
                                               &dlg]() {
@@ -2230,12 +2243,29 @@ void PricoinSwapsPage::onAdaptPricClaimClicked()
                     j["ring_json"].get_str()));
             }
         }
-        // Fallback for sessions that pre-date the ML port (ring_json
-        // was single-layer): if ring is still empty, fill from the
-        // single-layer pric_claim_ring_hex on the snap. The adapt
-        // RPC will then take the legacy path (which fails consensus
-        // but at least surfaces a clear error rather than a silent
-        // "0 inputs filled").
+        // Recovery fallback: session JSON's ring_json is empty or
+        // stale (e.g. after a crash + restart wiped it). If the swap
+        // record has the {P, W} ring components, reconstruct ring_ml
+        // from those so the multi-layer adapt path works without
+        // requiring a re-buildtx (which would generate fresh decoys
+        // and invalidate the stored pre-sig).
+        if (ring->toPlainText().trimmed().isEmpty()
+            && !snap_opt->pric_claim_ring_hex.empty()
+            && snap_opt->pric_claim_ring_w_hex.size()
+                 == snap_opt->pric_claim_ring_hex.size()) {
+            UniValue ml_arr{UniValue::VARR};
+            for (size_t i = 0; i < snap_opt->pric_claim_ring_hex.size(); ++i) {
+                UniValue m{UniValue::VOBJ};
+                m.pushKV("P", snap_opt->pric_claim_ring_hex[i]);
+                m.pushKV("W", snap_opt->pric_claim_ring_w_hex[i]);
+                ml_arr.push_back(m);
+            }
+            ring->setPlainText(QString::fromStdString(ml_arr.write(0)));
+        }
+        // Legacy fallback: P-only ring (no W on record). Adapt RPC
+        // will take the legacy path that fails consensus, but at
+        // least surfaces a clear error rather than a silent "0
+        // inputs filled". Pre-2026-05-16 swaps fall here.
         if (ring->toPlainText().trimmed().isEmpty()
             && !snap_opt->pric_claim_ring_hex.empty()) {
             UniValue ring_arr{UniValue::VARR};

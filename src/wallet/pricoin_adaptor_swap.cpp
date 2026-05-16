@@ -479,15 +479,28 @@ TransitionResult SetTSecret(
 TransitionResult SetPricClaimRing(
     CWallet& wallet,
     const uint256& swap_id,
-    const std::vector<std::array<unsigned char, 33>>& ring)
+    const std::vector<std::array<unsigned char, 33>>& ring,
+    const std::vector<std::array<unsigned char, 33>>& ring_w)
 {
     if (ring.empty()) return TransitionResult::InvalidInput;
+    // ring_w may be empty (legacy callers / pre-ML path), but if
+    // supplied it must align with the P ring 1:1.
+    if (!ring_w.empty() && ring_w.size() != ring.size()) {
+        return TransitionResult::InvalidInput;
+    }
     return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
-        if (!s.pric_claim_ring.empty()) {
-            if (s.pric_claim_ring == ring) return TransitionResult::Ok;
-            return TransitionResult::InvalidInput;
-        }
+        const bool ring_clash =
+            (!s.pric_claim_ring.empty() && s.pric_claim_ring != ring);
+        if (ring_clash) return TransitionResult::InvalidInput;
         s.pric_claim_ring = ring;
+        // Back-fill / set W. Idempotent on equal; conflicting re-set
+        // rejected (don't clobber a real W with a different one).
+        if (!ring_w.empty()) {
+            if (!s.pric_claim_ring_w.empty() && s.pric_claim_ring_w != ring_w) {
+                return TransitionResult::InvalidInput;
+            }
+            s.pric_claim_ring_w = ring_w;
+        }
         return TransitionResult::Ok;
     });
 }

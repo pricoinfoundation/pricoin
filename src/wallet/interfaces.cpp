@@ -443,6 +443,27 @@ public:
         return ToSnapshot(o);
     }
 
+    std::string offerRepublishUri(const std::string& order_id) override
+    {
+        auto oid = ParseOid(order_id);
+        if (!oid) return std::string{};
+        return ::wallet::pricoin_offer::RepublishUri(*m_wallet, *oid);
+    }
+
+    util::Result<PricoinOfferSnapshot> offerApplyImportedUpdate(
+        const std::string& uri) override
+    {
+        auto r = ::wallet::pricoin_offer::ApplyImportedUpdate(*m_wallet, uri);
+        if (r != ::wallet::pricoin_offer::MutateResult::Ok) {
+            return util::Error{Untranslated("ApplyImportedUpdate rejected")};
+        }
+        auto payload = ::wallet::pricoin_offer::DecodeUri(uri);
+        if (!payload) return util::Error{Untranslated("decode after apply failed")};
+        ::wallet::pricoin_offer::Order o;
+        ::wallet::pricoin_offer::Get(*m_wallet, payload->order_id, o);
+        return ToSnapshot(o);
+    }
+
     // ────── Phase-5/6 adaptor-swap orchestration ──────
     static const char* AdaptorSwapRoleStr(::wallet::pricoin_adaptor_swap::Role r) {
         return r == ::wallet::pricoin_adaptor_swap::Role::Alice ? "alice" : "bob";
@@ -517,6 +538,10 @@ public:
         o.pric_claim_ring_hex.reserve(s.pric_claim_ring.size());
         for (const auto& p : s.pric_claim_ring) {
             o.pric_claim_ring_hex.push_back(HexStr(p));
+        }
+        o.pric_claim_ring_w_hex.reserve(s.pric_claim_ring_w.size());
+        for (const auto& w : s.pric_claim_ring_w) {
+            o.pric_claim_ring_w_hex.push_back(HexStr(w));
         }
         o.has_pric_ephemeral_r = s.has_pric_ephemeral_r;
         if (s.has_pric_ephemeral_r) {

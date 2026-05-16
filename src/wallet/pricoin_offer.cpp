@@ -199,6 +199,31 @@ struct WalletCache {
 };
 
 Mutex g_mutex;
+
+// Re-derive the maker priv that backs an order's signature. Mirrors
+// the HMAC chain swap_session::GetSwapIdentityPubkey uses. Returns
+// false if the wallet's stealth identity is unavailable or no valid
+// scalar is found in the 16-counter search window (cryptographically
+// implausible). Pulled out of `Create` so `RepublishUri` can re-sign
+// without duplicating the derivation.
+bool DeriveMakerPriv(const ::wallet::pricoin_stealth::Identity& id,
+                      CKey& out)
+{
+    if (!id.spend.IsValid()) return false;
+    constexpr const char* kTag = "pricoin/swap/identity-v1";
+    uint8_t counter = 0;
+    while (counter < 16) {
+        CHMAC_SHA256 hmac(UCharCast(id.spend.data()), 32);
+        hmac.Write(reinterpret_cast<const unsigned char*>(kTag), std::strlen(kTag));
+        hmac.Write(&counter, 1);
+        unsigned char raw[32];
+        hmac.Finalize(raw);
+        out.Set(raw, raw + 32, /*compressed=*/true);
+        if (out.IsValid()) return true;
+        ++counter;
+    }
+    return false;
+}
 std::map<CWallet*, std::unique_ptr<WalletCache>> g_caches GUARDED_BY(g_mutex);
 
 WalletCache& EnsureCache(CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(g_mutex)
@@ -348,21 +373,7 @@ CreateResult Create(CWallet& wallet, const CreateParams& params, Order& out)
 
     // Re-derive the same key as swap_session::GetSwapIdentityPubkey.
     CKey maker_priv;
-    {
-        constexpr const char* kTag = "pricoin/swap/identity-v1";
-        uint8_t counter = 0;
-        while (counter < 16) {
-            CHMAC_SHA256 hmac(UCharCast(id.spend.data()), 32);
-            hmac.Write(reinterpret_cast<const unsigned char*>(kTag), std::strlen(kTag));
-            hmac.Write(&counter, 1);
-            unsigned char raw[32];
-            hmac.Finalize(raw);
-            maker_priv.Set(raw, raw + 32, /*compressed=*/true);
-            if (maker_priv.IsValid()) break;
-            ++counter;
-        }
-        if (!maker_priv.IsValid()) return CreateResult::DerivationFailed;
-    }
+    if (!DeriveMakerPriv(id, maker_priv)) return CreateResult::DerivationFailed;
 
     Order o;
     o.payload.version = 1;
@@ -428,6 +439,113 @@ ImportResult Import(CWallet& wallet, const std::string& uri, Order& out)
     cache.by_id[o.payload.order_id] = o;
     out = std::move(o);
     return ImportResult::Ok;
+}
+
+std::string RepublishUri(CWallet& wallet, const uint256& order_id)
+{
+    if (!RequireUnlocked(wallet)) return std::string{};
+    LOCK(g_mutex);
+    auto& cache = EnsureCache(wallet);
+    if (!EnsureLoadedLocked(wallet, cache)) return std::string{};
+    auto it = cache.by_id.find(order_id);
+    if (it == cache.by_id.end()) return std::string{};
+    const Order& o = it->second;
+    if (o.origin != Origin::Local) return std::string{};
+    if (o.pric_remaining_sat <= 0) return std::string{};
+    // No-op when nothing has changed since publish — the original
+    // signature is still authoritative.
+    if (o.pric_remaining_sat == o.payload.max_pric_amount_sat) {
+        return EncodeUri(o.payload);
+    }
+
+    const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+    CKey maker_priv;
+    if (!DeriveMakerPriv(id, maker_priv)) return std::string{};
+
+    // Scale the foreign max to preserve the original rate. Use 128-bit
+    // intermediate to avoid overflow on large amounts (any int64 input
+    // pair stays within int128 product range).
+    OfferPayload p = o.payload;
+    p.max_pric_amount_sat = o.pric_remaining_sat;
+    {
+        const __int128 num =
+            static_cast<__int128>(o.payload.foreign_amount_at_max_sat) *
+            static_cast<__int128>(o.pric_remaining_sat);
+        const __int128 den =
+            static_cast<__int128>(o.payload.max_pric_amount_sat);
+        if (den <= 0) return std::string{};
+        const __int128 q = num / den;
+        p.foreign_amount_at_max_sat = static_cast<int64_t>(q);
+    }
+    if (p.foreign_amount_at_max_sat <= 0) return std::string{};
+
+    if (!SignPayload(p, maker_priv)) return std::string{};
+    if (!VerifySignedPayload(p)) return std::string{};
+    return EncodeUri(p);
+}
+
+MutateResult ApplyImportedUpdate(CWallet& wallet, const std::string& uri)
+{
+    auto payload = DecodeUri(uri);
+    if (!payload) return MutateResult::InvalidInput;
+    if (!VerifySignedPayload(*payload)) return MutateResult::InvalidInput;
+    if (payload->max_pric_amount_sat <= 0
+        || payload->foreign_amount_at_max_sat <= 0) {
+        return MutateResult::InvalidInput;
+    }
+    if (!RequireUnlocked(wallet)) return MutateResult::Locked;
+
+    LOCK(g_mutex);
+    auto& cache = EnsureCache(wallet);
+    if (!EnsureLoadedLocked(wallet, cache)) return MutateResult::WriteFailed;
+    auto it = cache.by_id.find(payload->order_id);
+    if (it == cache.by_id.end()) return MutateResult::NotFound;
+
+    Order& o = it->second;
+    if (o.origin != Origin::Imported) return MutateResult::InvalidState;
+    // Same maker — the update must come from the original author.
+    if (o.payload.maker_pubkey != payload->maker_pubkey) {
+        return MutateResult::InvalidInput;
+    }
+    // Same side + chain — peers don't get to flip those mid-life.
+    if (o.payload.side != payload->side
+        || o.payload.foreign_chain != payload->foreign_chain) {
+        return MutateResult::InvalidInput;
+    }
+    // Same expiry — re-extending an expired offer is a separate
+    // operation (would be a new order from the maker's perspective).
+    if (o.payload.expiry_unix_sec != payload->expiry_unix_sec) {
+        return MutateResult::InvalidInput;
+    }
+    // Monotonic shrink: peers can only reduce. Equal is a no-op.
+    if (payload->max_pric_amount_sat > o.payload.max_pric_amount_sat) {
+        return MutateResult::InvalidInput;
+    }
+    if (payload->max_pric_amount_sat == o.payload.max_pric_amount_sat) {
+        return MutateResult::Ok;  // idempotent
+    }
+    // Terminal-state imports stay as-is. An updated payload to a
+    // Cancelled / Expired import is a stale rebroadcast.
+    if (o.status == Status::Cancelled
+        || o.status == Status::Expired) {
+        return MutateResult::InvalidState;
+    }
+
+    Order snap = o;
+    o.payload = *payload;
+    // Clamp remaining + in_flight to the new ceiling.
+    if (o.pric_remaining_sat > payload->max_pric_amount_sat) {
+        o.pric_remaining_sat = payload->max_pric_amount_sat;
+    }
+    if (o.pric_in_flight_sat > o.pric_remaining_sat) {
+        o.pric_in_flight_sat = o.pric_remaining_sat;
+    }
+    o.updated_time = NowSec();
+    if (!WriteOrderToDB(wallet, o)) {
+        o = snap;
+        return MutateResult::WriteFailed;
+    }
+    return MutateResult::Ok;
 }
 
 namespace {

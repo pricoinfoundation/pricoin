@@ -130,6 +130,13 @@ private:
     // gets the cancellation published (not the now-stale create).
     QSet<QString>       m_pending_publish_offers;
     QSet<QString>       m_pending_publish_cancels;
+    // Per-local-order remember of the last `pric_remaining_sat` we
+    // republished to peers. The refresh tick only sends a fresh
+    // offer URI when the remaining has actually shrunk since the
+    // previous publish — avoids spamming relays on every refresh.
+    // In-memory only; on restart we'll republish once per order
+    // whose remaining < max (cheap, idempotent on the peer side).
+    QHash<QString, int64_t> m_last_republished_remaining;
 
     // Counterparty's swap-side addresses, keyed by THE LOCAL ORDER ID
     // they're pinned to. Populated when the swap_addrs DM lands;

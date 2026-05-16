@@ -82,6 +82,13 @@ public:
     // sees high-level progress instead of raw cryptographic fields.
     // Call BEFORE exec() / show().
     void setProgressOnlyMode(bool on);
+    // Headless mode — the dialog still exec()'s its modal event loop
+    // and drives the cooperative-sign ceremony to completion, but it
+    // is never painted on screen (Qt::WA_DontShowOnScreen). Used by
+    // the swaps page's auto-coord so the ceremony is invisible
+    // plumbing — the user only sees the row-level progress on the
+    // Swaps page. Must be set BEFORE the first show()/exec().
+    void setHeadlessMode(bool on);
 
 private Q_SLOTS:
     void onStep1Compute();
@@ -236,6 +243,7 @@ private:
     QLabel*         m_progress_action{nullptr};  // last-action / status line
     QPushButton*    m_btn_toggle_advanced{nullptr};
     bool            m_progress_only{false};
+    bool            m_headless{false};
 
     // ─── Nostr DM transport ───
     QString             m_swap_id;

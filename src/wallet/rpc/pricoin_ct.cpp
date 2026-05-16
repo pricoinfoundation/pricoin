@@ -5265,22 +5265,28 @@ RPCMethod pricoin_adaptor_swap_set_pric_claim_ring()
 {
     return RPCMethod{
         "pricoin_adaptor_swap_set_pric_claim_ring",
-        "Persist the cooperative single-layer CLSAG ring used at PRIC adapt-\n"
-        "round-1 time. Called by Alice's coopsign dialog after a successful\n"
-        "adaptor combine, so the watcher can run extract automatically when\n"
-        "Bob's claim hits chain (no need for Alice to re-paste the ring).\n"
-        "Idempotent if the supplied ring matches the stored one.\n",
+        "Persist the cooperative multi-layer CLSAG ring used at PRIC adapt-\n"
+        "round-1 time. Called by both wallets' coopsign dialogs after a\n"
+        "successful adaptor combine, so the watcher can run extract when\n"
+        "Bob's claim hits chain AND the spender can re-adapt after a\n"
+        "session-JSON wipe without re-running buildtx (which would\n"
+        "invalidate the pre-sig). Idempotent if the supplied ring matches.\n",
         {
             {"swap_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
             {"ring",    RPCArg::Type::ARR,     RPCArg::Optional::NO,
-                "Array of 33-byte compressed pubkey hex strings (single-layer ring)",
+                "Array of 33-byte compressed pubkey hex strings (P component)",
                 {{"P", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+            {"ring_w",  RPCArg::Type::ARR,     RPCArg::Default{UniValue::VARR},
+                "Optional array of W (commitment image) components aligned "
+                "1:1 with `ring`. Required for the multi-layer adapt-recovery "
+                "path; legacy callers may omit.",
+                {{"W", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
         },
         RPCResult{ RPCResult::Type::OBJ, "", "",
             {{RPCResult::Type::BOOL, "ok", "true on success"}}
         },
         RPCExamples{HelpExampleCli("pricoin_adaptor_swap_set_pric_claim_ring",
-            "<swap_id> '[\"<P0>\",\"<P1>\",\"<P2>\",\"<P3>\"]'")},
+            "<swap_id> '[\"<P0>\",\"<P1>\",\"<P2>\",\"<P3>\"]' '[\"<W0>\",\"<W1>\",\"<W2>\",\"<W3>\"]'")},
         [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
             auto wallet_sp = GetWalletForJSONRPCRequest(request);
             if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
@@ -5302,7 +5308,33 @@ RPCMethod pricoin_adaptor_swap_set_pric_claim_ring()
                 std::copy(pb->begin(), pb->end(), p.begin());
                 ring.push_back(p);
             }
-            auto r = aas::SetPricClaimRing(*wallet_sp, sid, ring);
+            // Optional ring_w. If present, must align 1:1 with ring.
+            std::vector<std::array<unsigned char, 33>> ring_w;
+            if (request.params.size() >= 3 && !request.params[2].isNull()) {
+                const UniValue& w_arr = request.params[2];
+                if (!w_arr.isArray()) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "ring_w must be a JSON array");
+                }
+                if (!w_arr.empty()) {
+                    if (w_arr.size() != ring.size()) {
+                        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                            "ring_w length must match ring length");
+                    }
+                    ring_w.reserve(w_arr.size());
+                    for (size_t i = 0; i < w_arr.size(); ++i) {
+                        auto wb = TryParseHex<unsigned char>(w_arr[i].get_str());
+                        if (!wb || wb->size() != 33) {
+                            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                strprintf("ring_w[%u] must be 33-byte hex",
+                                          static_cast<unsigned>(i)));
+                        }
+                        std::array<unsigned char, 33> w{};
+                        std::copy(wb->begin(), wb->end(), w.begin());
+                        ring_w.push_back(w);
+                    }
+                }
+            }
+            auto r = aas::SetPricClaimRing(*wallet_sp, sid, ring, ring_w);
             if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
             UniValue out{UniValue::VOBJ};
             out.pushKV("ok", true);

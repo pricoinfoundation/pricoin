@@ -2455,6 +2455,27 @@ void PricCoopSignDialog::setProgressOnlyMode(bool on)
     }
 }
 
+void PricCoopSignDialog::setHeadlessMode(bool on)
+{
+    m_headless = on;
+    // Qt::WA_DontShowOnScreen keeps the widget out of the screen but
+    // still participates in the modal event loop, so exec() runs
+    // normally and the auto-coord chain drives the ceremony exactly
+    // as if the dialog were visible. The user only sees row-level
+    // progress on the Swaps page. Combined with progress-only mode,
+    // this keeps the window state coherent for any code path that
+    // queries m_progress_state etc.
+    setAttribute(Qt::WA_DontShowOnScreen, on);
+    if (on) {
+        setProgressOnlyMode(true);
+        // Belt-and-suspenders: tool window + frameless minimizes any
+        // window-manager artefact in case WA_DontShowOnScreen is
+        // honored late on some platforms.
+        setWindowFlag(Qt::Tool, true);
+        setWindowFlag(Qt::FramelessWindowHint, true);
+    }
+}
+
 void PricCoopSignDialog::onStep1Compute()
 {
     const bool adaptor = (m_mode == Mode::PricAdaptor);
@@ -2710,22 +2731,34 @@ void PricCoopSignDialog::onStep2Compute()
         m_s_others_json = QString::fromStdString(v["s_others"].write(0));
         m_out_step2->setPlainText(QString::fromStdString(r.json));
 
-        // Persist the cooperative ring into the swap record so the
-        // watcher can run extract automatically when Bob's claim hits
-        // chain. The set_pric_claim_ring RPC stores only the P side
-        // (extract just needs ring[pi].P for the t·G==T_G check); we
-        // project ring_ml {P,W} → [P] before calling. Best-effort.
+        // Persist the cooperative ring (P + W) into the swap record so
+        // the watcher can run extract automatically when Bob's claim
+        // hits chain AND the spender can recover after a session-JSON
+        // wipe (crash + re-buildtx would otherwise lose the W components
+        // and break the multi-layer adapt path). Best-effort.
         if (!m_swap_id.isEmpty()) {
             UniValue ring_p_only{UniValue::VARR};
+            UniValue ring_w_only{UniValue::VARR};
             for (size_t i = 0; i < ring_ml_v.size(); ++i) {
                 const UniValue& entry = ring_ml_v[i];
-                if (entry.isObject() && entry.exists("P") && entry["P"].isStr()) {
+                if (!entry.isObject()) continue;
+                if (entry.exists("P") && entry["P"].isStr()) {
                     ring_p_only.push_back(entry["P"]);
+                }
+                if (entry.exists("W") && entry["W"].isStr()) {
+                    ring_w_only.push_back(entry["W"]);
                 }
             }
             UniValue ring_params{UniValue::VARR};
             ring_params.push_back(m_swap_id.toStdString());
             ring_params.push_back(ring_p_only);
+            // Only include ring_w when we got W out of every ring
+            // member (defensive — partial W would fail the 1:1 length
+            // check in the RPC anyway).
+            if (ring_w_only.size() == ring_p_only.size()
+                && !ring_w_only.empty()) {
+                ring_params.push_back(ring_w_only);
+            }
             auto rr = callRpc("pricoin_adaptor_swap_set_pric_claim_ring",
                                 ring_params.write(0));
             if (!rr.ok) {
