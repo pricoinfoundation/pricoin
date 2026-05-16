@@ -616,6 +616,10 @@ void PricCoopSignDialog::onRunBuildtx()
     const std::string sighash    = v["sighash"].get_str();
     const std::string z_self     = v["z_self"].get_str();
     const std::string z_other    = v["z_other"].get_str();
+    // Capture z_other into the persisted shadow so the resend timer
+    // can include it after a dialog restart. The widget echo
+    // (m_out_buildtx) isn't persisted.
+    m_z_other = QString::fromStdString(z_other);
     const int         pi         = v["pi"].getInt<int>();
     const std::string ring_ml    = v["ring_ml"].write(0);
     m_unsigned_tx_hex = QString::fromStdString(v["tx_hex"].get_str());
@@ -1246,6 +1250,7 @@ void PricCoopSignDialog::persistSession()
     put("unsigned_tx_hex", m_unsigned_tx_hex);
     put("x_share", m_x_share);
     put("z_share", m_z_share);
+    put("z_other", m_z_other);
     put("msg_hex", m_msg_hex);
     put("pi", m_pi);
     put("session_id", m_session_id);
@@ -1346,6 +1351,7 @@ void PricCoopSignDialog::loadSessionFromRecord(const std::string& json)
     load_str("unsigned_tx_hex", m_unsigned_tx_hex);
     load_str("x_share", m_x_share);
     load_str("z_share", m_z_share);
+    load_str("z_other", m_z_other);
     load_str("msg_hex", m_msg_hex);
     load_str("pi", m_pi);
     load_str("session_id", m_session_id);
@@ -1684,13 +1690,21 @@ void PricCoopSignDialog::tryAutoSendBuildtx()
                    m_in_joint_output_id->text().trimmed().toStdString());
     }
     // Spender's z_other is cosigner's z_share — needed for BOTH plain
-    // and adaptor_ml mode. The buildtx echo includes "z_other_for_peer"
-    // (extract from m_out_buildtx, parsed JSON we displayed).
+    // and adaptor_ml mode. Prefer the persisted m_z_other shadow
+    // (survives dialog restarts); fall back to the m_out_buildtx echo
+    // for the in-session path where the shadow may not yet be set.
     {
-        UniValue echo;
-        if (echo.read(m_out_buildtx->toPlainText().toStdString()) && echo.isObject()
-            && echo.exists("z_other_for_peer") && echo["z_other_for_peer"].isStr()) {
-            env.pushKV("z_other", echo["z_other_for_peer"].get_str());
+        QString z_other_to_send = m_z_other;
+        if (z_other_to_send.isEmpty() && m_out_buildtx) {
+            UniValue echo;
+            if (echo.read(m_out_buildtx->toPlainText().toStdString()) && echo.isObject()
+                && echo.exists("z_other_for_peer") && echo["z_other_for_peer"].isStr()) {
+                z_other_to_send = QString::fromStdString(
+                    echo["z_other_for_peer"].get_str());
+            }
+        }
+        if (!z_other_to_send.isEmpty()) {
+            env.pushKV("z_other", z_other_to_send.toStdString());
         }
     }
     if (m_mode == Mode::PricAdaptor) {

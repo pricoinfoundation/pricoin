@@ -144,6 +144,14 @@ private:
 
     // Inputs that persist for cross-step recall.
     QString m_x_share, m_z_share;
+    // z_other_for_peer — the half of the buildtx z-split that the
+    // spender must ship to the cosigner so they can use it as their
+    // own z_share. Persisted because the buildtx output widget itself
+    // (m_out_buildtx) is not, and the resend timer needs to be able
+    // to include z_other in re-fired buildtx DMs after a dialog
+    // restart (otherwise the cosigner's z_share stays empty and Step
+    // 1 silently blocks).
+    QString m_z_other;
     QString m_msg_hex;
     QString m_pi;
     QString m_session_id;
