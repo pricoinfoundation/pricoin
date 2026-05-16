@@ -152,6 +152,11 @@ public:
         std::string notes;
         int64_t     created_time{0};
         int64_t     updated_time{0};
+        // AdaptorSwap id created from this order. Empty until the
+        // orderbook page calls offerLinkSwap right after a successful
+        // adaptorSwapCreate. Survives Unmatch / Cancel — see Order
+        // for the linkage semantics.
+        std::string linked_swap_id;
     };
 
     struct PricoinOfferCreateParams {
@@ -211,6 +216,21 @@ public:
 
     //! Pricoin: release a Matched order back to Active (cascades to peer).
     virtual util::Result<PricoinOfferSnapshot> offerUnmatch(const std::string& order_id) = 0;
+
+    // Link an order to the AdaptorSwap it backs. Idempotent on same
+    // value; rejected on conflicting re-link to avoid silent overwrite.
+    // Set by the orderbook page's Start-swap path immediately after
+    // adaptorSwapCreate succeeds, on BOTH the local and the imported
+    // peer order so each side's watcher can find the order to Fill.
+    virtual util::Result<PricoinOfferSnapshot> offerLinkSwap(
+        const std::string& order_id, const std::string& swap_id) = 0;
+
+    // Apply a swap-consumed deduction independent of current status.
+    // Used by the watcher's self-heal when the order's matched_with
+    // link has been cleared but `linked_swap_id` still ties it to a
+    // now-terminal swap. See pricoin_offer::FillFromLinkedSwap.
+    virtual util::Result<PricoinOfferSnapshot> offerFillFromLinkedSwap(
+        const std::string& order_id, int64_t consumed_sat) = 0;
 
     //! Pricoin: find imported offers that price-cross with my order,
     //! sorted best-first.

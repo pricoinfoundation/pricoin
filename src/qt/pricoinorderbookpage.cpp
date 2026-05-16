@@ -1162,6 +1162,16 @@ void PricoinOrderbookPage::onStartSwapClicked()
     }
     const std::string created_swap_id = r->swap_id;
 
+    // Persist the order ↔ swap linkage on BOTH the local order and the
+    // imported peer order. Survives Unmatch/Cancel so the watcher's
+    // post-terminal hook can still Fill the order after a stray
+    // release-match click mid-swap. Best-effort — a failure here just
+    // means the linked_swap_id stays null and the order falls back to
+    // the matched_with-based linkage (the legacy path that breaks on
+    // Unmatch).
+    (void)m_model->wallet().offerLinkSwap(mine_v.order_id, created_swap_id);
+    (void)m_model->wallet().offerLinkSwap(peer_v.order_id, created_swap_id);
+
     // Persist peer's PRIC stealth view+spend pubkeys to the swap
     // record. Needed by the cooperative-sign dialog's loadshare
     // call (other_spend_pubkey arg). PeerSwapAddrs lives only
@@ -1445,6 +1455,34 @@ void PricoinOrderbookPage::onCancelClicked()
     const auto pre = m_model->wallet().offerGet(oid);
     if (!pre) return;
     const bool was_local = (pre->origin == "local");
+
+    // Safety gate: same logic as Unmatch — refuse to cancel an order
+    // whose linked swap has on-chain commitments. The order WILL be
+    // consumed when the swap settles, and pre-emptive cancellation
+    // breaks the watcher's auto-Fill linkage. Allow cancel only when
+    // the linked swap is in a pre-commitment state OR terminal
+    // (Complete / Refunded / Aborted — the order is effectively
+    // settled regardless).
+    if (!pre->linked_swap_id.empty()) {
+        const auto swap = m_model->wallet().adaptorSwapGet(pre->linked_swap_id);
+        if (swap) {
+            static const std::set<std::string> committed = {
+                "btc_funded", "both_funded", "pric_claimed"};
+            if (committed.contains(swap->state)) {
+                QMessageBox::warning(this, tr("Cannot cancel order"), tr(
+                    "<b>This order is linked to swap %1 in state <code>%2</code> "
+                    "— funds are already committed on-chain.</b><br><br>"
+                    "Cancelling would break the watcher's ability to mark the "
+                    "order Filled when the swap completes. Wait for the swap "
+                    "to settle (or refund); the order will then update "
+                    "automatically and you can cancel any remainder.")
+                    .arg(QString::fromStdString(pre->linked_swap_id).left(12) + "…")
+                    .arg(QString::fromStdString(swap->state)));
+                return;
+            }
+        }
+    }
+
     if (QMessageBox::question(this, tr("Cancel order"),
             tr("Cancel this order? This is terminal and cannot be undone."),
             QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) return;
@@ -1798,6 +1836,39 @@ void PricoinOrderbookPage::onUnmatchClicked()
     if (!m_model) return;
     const std::string oid = selectedOrderId();
     if (oid.empty()) return;
+
+    // Safety gate: if this order is linked to a swap that has reached
+    // a state with on-chain commitments (BtcFunded onward in the
+    // post-2026-05-15 ordering), unmatching would break the
+    // order ↔ swap linkage the watcher uses to Fill the order on
+    // swap-complete. The actual coins are already committed on-chain,
+    // so the order WILL be consumed by the swap regardless — releasing
+    // it now just leaves the wallet thinking the order is freely
+    // available for re-match while it's actually spoken for.
+    {
+        const auto rec = m_model->wallet().offerGet(oid);
+        if (rec && !rec->linked_swap_id.empty()) {
+            const auto swap = m_model->wallet().adaptorSwapGet(rec->linked_swap_id);
+            if (swap) {
+                static const std::set<std::string> committed = {
+                    "btc_funded", "both_funded", "pric_claimed",
+                    "complete", "refunded"};
+                if (committed.contains(swap->state)) {
+                    QMessageBox::warning(this, tr("Cannot release match"), tr(
+                        "<b>This order is linked to swap %1 in state <code>%2</code> "
+                        "— funds are already committed on-chain.</b><br><br>"
+                        "Releasing the match now would break the watcher's "
+                        "ability to mark this order Filled when the swap "
+                        "completes. Wait for the swap to settle (or refund) "
+                        "instead — the order will then update automatically.")
+                        .arg(QString::fromStdString(rec->linked_swap_id).left(12) + "…")
+                        .arg(QString::fromStdString(swap->state)));
+                    return;
+                }
+            }
+        }
+    }
+
     if (QMessageBox::question(this, tr("Release match"),
             tr("Release this match back to Active? Use when the swap setup "
                "has aborted but the order should remain available."),

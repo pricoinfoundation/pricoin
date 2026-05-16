@@ -737,21 +737,77 @@ void ChainWatcher::TryReconcileMatchedOrders()
     if (::wallet::pricoin_offer::List(m_wallet, orders)
         != ::wallet::pricoin_offer::LookupResult::Ok) return;
 
-    bool any_matched = false;
+    // Two reconciliation paths:
+    //   (a) Matched + pric_in_flight_sat — legacy path. The Fill /
+    //       Unmatch primitives mutate both target and peer if matched.
+    //   (b) linked_swap_id — the swap is known directly, independent
+    //       of current `matched_with_order_id`. Recovers orders that
+    //       got Unmatched mid-swap (stray release-match click).
+    bool any_candidate = false;
     for (const auto& o : orders) {
-        if (o.status == OS::Matched) { any_matched = true; break; }
+        if (o.status == OS::Matched) { any_candidate = true; break; }
+        if (!o.linked_swap_id.IsNull()
+            && o.status != OS::Filled
+            && o.status != OS::Cancelled
+            && o.status != OS::Expired) {
+            any_candidate = true;
+            break;
+        }
     }
-    if (!any_matched) return;
+    if (!any_candidate) return;
 
     std::vector<AdaptorSwap> swaps;
     if (List(m_wallet, swaps) != LookupResult::Ok) return;
+    std::map<uint256, const AdaptorSwap*> swap_by_id;
+    for (const auto& s : swaps) swap_by_id[s.swap_id] = &s;
 
     for (const auto& o : orders) {
         if (m_stopping.load()) return;
+
+        // Path (b): linked_swap_id-driven reconciliation. Runs first
+        // because it handles the (Unmatched-but-linked) case the
+        // legacy path doesn't see.
+        if (!o.linked_swap_id.IsNull()
+            && o.status != OS::Filled
+            && o.status != OS::Cancelled
+            && o.status != OS::Expired) {
+            auto it = swap_by_id.find(o.linked_swap_id);
+            if (it != swap_by_id.end()) {
+                const AdaptorSwap& s = *it->second;
+                const bool complete = (s.state == State::Complete);
+                const bool refunded = (s.state == State::Refunded
+                                        || s.state == State::Aborted);
+                if (complete) {
+                    auto r = ::wallet::pricoin_offer::FillFromLinkedSwap(
+                        m_wallet, o.payload.order_id, s.pric_amount_sat);
+                    if (r == MR::Ok) {
+                        LogInfo("Pricoin order self-heal: FillFromLinkedSwap "
+                                "applied to order %s (linked swap %s reached "
+                                "Complete; %lld sat consumed)\n",
+                                o.payload.order_id.ToString().substr(0, 12),
+                                s.swap_id.ToString().substr(0, 12),
+                                (long long)s.pric_amount_sat);
+                    }
+                    continue;  // handled (or no-op idempotent)
+                }
+                if (refunded) {
+                    // Refund: release the link without consuming the
+                    // order's remaining. If still Matched the legacy
+                    // path below handles it; otherwise just clear the
+                    // linked_swap_id by tag-applying FillFromLinkedSwap
+                    // with zero consumption is wrong — instead let the
+                    // legacy path handle Matched orders below, and
+                    // accept that Active-but-linked orders simply keep
+                    // a stale linked_swap_id (harmless; cleared on
+                    // re-match or cancel).
+                }
+            }
+        }
+
+        // Path (a): legacy Matched+in_flight reconciliation. Keeps
+        // working when the matched_with link is intact.
         if (o.status != OS::Matched) continue;
         if (o.pric_in_flight_sat == 0) continue;
-        // Find a swap whose pric_amount_sat matches the order's
-        // in-flight amount and which is in a terminal state.
         for (const auto& s : swaps) {
             if (s.pric_amount_sat != o.pric_in_flight_sat) continue;
             const bool complete = (s.state == State::Complete);

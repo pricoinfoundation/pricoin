@@ -253,6 +253,9 @@ private:
         s.notes = o.notes;
         s.created_time = o.created_time;
         s.updated_time = o.updated_time;
+        if (!o.linked_swap_id.IsNull()) {
+            s.linked_swap_id = o.linked_swap_id.ToString();
+        }
         return s;
     }
 
@@ -401,6 +404,39 @@ public:
         auto r = ::wallet::pricoin_offer::Unmatch(*m_wallet, *oid);
         if (r != ::wallet::pricoin_offer::MutateResult::Ok) {
             return util::Error{Untranslated("unmatch rejected (order not Matched)")};
+        }
+        ::wallet::pricoin_offer::Order o;
+        ::wallet::pricoin_offer::Get(*m_wallet, *oid, o);
+        return ToSnapshot(o);
+    }
+
+    util::Result<PricoinOfferSnapshot> offerLinkSwap(
+        const std::string& order_id,
+        const std::string& swap_id) override
+    {
+        auto oid = ParseOid(order_id);
+        if (!oid) return util::Error{Untranslated("bad order_id")};
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("bad swap_id")};
+        auto r = ::wallet::pricoin_offer::LinkSwap(*m_wallet, *oid, *sid);
+        if (r != ::wallet::pricoin_offer::MutateResult::Ok) {
+            return util::Error{Untranslated("link rejected (conflicting existing link?)")};
+        }
+        ::wallet::pricoin_offer::Order o;
+        ::wallet::pricoin_offer::Get(*m_wallet, *oid, o);
+        return ToSnapshot(o);
+    }
+
+    util::Result<PricoinOfferSnapshot> offerFillFromLinkedSwap(
+        const std::string& order_id,
+        int64_t consumed_sat) override
+    {
+        auto oid = ParseOid(order_id);
+        if (!oid) return util::Error{Untranslated("bad order_id")};
+        auto r = ::wallet::pricoin_offer::FillFromLinkedSwap(
+            *m_wallet, *oid, consumed_sat);
+        if (r != ::wallet::pricoin_offer::MutateResult::Ok) {
+            return util::Error{Untranslated("FillFromLinkedSwap rejected")};
         }
         ::wallet::pricoin_offer::Order o;
         ::wallet::pricoin_offer::Get(*m_wallet, *oid, o);

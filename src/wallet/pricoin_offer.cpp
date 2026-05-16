@@ -8,6 +8,7 @@
 #include <crypto/sha256.h>
 #include <hash.h>
 #include <key.h>
+#include <logging.h>
 #include <random.h>
 #include <streams.h>
 #include <sync.h>
@@ -234,6 +235,7 @@ bool LoadFromDBLocked(CWallet& wallet, WalletCache& cache)
         WalletBatch batch(wallet.GetDatabase());
         if (!batch.ReadAllPricoinOffers(blobs)) return false;
     }
+    int dropped = 0;
     for (auto& [oid, blob] : blobs) {
         std::vector<unsigned char> plain;
         if (!::wallet::pricoin_stealth::DecryptWalletBlob(wallet, blob, plain)) return false;
@@ -242,10 +244,49 @@ bool LoadFromDBLocked(CWallet& wallet, WalletCache& cache)
         try {
             ds >> o;
         } catch (const std::exception&) {
-            return false;
+            // Tail-truncated record: rewind and parse without the
+            // appended fields (linked_swap_id and any future addition).
+            // The serialized layout up to and including `updated_time`
+            // is stable; pre-format records lack the bytes after it.
+            // Treat as a pre-format record and decode best-effort: the
+            // partial parse may have advanced — discard and use the
+            // default-constructed `o` to consume the original blob
+            // again, this time tolerating a short read by catching at
+            // each field. Simpler heuristic: attempt a manual parse
+            // matching the pre-2026-05-16 layout, then keep the
+            // resulting `o` with `linked_swap_id` defaulted to null.
+            ds = DataStream{std::span<const unsigned char>{plain}};
+            o = Order{};
+            try {
+                ds >> o.payload;
+                uint8_t origin_byte = 0;
+                ds >> origin_byte;
+                o.origin = static_cast<Origin>(origin_byte);
+                uint8_t status_byte = 0;
+                ds >> status_byte;
+                o.status = static_cast<Status>(status_byte);
+                ds >> o.pric_remaining_sat;
+                ds >> o.pric_in_flight_sat;
+                ds >> o.matched_with_order_id;
+                ds >> o.notes;
+                ds >> o.created_time;
+                ds >> o.updated_time;
+                // linked_swap_id stays default (null) for old records.
+            } catch (const std::exception&) {
+                ++dropped;
+                continue;
+            }
         }
-        if (o.payload.order_id != oid) return false;
+        if (o.payload.order_id != oid) {
+            ++dropped;
+            continue;
+        }
         cache.by_id[oid] = std::move(o);
+    }
+    if (dropped > 0) {
+        LogInfo("Pricoin offer cache: dropped %d unparseable record(s) "
+                "(likely older serialization layout); %d valid loaded\n",
+                dropped, (int)cache.by_id.size());
     }
     return true;
 }
@@ -578,6 +619,7 @@ MutateResult Fill(CWallet& wallet, const uint256& order_id)
             target.pric_remaining_sat -= consumed;
             target.pric_in_flight_sat = 0;
             target.matched_with_order_id = uint256{};
+            target.linked_swap_id = uint256{};   // linkage consumed
             target.status = (target.pric_remaining_sat <= kOrderDustRemainderSat)
                 ? Status::Filled : Status::Active;
             if (peer && peer->status == Status::Matched) {
@@ -587,11 +629,76 @@ MutateResult Fill(CWallet& wallet, const uint256& order_id)
                 peer->pric_remaining_sat -= consumed;
                 peer->pric_in_flight_sat = 0;
                 peer->matched_with_order_id = uint256{};
+                peer->linked_swap_id = uint256{};   // linkage consumed
                 peer->status = (peer->pric_remaining_sat <= kOrderDustRemainderSat)
                     ? Status::Filled : Status::Active;
             }
             return MutateResult::Ok;
         });
+}
+
+MutateResult LinkSwap(
+    CWallet& wallet, const uint256& order_id, const uint256& swap_id)
+{
+    if (swap_id.IsNull()) return MutateResult::InvalidInput;
+    if (!RequireUnlocked(wallet)) return MutateResult::Locked;
+    LOCK(g_mutex);
+    auto& cache = EnsureCache(wallet);
+    if (!EnsureLoadedLocked(wallet, cache)) return MutateResult::WriteFailed;
+    auto it = cache.by_id.find(order_id);
+    if (it == cache.by_id.end()) return MutateResult::NotFound;
+    Order& o = it->second;
+    if (!o.linked_swap_id.IsNull() && o.linked_swap_id != swap_id) {
+        return MutateResult::InvalidState;  // refuse to clobber an existing link
+    }
+    if (o.linked_swap_id == swap_id) {
+        return MutateResult::Ok;            // idempotent
+    }
+    Order snap = o;
+    o.linked_swap_id = swap_id;
+    o.updated_time = NowSec();
+    if (!WriteOrderToDB(wallet, o)) {
+        o = snap;
+        return MutateResult::WriteFailed;
+    }
+    return MutateResult::Ok;
+}
+
+MutateResult FillFromLinkedSwap(
+    CWallet& wallet, const uint256& order_id, int64_t consumed_sat)
+{
+    if (consumed_sat <= 0) return MutateResult::InvalidInput;
+    if (!RequireUnlocked(wallet)) return MutateResult::Locked;
+    LOCK(g_mutex);
+    auto& cache = EnsureCache(wallet);
+    if (!EnsureLoadedLocked(wallet, cache)) return MutateResult::WriteFailed;
+    auto it = cache.by_id.find(order_id);
+    if (it == cache.by_id.end()) return MutateResult::NotFound;
+    Order& o = it->second;
+    // Terminal states already settled — no-op.
+    if (o.status == Status::Filled
+        || o.status == Status::Cancelled
+        || o.status == Status::Expired) {
+        return MutateResult::Ok;
+    }
+    if (consumed_sat > o.pric_remaining_sat) {
+        // Already applied (e.g. the standard Fill path ran first).
+        // Treat as idempotent success.
+        return MutateResult::Ok;
+    }
+    Order snap = o;
+    o.pric_remaining_sat -= consumed_sat;
+    o.pric_in_flight_sat = 0;
+    o.matched_with_order_id = uint256{};
+    o.linked_swap_id = uint256{};
+    o.status = (o.pric_remaining_sat <= kOrderDustRemainderSat)
+        ? Status::Filled : Status::Active;
+    o.updated_time = NowSec();
+    if (!WriteOrderToDB(wallet, o)) {
+        o = snap;
+        return MutateResult::WriteFailed;
+    }
+    return MutateResult::Ok;
 }
 
 MutateResult Unmatch(CWallet& wallet, const uint256& order_id)

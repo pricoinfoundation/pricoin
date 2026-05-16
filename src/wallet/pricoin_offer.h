@@ -126,6 +126,15 @@ struct Order {
     int64_t      created_time{0};
     int64_t      updated_time{0};
 
+    // AdaptorSwap id created from this order. Set by LinkSwap once the
+    // orderbook page's Start-swap path returns successfully. Survives
+    // Unmatch (which clears matched_with_order_id) so the watcher's
+    // post-terminal hook can find the order to Fill even if the user
+    // — or a peer DM — released the match mid-swap. Null while the
+    // order has never been used to drive a swap. Cleared by Fill
+    // (success) since the swap has consumed its in-flight share.
+    uint256      linked_swap_id{};
+
     bool operator==(const Order&) const = default;
 
     SERIALIZE_METHODS(Order, obj) {
@@ -142,6 +151,12 @@ struct Order {
         READWRITE(obj.notes);
         READWRITE(obj.created_time);
         READWRITE(obj.updated_time);
+
+        // linked_swap_id (appended 2026-05-16). Tolerate older records
+        // that lack the field — the wallet's offer cache treats deser
+        // failure on append as "use default (null) and continue", per
+        // the same convention used in pricoin_adaptor_swap.
+        READWRITE(obj.linked_swap_id);
     }
 };
 
@@ -269,6 +284,27 @@ MutateResult Fill(CWallet& wallet, const uint256& order_id);
 // Release a Matched order back to Active without consuming. Used
 // when the swap setup aborts before reaching the finality point.
 MutateResult Unmatch(CWallet& wallet, const uint256& order_id);
+
+// Tag an order with the AdaptorSwap id it backed. Set by the
+// orderbook page right after a successful adaptorSwapCreate so the
+// linkage survives Unmatch / Cancel (which clear `matched_with_order_id`).
+// Idempotent — re-set with same value is OK; re-set with a different
+// value is rejected to prevent silent overwrite of a real linkage.
+MutateResult LinkSwap(
+    CWallet& wallet, const uint256& order_id, const uint256& swap_id);
+
+// Apply a swap-consumed deduction to an order, independent of current
+// status — used by the watcher's self-heal when the order's
+// `matched_with` link was cleared (Unmatch / Cancel cascade) before
+// the swap reached its terminal state. Decrements
+// `pric_remaining_sat` by `consumed`, resets `pric_in_flight_sat` to
+// 0, clears `linked_swap_id`, and sets status:
+//   * Matched / Active → Active if remaining > dust else Filled.
+//   * Filled / Cancelled / Expired → unchanged (terminal).
+// Returns Ok in both the "applied" and "already-applied (idempotent)"
+// cases so the caller's retry-loop doesn't churn.
+MutateResult FillFromLinkedSwap(
+    CWallet& wallet, const uint256& order_id, int64_t consumed_sat);
 
 // Auto-expire (no-op if Active and not expired). Idempotent.
 // Useful as a periodic sweep; also called by List/Get internally.
