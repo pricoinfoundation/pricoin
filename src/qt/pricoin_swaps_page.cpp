@@ -394,6 +394,49 @@ void PricoinSwapsPage::refreshTable()
             m_auto_advance_fired.insert(fire_key);
             continue;
         }
+        // Sticky re-DM: tx_announce envelopes used to be sent once
+        // (at the moment of broadcast) and lost if the peer's wallet
+        // wasn't subscribed to a relay we hit. The receive-side
+        // pricoin_swapwatch_add is idempotent (duplicate Add returns
+        // ok), so blind retries are safe. Replay on every refresh
+        // tick while the state implies the peer still needs the
+        // announcement.
+        auto resend_tx_announce = [&](const std::string& kind,
+                                        const std::string& txid_hex,
+                                        int32_t vout,
+                                        int32_t min_conf) {
+            if (s.counterparty_pubkey_hex.size() < 66) return;
+            const QString peer_xonly = QString::fromStdString(
+                s.counterparty_pubkey_hex.substr(2));
+            auto* nostr = m_model->getOrCreateNostrClient();
+            if (!nostr) return;
+            nostr->publishBroadcastAnnouncement(
+                peer_xonly,
+                QString::fromStdString(s.swap_id),
+                QString::fromStdString(kind),
+                QString::fromStdString(txid_hex),
+                vout, min_conf);
+        };
+        // Bob → Alice: foreign_funding announcement. Bob is BtcFunded
+        // and Alice still needs to learn the LTC funding txid so her
+        // watcher can advance her PreSigned → BtcFunded.
+        if (s.role == "bob"
+            && (s.state == "btc_funded" || s.state == "both_funded")
+            && !s.foreign_funding_txid.empty()
+            && s.foreign_funding_vout >= 0) {
+            resend_tx_announce("foreign_funding", s.foreign_funding_txid,
+                                s.foreign_funding_vout, /*min_conf=*/1);
+        }
+        // Alice → Bob: pric_funding announcement. Alice is past
+        // BothFunded (her PRIC tx is broadcast) and Bob needs the
+        // txid to advance his BtcFunded → BothFunded.
+        if (s.role == "alice"
+            && (s.state == "both_funded" || s.state == "pric_claimed")
+            && !s.pric_funding_txid_hex.empty()
+            && s.pric_funding_vout >= 0) {
+            resend_tx_announce("pric_funding", s.pric_funding_txid_hex,
+                                s.pric_funding_vout, /*min_conf=*/1);
+        }
         if (s.state == "pric_claimed" && s.role == "alice"
             && s.foreign_chain == "ltc") {
             // Alice extracts t from Bob's on-chain PRIC claim (handled
