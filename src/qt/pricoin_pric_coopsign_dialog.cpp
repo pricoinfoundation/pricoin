@@ -2755,10 +2755,22 @@ void PricCoopSignDialog::onStep2Compute()
             // Only include ring_w when we got W out of every ring
             // member (defensive — partial W would fail the 1:1 length
             // check in the RPC anyway).
-            if (ring_w_only.size() == ring_p_only.size()
-                && !ring_w_only.empty()) {
+            const bool include_w = (ring_w_only.size() == ring_p_only.size()
+                                     && !ring_w_only.empty());
+            if (include_w) {
                 ring_params.push_back(ring_w_only);
+            } else {
+                ring_params.push_back(UniValue{UniValue::VARR});
             }
+            // Canonical (msg, pi, tx_hex) — what THIS Step-2 run
+            // computed the pre-sig against. SetPricClaimRing's
+            // conflict-policy will REJECT a different (msg, pi, tx_hex)
+            // from a subsequent run, so an accidental re-buildtx that
+            // wraps a new Step 2 surfaces here as an RPC failure
+            // instead of silently corrupting adapt.
+            ring_params.push_back(m_msg_hex.toStdString());
+            ring_params.push_back(m_pi.toInt());
+            ring_params.push_back(m_unsigned_tx_hex.toStdString());
             auto rr = callRpc("pricoin_adaptor_swap_set_pric_claim_ring",
                                 ring_params.write(0));
             if (!rr.ok) {

@@ -2218,27 +2218,35 @@ void PricoinSwapsPage::onAdaptPricClaimClicked()
     msg->setPlaceholderText(tr("32-byte sighash hex"));
     form->addRow(tr("msg (sighash):"), msg);
 
-    // Auto-fill the 3 fields. For the multi-layer adapt path, ring
-    // MUST be the {P,W} ring_ml from the coopsign session JSON —
-    // single-layer P-only (pric_claim_ring_hex on the snap) produces
-    // a sig with zero commitment_image that fails consensus
-    // VerifyMultiLayer. tx_hex + msg come from the same session JSON.
+    // Auto-fill the 3 fields. Preferred source is the swap record
+    // (canonical, persisted atomically with the pre-sig). Falls back
+    // to session JSON for pre-2026-05-17 swaps that didn't store
+    // (msg, pi, tx_hex) on the record.
     if (auto snap_opt = m_model->wallet().adaptorSwapGet(sid); snap_opt) {
+        if (!snap_opt->pric_claim_unsigned_tx_hex.empty()) {
+            tx_hex->setPlainText(QString::fromStdString(
+                snap_opt->pric_claim_unsigned_tx_hex));
+        }
+        if (!snap_opt->pric_claim_msg_hex.empty()) {
+            msg->setText(QString::fromStdString(snap_opt->pric_claim_msg_hex));
+        }
+        // Session-JSON fallback for any field still empty.
         const std::string& blob = snap_opt->pric_claim_adaptor_session_json;
         UniValue j;
         const bool have_session = !blob.empty() && j.read(blob) && j.isObject();
         if (have_session) {
-            if (j.exists("unsigned_tx_hex") && j["unsigned_tx_hex"].isStr()) {
+            if (tx_hex->toPlainText().trimmed().isEmpty()
+                && j.exists("unsigned_tx_hex") && j["unsigned_tx_hex"].isStr()) {
                 tx_hex->setPlainText(QString::fromStdString(
                     j["unsigned_tx_hex"].get_str()));
             }
-            if (j.exists("msg_hex") && j["msg_hex"].isStr()) {
+            if (msg->text().trimmed().isEmpty()
+                && j.exists("msg_hex") && j["msg_hex"].isStr()) {
                 msg->setText(QString::fromStdString(
                     j["msg_hex"].get_str()));
             }
-            // Prefer session's ring_json (post-2026-05-12 coopsign
-            // stores ring_ml here for adaptor mode).
-            if (j.exists("ring_json") && j["ring_json"].isStr()) {
+            if (ring->toPlainText().trimmed().isEmpty()
+                && j.exists("ring_json") && j["ring_json"].isStr()) {
                 ring->setPlainText(QString::fromStdString(
                     j["ring_json"].get_str()));
             }
@@ -2411,47 +2419,84 @@ bool PricoinSwapsPage::autoAdaptPricClaim(const std::string& sid)
     // no dialog. Used by the pre_signed auto-trigger so Bob's PRIC
     // claim broadcasts without manual button-click. Returns true on
     // success.
+    //
+    // Source of truth for (tx_hex, ring, msg): the swap record, set
+    // atomically with the pre-sig at Step 2 success. The session JSON
+    // is only a fallback for swaps that predate that persistence
+    // (2026-05-17). Reading from session is fragile because nothing
+    // prevents the spender's buildtx from re-running across dialog
+    // restarts and overwriting the cached ring/msg — which is exactly
+    // the bug class we hit on 2026-05-16.
     if (!m_model) return false;
     auto snap_opt = m_model->wallet().adaptorSwapGet(sid);
     if (!snap_opt) return false;
-    const std::string& blob = snap_opt->pric_claim_adaptor_session_json;
-    if (blob.empty()) {
-        setStatus(tr("Auto: PRIC claim — coopsign session JSON missing on "
-                      "swap record; can't extract tx_hex/ring/msg."), true);
-        return false;
-    }
-    UniValue j;
-    if (!j.read(blob) || !j.isObject()) {
-        setStatus(tr("Auto: PRIC claim — coopsign session JSON unparseable."), true);
-        return false;
-    }
-    if (!j.exists("unsigned_tx_hex") || !j["unsigned_tx_hex"].isStr()) {
-        setStatus(tr("Auto: PRIC claim — session missing unsigned_tx_hex."), true);
-        return false;
-    }
-    if (!j.exists("msg_hex") || !j["msg_hex"].isStr()) {
-        setStatus(tr("Auto: PRIC claim — session missing msg_hex."), true);
-        return false;
-    }
-    // Prefer session's ring_json (multi-layer {P,W} format).
+
+    std::string tx_hex_use;
+    std::string msg_hex_use;
     UniValue ring_v;
-    if (j.exists("ring_json") && j["ring_json"].isStr()
-        && ring_v.read(j["ring_json"].get_str()) && ring_v.isArray()) {
-        // ok
-    } else if (!snap_opt->pric_claim_ring_hex.empty()) {
+    // Preferred path: swap record (canonical).
+    if (!snap_opt->pric_claim_unsigned_tx_hex.empty()
+        && !snap_opt->pric_claim_msg_hex.empty()
+        && !snap_opt->pric_claim_ring_hex.empty()) {
+        tx_hex_use  = snap_opt->pric_claim_unsigned_tx_hex;
+        msg_hex_use = snap_opt->pric_claim_msg_hex;
+        // Prefer ring_ml ({P,W}) when W is available; fall back to
+        // P-only (single-layer; will fail consensus but at least
+        // surfaces a clear error).
         ring_v = UniValue{UniValue::VARR};
-        for (const auto& h : snap_opt->pric_claim_ring_hex) {
-            ring_v.push_back(h);
+        if (snap_opt->pric_claim_ring_w_hex.size()
+            == snap_opt->pric_claim_ring_hex.size()) {
+            for (size_t i = 0; i < snap_opt->pric_claim_ring_hex.size(); ++i) {
+                UniValue m{UniValue::VOBJ};
+                m.pushKV("P", snap_opt->pric_claim_ring_hex[i]);
+                m.pushKV("W", snap_opt->pric_claim_ring_w_hex[i]);
+                ring_v.push_back(m);
+            }
+        } else {
+            for (const auto& h : snap_opt->pric_claim_ring_hex) {
+                ring_v.push_back(h);
+            }
         }
     } else {
-        setStatus(tr("Auto: PRIC claim — no ring data available."), true);
-        return false;
+        // Legacy fallback: pre-2026-05-17 swaps store this only in
+        // the session JSON.
+        const std::string& blob = snap_opt->pric_claim_adaptor_session_json;
+        if (blob.empty()) {
+            setStatus(tr("Auto: PRIC claim — neither swap-record context nor "
+                          "session JSON has tx_hex/ring/msg."), true);
+            return false;
+        }
+        UniValue j;
+        if (!j.read(blob) || !j.isObject()) {
+            setStatus(tr("Auto: PRIC claim — coopsign session JSON unparseable."), true);
+            return false;
+        }
+        if (!j.exists("unsigned_tx_hex") || !j["unsigned_tx_hex"].isStr()
+            || !j.exists("msg_hex") || !j["msg_hex"].isStr()) {
+            setStatus(tr("Auto: PRIC claim — session missing unsigned_tx_hex/msg_hex."), true);
+            return false;
+        }
+        tx_hex_use  = j["unsigned_tx_hex"].get_str();
+        msg_hex_use = j["msg_hex"].get_str();
+        if (j.exists("ring_json") && j["ring_json"].isStr()
+            && ring_v.read(j["ring_json"].get_str()) && ring_v.isArray()) {
+            // ok
+        } else if (!snap_opt->pric_claim_ring_hex.empty()) {
+            ring_v = UniValue{UniValue::VARR};
+            for (const auto& h : snap_opt->pric_claim_ring_hex) {
+                ring_v.push_back(h);
+            }
+        } else {
+            setStatus(tr("Auto: PRIC claim — no ring data available."), true);
+            return false;
+        }
     }
+
     UniValue p{UniValue::VARR};
     p.push_back(sid);
-    p.push_back(j["unsigned_tx_hex"].get_str());
+    p.push_back(tx_hex_use);
     p.push_back(ring_v);
-    p.push_back(j["msg_hex"].get_str());
+    p.push_back(msg_hex_use);
     p.push_back(1);  // min_confirmations
     std::string err;
     auto r = CallWalletRpc(m_model, "pricoin_swapwatch_adapt_pric_claim", p, &err);
@@ -2468,7 +2513,7 @@ bool PricoinSwapsPage::autoAdaptPricClaim(const std::string& sid)
                       "  swap_id=%2  msg=%3  ring=%4 size=%5")
             .arg(QString::fromStdString(err))
             .arg(QString::fromStdString(sid).left(12) + "…")
-            .arg(QString::fromStdString(j["msg_hex"].get_str()).left(16) + "…")
+            .arg(QString::fromStdString(msg_hex_use).left(16) + "…")
             .arg(QString::fromStdString(ring_summary))
             .arg(static_cast<int>(ring_v.size())),
             true);

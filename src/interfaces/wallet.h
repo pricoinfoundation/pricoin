@@ -326,6 +326,14 @@ public:
         // that predate the post-2026-05-16 persistence.
         std::vector<std::string> pric_claim_ring_w_hex;
 
+        // Canonical (msg, pi, tx_hex) the PRIC claim pre-sig is
+        // bound to, stored on the swap record at Step 2 success.
+        // Authoritative source for the adapt path; session_json is
+        // only a fallback for swaps that predate this persistence.
+        std::string pric_claim_msg_hex;
+        int32_t     pric_claim_pi{-1};
+        std::string pric_claim_unsigned_tx_hex;
+
         // PRIC stealth ephemeral r (32-byte hex). Set when Bob has
         // committed adaptor materials; required for Alice's PRIC
         // funding-tx auto-build to use a pinned ephemeral so on-chain

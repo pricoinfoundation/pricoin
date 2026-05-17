@@ -480,12 +480,19 @@ TransitionResult SetPricClaimRing(
     CWallet& wallet,
     const uint256& swap_id,
     const std::vector<std::array<unsigned char, 33>>& ring,
-    const std::vector<std::array<unsigned char, 33>>& ring_w)
+    const std::vector<std::array<unsigned char, 33>>& ring_w,
+    const std::string& msg_hex,
+    int32_t pi,
+    const std::string& unsigned_tx_hex)
 {
     if (ring.empty()) return TransitionResult::InvalidInput;
     // ring_w may be empty (legacy callers / pre-ML path), but if
     // supplied it must align with the P ring 1:1.
     if (!ring_w.empty() && ring_w.size() != ring.size()) {
+        return TransitionResult::InvalidInput;
+    }
+    // msg_hex when supplied must be 32 bytes (64 hex chars).
+    if (!msg_hex.empty() && msg_hex.size() != 64) {
         return TransitionResult::InvalidInput;
     }
     return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
@@ -500,6 +507,26 @@ TransitionResult SetPricClaimRing(
                 return TransitionResult::InvalidInput;
             }
             s.pric_claim_ring_w = ring_w;
+        }
+        // Back-fill / set (msg, pi, tx_hex). Same conflict policy.
+        if (!msg_hex.empty()) {
+            if (!s.pric_claim_msg_hex.empty() && s.pric_claim_msg_hex != msg_hex) {
+                return TransitionResult::InvalidInput;
+            }
+            s.pric_claim_msg_hex = msg_hex;
+        }
+        if (pi >= 0) {
+            if (s.pric_claim_pi >= 0 && s.pric_claim_pi != pi) {
+                return TransitionResult::InvalidInput;
+            }
+            s.pric_claim_pi = pi;
+        }
+        if (!unsigned_tx_hex.empty()) {
+            if (!s.pric_claim_unsigned_tx_hex.empty()
+                && s.pric_claim_unsigned_tx_hex != unsigned_tx_hex) {
+                return TransitionResult::InvalidInput;
+            }
+            s.pric_claim_unsigned_tx_hex = unsigned_tx_hex;
         }
         return TransitionResult::Ok;
     });

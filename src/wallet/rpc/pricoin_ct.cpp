@@ -5281,6 +5281,16 @@ RPCMethod pricoin_adaptor_swap_set_pric_claim_ring()
                 "1:1 with `ring`. Required for the multi-layer adapt-recovery "
                 "path; legacy callers may omit.",
                 {{"W", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""}}},
+            {"msg_hex", RPCArg::Type::STR_HEX, RPCArg::Default{""},
+                "Canonical 32-byte sighash the pre-sig is bound to "
+                "(from pricoin_jointspend_buildtx). Stored on the swap "
+                "record so the spender's adapt path can recover after a "
+                "session-JSON wipe."},
+            {"pi",      RPCArg::Type::NUM,     RPCArg::Default{-1},
+                "Signer index in the ring (0..ring_size-1)."},
+            {"unsigned_tx_hex", RPCArg::Type::STR_HEX, RPCArg::Default{""},
+                "Skeleton tx hex from pricoin_jointspend_buildtx that the "
+                "pre-sig will be adapted into."},
         },
         RPCResult{ RPCResult::Type::OBJ, "", "",
             {{RPCResult::Type::BOOL, "ok", "true on success"}}
@@ -5334,7 +5344,21 @@ RPCMethod pricoin_adaptor_swap_set_pric_claim_ring()
                     }
                 }
             }
-            auto r = aas::SetPricClaimRing(*wallet_sp, sid, ring, ring_w);
+            // Optional canonical (msg, pi, tx_hex).
+            std::string msg_hex_p;
+            int32_t pi_p = -1;
+            std::string tx_hex_p;
+            if (request.params.size() >= 4 && !request.params[3].isNull()) {
+                msg_hex_p = request.params[3].get_str();
+            }
+            if (request.params.size() >= 5 && !request.params[4].isNull()) {
+                pi_p = request.params[4].getInt<int32_t>();
+            }
+            if (request.params.size() >= 6 && !request.params[5].isNull()) {
+                tx_hex_p = request.params[5].get_str();
+            }
+            auto r = aas::SetPricClaimRing(*wallet_sp, sid, ring, ring_w,
+                                            msg_hex_p, pi_p, tx_hex_p);
             if (r != aas::TransitionResult::Ok) ThrowFromAdaptorSwapTransition(r);
             UniValue out{UniValue::VOBJ};
             out.pushKV("ok", true);

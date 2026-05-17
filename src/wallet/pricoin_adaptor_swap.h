@@ -255,6 +255,21 @@ struct AdaptorSwap {
     // run yet. Same length as `pric_claim_ring` once populated.
     std::vector<std::array<unsigned char, 33>> pric_claim_ring_w;
 
+    // Canonical (msg, pi, tx_hex) the PRIC claim pre-sig was built
+    // against — stored together with the ring (P+W) at Step 2 success
+    // so the spender's adapt path can read them from the swap record
+    // instead of relying on session_json (which can drift if buildtx
+    // re-runs across dialog instances). Empty before Step 2; once set,
+    // SetPricClaimRing rejects a conflicting re-set so the canonical
+    // values can't be silently overwritten.
+    //
+    // pric_claim_msg_hex      — 32-byte sighash (hex) from buildtx
+    // pric_claim_pi           — signer index in the ring (0..ring_size-1)
+    // pric_claim_unsigned_tx_hex — skeleton tx hex the sig embeds into
+    std::string pric_claim_msg_hex;
+    int32_t     pric_claim_pi{-1};
+    std::string pric_claim_unsigned_tx_hex;
+
     // Pricoin-stealth ephemeral private `r` chosen by Bob at adaptor-
     // setup. Bob uses it to compute P_pi = shared(r·A_J)·G + B_J;
     // T_G/T_H/DLEQ are bound to that P_pi. For the on-chain P_pi to
@@ -441,6 +456,14 @@ struct AdaptorSwap {
         // session-JSON wipe doesn't lose the multi-layer ring the
         // PRIC claim pre-sig is bound to.
         READWRITE(obj.pric_claim_ring_w);
+
+        // Canonical (msg, pi, tx_hex) the PRIC claim pre-sig is
+        // bound to (appended 2026-05-17). Lets the spender's adapt
+        // path read directly from the swap record instead of trusting
+        // session_json, which can drift if buildtx re-runs.
+        READWRITE(obj.pric_claim_msg_hex);
+        READWRITE(obj.pric_claim_pi);
+        READWRITE(obj.pric_claim_unsigned_tx_hex);
     }
 };
 
@@ -586,19 +609,28 @@ TransitionResult SetTSecret(
     const uint256& swap_id,
     const std::array<unsigned char, 32>& t);
 
-// Persist the cooperative ring used at PRIC adapt-round-1 time. Called
-// by both wallets' coopsign dialogs after a successful adaptor combine,
+// Persist the cooperative ring used at PRIC adapt-round-1 time, plus
+// the canonical (msg, pi, tx_hex) the pre-sig is bound to. Called by
+// both wallets' coopsign dialogs after a successful adaptor combine,
 // so that when Bob's claim later hits chain the watcher can run extract
 // (Alice) or re-adapt (Bob, after a session-JSON wipe) without manually
 // re-running buildtx and invalidating the pre-sig. State-machine-neutral.
-// Idempotent if the supplied ring matches the stored one. Rejects with
+// Idempotent if all supplied values match what's stored. Rejects with
 // InvalidInput if `ring` is empty or `ring_w` (when supplied) doesn't
-// match `ring` in length.
+// match `ring` in length, OR if any supplied non-empty field conflicts
+// with an existing stored value.
+//
+// msg_hex / pi / unsigned_tx_hex may all be empty for legacy callers
+// (back-compat) — the corresponding swap-record fields stay blank and
+// the adapt path falls back to session_json.
 TransitionResult SetPricClaimRing(
     CWallet& wallet,
     const uint256& swap_id,
     const std::vector<std::array<unsigned char, 33>>& ring,
-    const std::vector<std::array<unsigned char, 33>>& ring_w = {});
+    const std::vector<std::array<unsigned char, 33>>& ring_w = {},
+    const std::string& msg_hex = {},
+    int32_t pi = -1,
+    const std::string& unsigned_tx_hex = {});
 
 // Record the pre-built unsigned PRIC refund tx hex. Captured by the
 // spender (Alice) during the PreSigned ceremony's buildtx step so

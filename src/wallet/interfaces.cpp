@@ -543,6 +543,9 @@ public:
         for (const auto& w : s.pric_claim_ring_w) {
             o.pric_claim_ring_w_hex.push_back(HexStr(w));
         }
+        o.pric_claim_msg_hex = s.pric_claim_msg_hex;
+        o.pric_claim_pi      = s.pric_claim_pi;
+        o.pric_claim_unsigned_tx_hex = s.pric_claim_unsigned_tx_hex;
         o.has_pric_ephemeral_r = s.has_pric_ephemeral_r;
         if (s.has_pric_ephemeral_r) {
             o.pric_ephemeral_r_hex = HexStr(s.pric_ephemeral_r);
