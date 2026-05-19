@@ -22,7 +22,9 @@
 #include <openssl/x509v3.h>
 #endif
 
+#include <chrono>
 #include <mutex>
+#include <thread>
 
 #include <cstdint>
 #include <cstring>
@@ -207,7 +209,11 @@ SSL_CTX* GetSSLContext()
 // One-shot HTTP request. Method is EVHTTP_REQ_GET / EVHTTP_REQ_POST.
 // `path` should start with '/' and be relative to the URL prefix
 // (the prefix is prepended internally).
-HTTPReply DoRequest(
+//
+// Renamed from `DoRequest` to `DoRequestOnce` — the public entry
+// point with the same name now wraps this in a transient-error retry
+// loop (see `DoRequest` below).
+HTTPReply DoRequestOnce(
     const ParsedURL& url,
     int timeout_seconds,
     int method,
@@ -342,6 +348,56 @@ HTTPReply DoRequest(
             url.host, url.port, full_path, err_str));
     }
     return reply;
+}
+
+// Public DoRequest — same interface as before, but wraps
+// `DoRequestOnce` in a retry loop on transient transport errors
+// (timeout, EOF, buffer error, connection failure). HTTP non-2xx
+// responses are NOT retried: those are a deliberate server reply and
+// retrying just churns rate limits. The retry budget is small (3
+// attempts with exponential backoff 0.5s → 1s → 2s) so a totally
+// unreachable host fails within a few seconds rather than hanging.
+//
+// Broadcast POSTs are safe to retry: Esplora dedupes by txid, so a
+// double-submit of the same tx returns the same txid (already in
+// mempool). All GETs are obviously idempotent.
+//
+// Surfaces the final attempt's error message on exhaustion so the
+// caller's status line still says something actionable.
+HTTPReply DoRequest(
+    const ParsedURL& url,
+    int timeout_seconds,
+    int method,
+    const std::string& path,
+    const std::string* body_for_post = nullptr,
+    const char* content_type = "text/plain")
+{
+    constexpr int kMaxAttempts = 3;
+    constexpr int kBaseBackoffMs = 500;
+    std::string last_err;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        try {
+            return DoRequestOnce(url, timeout_seconds, method, path,
+                                  body_for_post, content_type);
+        } catch (const ChainBackendError& e) {
+            last_err = e.what();
+            // Only retry on transient transport failures — the
+            // "HTTP{S} error talking to ... — <reason>" path. HTTP
+            // status errors (non-2xx) go through `Require2xx` in the
+            // backend, which throws a "Esplora <path> returned HTTP
+            // N: ..." error — those we do NOT retry.
+            const bool is_transport_err =
+                last_err.find("error talking to") != std::string::npos;
+            if (!is_transport_err || attempt + 1 >= kMaxAttempts) {
+                throw;
+            }
+            const int backoff_ms = kBaseBackoffMs << attempt;  // 500, 1000, 2000
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+        }
+    }
+    // Unreachable — the loop either returns or throws. Belt-and-
+    // suspenders to keep the compiler happy.
+    throw ChainBackendError("DoRequest retry loop exited unexpectedly: " + last_err);
 }
 
 // Helpers — strip surrounding whitespace from a body the server may
