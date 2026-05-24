@@ -85,6 +85,12 @@ bool WalletFrame::addView(WalletView* walletView)
     walletStack->addWidget(walletView);
     mapWalletViews[walletView->getWalletModel()] = walletView;
 
+    // Forward programmatic Swaps-page nav so BitcoinGUI can update its
+    // toolbar action highlight. Without this the widget swap fires but
+    // the previous tab's action stays visually selected.
+    connect(walletView, &WalletView::pricoinSwapsPageRequested,
+            this, &WalletFrame::pricoinSwapsPageRequested);
+
     return true;
 }
 

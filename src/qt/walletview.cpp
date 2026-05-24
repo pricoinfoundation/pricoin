@@ -101,9 +101,15 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
 
     // After a successful "Start swap" confirmation, jump the user
     // straight to the Swaps tab so they see row-level progress without
-    // having to click over manually.
+    // having to click over manually. The widget swap happens here AND
+    // we surface a signal so BitcoinGUI can also update its toolbar
+    // action-group highlight (the "selected tab" indicator) — without
+    // that the toolbar would still show the Orderbook tab as active.
     connect(pricoinOrderbookPage, &PricoinOrderbookPage::gotoSwapsPageRequested,
-            this, &WalletView::gotoPricoinSwapsPage);
+            this, [this]() {
+                gotoPricoinSwapsPage();
+                Q_EMIT pricoinSwapsPageRequested();
+            });
 
     // Clicking on "Export" allows to export the transaction list
     connect(exportButton, &QPushButton::clicked, transactionView, &TransactionView::exportClicked);

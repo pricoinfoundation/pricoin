@@ -1084,6 +1084,53 @@ void PricoinOrderbookPage::onStartSwapClicked()
                 peer_addrs.view_pubkey.toStdString(),
                 peer_addrs.spend_pubkey.toStdString());
         }
+
+        // DM the counterparty so their wallet auto-creates the mirror
+        // swap record (same payload the legacy form path sends). Without
+        // this the swap only exists on this side; the peer's auto-coord
+        // never starts. Same envelope shape as the form fallback below
+        // — receiver handler is `pricoin:swap_start/v1` in onNostrDmReceived.
+        if (m_nostr && peer->maker_pubkey_hex.size() >= 66) {
+            const QString peer_xonly = QString::fromStdString(
+                peer->maker_pubkey_hex.substr(2));
+            QJsonObject swap_dm;
+            swap_dm.insert(QStringLiteral("type"),
+                QStringLiteral("pricoin:swap_start/v1"));
+            swap_dm.insert(QStringLiteral("sender_role"),
+                QString::fromStdString(my_role));
+            swap_dm.insert(QStringLiteral("foreign_chain"),
+                QString::fromStdString(ap.foreign_chain));
+            swap_dm.insert(QStringLiteral("foreign_amount_sat"),
+                static_cast<double>(ap.foreign_amount_sat));
+            swap_dm.insert(QStringLiteral("pric_amount_sat"),
+                static_cast<double>(ap.pric_amount_sat));
+            swap_dm.insert(QStringLiteral("pric_joint_stealth_address"),
+                QString::fromStdString(ap.pric_joint_stealth_address));
+            swap_dm.insert(QStringLiteral("memo"),
+                QString::fromStdString(ap.memo));
+            swap_dm.insert(QStringLiteral("btc_alice_recipient_xonly_hex"),
+                QString::fromStdString(ap.btc_alice_recipient_xonly_hex));
+            swap_dm.insert(QStringLiteral("btc_bob_recipient_xonly_hex"),
+                QString::fromStdString(ap.btc_bob_recipient_xonly_hex));
+            swap_dm.insert(QStringLiteral("pric_alice_recipient_stealth"),
+                QString::fromStdString(ap.pric_alice_recipient_stealth));
+            swap_dm.insert(QStringLiteral("pric_bob_recipient_stealth"),
+                QString::fromStdString(ap.pric_bob_recipient_stealth));
+            swap_dm.insert(QStringLiteral("my_order_id"),
+                QString::fromStdString(oid));
+            swap_dm.insert(QStringLiteral("their_order_id"),
+                QString::fromStdString(peer->order_id));
+            swap_dm.insert(QStringLiteral("swap_id"),
+                QString::fromStdString(created_swap_id));
+            const QString plaintext = QString::fromUtf8(
+                QJsonDocument(swap_dm).toJson(QJsonDocument::Compact));
+            LogInfo("Pricoin start_swap (happy) emit: swap_id=%s peer=%s plaintext_bytes=%d\n",
+                    created_swap_id.substr(0, 16),
+                    peer_xonly.left(12).toStdString(),
+                    (int)plaintext.size());
+            m_nostr->publishDirectMessage(peer_xonly, plaintext);
+        }
+
         setStatus(tr("Swap created. Counterparty's wallet will mirror it "
                       "automatically — switching to the Swaps tab."));
         Q_EMIT gotoSwapsPageRequested();

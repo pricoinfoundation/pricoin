@@ -50,6 +50,10 @@ Q_SIGNALS:
     void createWalletButtonClicked();
     void message(const QString& title, const QString& message, unsigned int style);
     void currentWalletSet();
+    /** Forwarded from any WalletView when programmatic navigation
+     *  to the Pricoin Swaps page should also update BitcoinGUI's
+     *  toolbar action highlight. */
+    void pricoinSwapsPageRequested();
 
 private:
     QStackedWidget *walletStack;

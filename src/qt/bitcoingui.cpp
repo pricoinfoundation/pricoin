@@ -123,6 +123,12 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
             this->message(title, message, style);
         });
         connect(walletFrame, &WalletFrame::currentWalletSet, [this] { updateWalletStatus(); });
+        // Programmatic Swaps-page nav (e.g. from Start-swap confirmation):
+        // sync the toolbar action so the highlight follows the widget.
+        connect(walletFrame, &WalletFrame::pricoinSwapsPageRequested, this,
+            [this] {
+                if (pricoinSwapsAction) pricoinSwapsAction->setChecked(true);
+            });
         setCentralWidget(walletFrame);
     } else
 #endif // ENABLE_WALLET

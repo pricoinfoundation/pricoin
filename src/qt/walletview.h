@@ -134,6 +134,11 @@ Q_SIGNALS:
     void incomingTransaction(const QString& date, BitcoinUnit unit, const CAmount& amount, const QString& type, const QString& address, const QString& label, const QString& walletName);
     /** Notify that the out of sync warning icon has been pressed */
     void outOfSyncWarningClicked();
+    /** Programmatic navigation to the Pricoin Swaps page — forwarded so
+     *  BitcoinGUI can also update its action-group highlight (the
+     *  toolbar tab indicator). Without this, programmatic tab switches
+     *  swap the widget but leave the previous action visually selected. */
+    void pricoinSwapsPageRequested();
 };
 
 #endif // BITCOIN_QT_WALLETVIEW_H
