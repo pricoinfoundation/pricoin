@@ -985,8 +985,115 @@ void PricoinOrderbookPage::onStartSwapClicked()
         }
     }
 
-    // Prompt for the joint stealth address (the user computed it via
-    // pricoin_buildjointstealthaddress out-of-band) plus refund timelocks.
+    // Resolve "my own" + peer's swap-side addresses up front. When all
+    // of (joint stealth, both BTC xonlys, both PRIC stealths) are
+    // already known — which is the happy path now that swap_addrs DMs
+    // auto-exchange them at match time — the field-heavy form is just
+    // noise. Show a single-line confirmation and skip straight to the
+    // adaptorSwapCreate call. Falls back to the legacy form only when
+    // something genuinely needs user input.
+    const std::string my_stealth_pre = m_model
+        ? m_model->wallet().getStealthAddress() : "";
+    const QString my_btc_xonly_pre = getMyBtcXOnly(
+        QString::fromStdString(mine->foreign_chain));
+    QString peer_btc_xonly_pre;
+    QString peer_pric_stlth_pre;
+    QString joint_addr_pre;
+    {
+        auto it = m_peer_swap_addrs.find(QString::fromStdString(mine->order_id));
+        if (it != m_peer_swap_addrs.end()) {
+            peer_btc_xonly_pre = it->btc_xonly;
+            peer_pric_stlth_pre = it->pric_stealth;
+            joint_addr_pre = it->joint_address;
+        }
+    }
+    const bool happy_path =
+        !joint_addr_pre.isEmpty()
+        && !my_btc_xonly_pre.isEmpty()
+        && !peer_btc_xonly_pre.isEmpty()
+        && !my_stealth_pre.empty()
+        && !peer_pric_stlth_pre.isEmpty();
+    if (happy_path) {
+        // Single-line confirmation: amounts + counterparty preview.
+        // Matches the "post-match swap is one confirmation + progress UI"
+        // memory direction.
+        const QString cp_short =
+            peer->maker_pubkey_hex.size() >= 16
+                ? QString::fromStdString(peer->maker_pubkey_hex).left(16) + "…"
+                : QString::fromStdString(peer->maker_pubkey_hex);
+        const QString confirm_msg = tr(
+            "<b>Start swap?</b><br><br>"
+            "Role: <b>%1</b><br>"
+            "Foreign chain: <b>%2</b><br>"
+            "PRIC amount: <b>%3</b> sat<br>"
+            "Foreign amount: <b>%4</b> sat<br>"
+            "Counterparty: <code>%5</code><br><br>"
+            "All addresses + joint stealth are pre-resolved from the match. "
+            "After clicking Yes, the swap progresses automatically — "
+            "watch the Swaps tab.")
+            .arg(QString::fromStdString(my_role))
+            .arg(QString::fromStdString(mine->foreign_chain))
+            .arg(QString::number(pric_amount))
+            .arg(QString::number(foreign_amount))
+            .arg(cp_short);
+        if (QMessageBox::question(this, tr("Start atomic swap"), confirm_msg,
+                QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) {
+            return;
+        }
+        // Build params and jump to the create path. Defaults match the
+        // form's defaults: pric_lock=480, delta_min=144, memo="".
+        interfaces::Wallet::PricoinAdaptorSwapCreateParams ap;
+        ap.role = my_role;
+        ap.counterparty_pubkey_hex = peer->maker_pubkey_hex;
+        ap.foreign_chain = mine->foreign_chain;
+        ap.foreign_amount_sat = foreign_amount;
+        ap.pric_joint_stealth_address = joint_addr_pre.toStdString();
+        ap.pric_amount_sat = pric_amount;
+        ap.memo = std::string{};
+        if (my_role == "alice") {
+            ap.btc_alice_recipient_xonly_hex = my_btc_xonly_pre.toStdString();
+            ap.btc_bob_recipient_xonly_hex   = peer_btc_xonly_pre.toStdString();
+            ap.pric_alice_recipient_stealth  = my_stealth_pre;
+            ap.pric_bob_recipient_stealth    = peer_pric_stlth_pre.toStdString();
+        } else {
+            ap.btc_alice_recipient_xonly_hex = peer_btc_xonly_pre.toStdString();
+            ap.btc_bob_recipient_xonly_hex   = my_btc_xonly_pre.toStdString();
+            ap.pric_alice_recipient_stealth  = peer_pric_stlth_pre.toStdString();
+            ap.pric_bob_recipient_stealth    = my_stealth_pre;
+        }
+        // Persist peer-addrs snapshot copy for the post-create wiring
+        // below (peer_addrs / cp_hex lookups work off this).
+        PeerSwapAddrs peer_addrs;
+        peer_addrs.btc_xonly = peer_btc_xonly_pre;
+        peer_addrs.pric_stealth = peer_pric_stlth_pre;
+        peer_addrs.joint_address = joint_addr_pre;
+
+        auto r = m_model->wallet().adaptorSwapCreate(ap);
+        if (!r) {
+            setStatus(tr("Start swap failed: %1")
+                .arg(QString::fromStdString(util::ErrorString(r).original)), true);
+            return;
+        }
+        const std::string created_swap_id = r->swap_id;
+        (void)m_model->wallet().offerLinkSwap(mine_v.order_id, created_swap_id);
+        (void)m_model->wallet().offerLinkSwap(peer_v.order_id, created_swap_id);
+        if (!peer_addrs.view_pubkey.isEmpty()
+            && !peer_addrs.spend_pubkey.isEmpty()) {
+            (void)m_model->wallet().adaptorSwapSetPeerStealthPubkeys(
+                created_swap_id,
+                peer_addrs.view_pubkey.toStdString(),
+                peer_addrs.spend_pubkey.toStdString());
+        }
+        setStatus(tr("Swap created. Counterparty's wallet will mirror it "
+                      "automatically — switching to the Swaps tab."));
+        Q_EMIT gotoSwapsPageRequested();
+        return;
+    }
+
+    // Fallback: legacy form. Reached only when one or more addresses
+    // are missing — typically because the peer's swap_addrs DM hasn't
+    // arrived yet, or this swap was started against a hand-imported
+    // order with no DM exchange.
     QDialog dlg(this);
     dlg.setWindowTitle(tr("Start atomic swap"));
     auto* form = new QFormLayout(&dlg);

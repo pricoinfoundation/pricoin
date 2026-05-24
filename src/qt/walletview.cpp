@@ -99,6 +99,12 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
     // Highlight transaction after send
     connect(sendCoinsPage, &SendCoinsDialog::coinsSent, transactionView, qOverload<const Txid&>(&TransactionView::focusTransaction));
 
+    // After a successful "Start swap" confirmation, jump the user
+    // straight to the Swaps tab so they see row-level progress without
+    // having to click over manually.
+    connect(pricoinOrderbookPage, &PricoinOrderbookPage::gotoSwapsPageRequested,
+            this, &WalletView::gotoPricoinSwapsPage);
+
     // Clicking on "Export" allows to export the transaction list
     connect(exportButton, &QPushButton::clicked, transactionView, &TransactionView::exportClicked);
 

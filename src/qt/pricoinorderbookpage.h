@@ -59,6 +59,13 @@ public:
 
     void setModel(WalletModel* model);
 
+Q_SIGNALS:
+    // Emitted after a successful adaptorSwapCreate from the happy-path
+    // Start-swap flow. WalletView wires this to gotoPricoinSwapsPage()
+    // so the user lands on the Swaps tab and sees row-level progress
+    // immediately instead of having to click over manually.
+    void gotoSwapsPageRequested();
+
 private Q_SLOTS:
     void onCreateClicked();
     void onImportClicked();
