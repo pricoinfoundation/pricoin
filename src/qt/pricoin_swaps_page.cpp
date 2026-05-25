@@ -20,6 +20,7 @@
 
 #include <cmath>
 
+#include <QEventLoop>
 #include <QJsonDocument>
 #include <QJsonObject>
 
@@ -1390,13 +1391,14 @@ void PricoinSwapsPage::onAdvanceClicked()
             [this, &dlg, sid, pric_p]() {
             PricCoopSignDialog d(m_model, PricCoopSignDialog::Mode::PricAdaptor,
                                  tr("PRIC claim adaptor pre-sig"), sid, &dlg);
-            // Headless when auto-coord is driving — the swaps page row
-            // already shows progress, and the dialog otherwise pops up
-            // briefly during the ceremony. Falls back to visible
-            // progress-only mode when the user clicks the button
-            // directly (auto-coord won't drive a click from the user).
+            // Headless when auto-coord is driving. Use runHeadless()
+            // instead of exec() — exec() forces WA_ShowModal which
+            // would invisibly modal-block the whole app (close button
+            // dead, no clicks possible). runHeadless() spins a local
+            // event loop without modality so the main window keeps
+            // processing input throughout the ceremony.
             d.setHeadlessMode(true);
-            d.exec();
+            d.runHeadless();
             if (!d.finalBlobHex().isEmpty()) {
                 pric_p->setPlainText(d.finalBlobHex());
             }
@@ -1428,7 +1430,7 @@ void PricoinSwapsPage::onAdvanceClicked()
             PricCoopSignDialog d(m_model, PricCoopSignDialog::Mode::PricPlain,
                                  tr("PRIC refund cooperative sig"), sid, &dlg);
             d.setHeadlessMode(true);
-            d.exec();
+            d.runHeadless();
             if (!d.finalBlobHex().isEmpty()) {
                 pric_r->setPlainText(d.finalBlobHex());
             }
@@ -1453,13 +1455,13 @@ void PricoinSwapsPage::onAdvanceClicked()
             // only sees the row-level state on the Swaps page advance
             // through Cooperative-signing → PreSigned.
             //
-            // Non-modal is CRITICAL — exec() defaults to ApplicationModal
-            // which blocks input to all windows. Combined with the
-            // invisible Qt::WA_DontShowOnScreen attribute, that makes
-            // the whole app appear frozen (even the title-bar close
-            // button is dead). NonModal still lets exec() block the
-            // caller via its local event loop, so auto-coord
-            // serialization is preserved.
+            // CRITICAL: don't use QDialog::exec() — it unconditionally
+            // sets Qt::WA_ShowModal which application-modals the
+            // dialog. Combined with WA_DontShowOnScreen, that makes
+            // the whole app appear frozen (close button dead, no
+            // clicks). We spin a local QEventLoop manually below and
+            // connect dlg.finished() → loop.quit() so blocking-the-
+            // caller semantics are preserved without the modal flag.
             dlg.setAttribute(Qt::WA_DontShowOnScreen, true);
             dlg.setWindowModality(Qt::NonModal);
             dlg.setWindowFlag(Qt::Tool, true);
@@ -1473,9 +1475,18 @@ void PricoinSwapsPage::onAdvanceClicked()
                 if (pric_r->toPlainText().trimmed().isEmpty()) return;
                 dlg.accept();
             }, Qt::QueuedConnection);
-        }
 
-        if (dlg.exec() != QDialog::Accepted) return;
+            // Manual non-modal "exec": show + spin until finished.
+            QEventLoop loop;
+            QObject::connect(&dlg, &QDialog::finished, &loop, &QEventLoop::quit);
+            dlg.show();
+            loop.exec();
+            if (dlg.result() != QDialog::Accepted) return;
+        } else {
+            // BTC / non-auto-coord path — keep legacy modal dialog with
+            // visible UI so the user can paste fields manually.
+            if (dlg.exec() != QDialog::Accepted) return;
+        }
         interfaces::Wallet::PricoinAdaptorSwapPreSigsHex ps;
         if (!is_ltc) {
             ps.btc_claim_presig_hex       = btc_p->toPlainText().trimmed().toStdString();

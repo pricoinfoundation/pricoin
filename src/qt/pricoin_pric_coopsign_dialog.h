@@ -89,6 +89,15 @@ public:
     // plumbing — the user only sees the row-level progress on the
     // Swaps page. Must be set BEFORE the first show()/exec().
     void setHeadlessMode(bool on);
+    // Headless replacement for QDialog::exec(). exec() unconditionally
+    // sets Qt::WA_ShowModal which makes the dialog application-modal
+    // regardless of setWindowModality — so a Qt::WA_DontShowOnScreen
+    // dialog ends up invisibly modal and the whole app appears frozen.
+    // runHeadless() spins a local QEventLoop that does NOT set ShowModal:
+    // the dialog stays alive and its auto-coord chain runs, the caller
+    // blocks until accept()/reject(), but the main window keeps
+    // processing input. Returns QDialog::Accepted / Rejected.
+    int runHeadless();
 
 private Q_SLOTS:
     void onStep1Compute();

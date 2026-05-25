@@ -18,6 +18,8 @@
 #include <util/translation.h>
 
 #include <QApplication>
+#include <QEventLoop>
+#include <QPointer>
 #include <QTimer>
 #include <QCheckBox>
 #include <QClipboard>
@@ -2458,6 +2460,31 @@ void PricCoopSignDialog::setProgressOnlyMode(bool on)
         resize(640, 360);
         setMinimumSize(560, 320);
     }
+}
+
+int PricCoopSignDialog::runHeadless()
+{
+    // Non-modal counterpart to QDialog::exec(). Spins a local QEventLoop
+    // that quits when the dialog calls accept() or reject() (via the
+    // finished signal). The dialog never gets WA_ShowModal set, so
+    // the main application window keeps processing events — clicks,
+    // repaints, tab switches, the close button — even while this
+    // method blocks the caller. Pairs with setHeadlessMode(true).
+    setResult(0);
+    QEventLoop loop;
+    QPointer<PricCoopSignDialog> guard{this};
+    connect(this, &QDialog::finished, &loop, &QEventLoop::quit);
+    // Show without modal flagging. WA_DontShowOnScreen (set by
+    // setHeadlessMode) keeps it off the screen; show() still triggers
+    // the show event the auto-coord chain hooks into.
+    show();
+    loop.exec();
+    if (!guard) {
+        // Defensive: if the dialog was deleted out from under us (the
+        // outer auto-coord uses stack-allocated dialogs, but be safe).
+        return QDialog::Rejected;
+    }
+    return result();
 }
 
 void PricCoopSignDialog::setHeadlessMode(bool on)
