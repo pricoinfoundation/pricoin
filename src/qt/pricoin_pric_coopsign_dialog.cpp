@@ -1825,6 +1825,18 @@ void PricCoopSignDialog::tryAutoStep1()
     m_auto_step1_fired = true;
     setStatus(tr("Auto: inputs ready — running Step 1."));
     onStep1Compute();
+    // If onStep1Compute failed (RPC error, bad inputs), m_my_commitment
+    // is still empty. Clear the fired flag so the next trigger (sticky
+    // resend, buildtx DM redelivery, or onNostrRelayStatus reconnect)
+    // gets a chance to retry. Without this reset, a single transient
+    // RPC failure leaves Step 1 permanently skipped and the ceremony
+    // wedged at "inputs ready" with no output. With headless dialogs
+    // there's no visible status, so the failure mode is silent.
+    if (m_my_commitment.isEmpty()) {
+        m_auto_step1_fired = false;
+        setStatus(tr("Step 1 produced no commitment — will retry on next trigger."), true);
+        return;
+    }
     tryAutoSendRound1();
 }
 
@@ -1852,6 +1864,13 @@ void PricCoopSignDialog::tryAutoStep2()
     m_auto_step2_fired = true;
     setStatus(tr("Auto: peer share present — running Step 2."));
     onStep2Compute();
+    // Step 2 succeeded iff m_KI is populated. On failure, clear the
+    // flag so the next trigger can retry instead of being skipped.
+    if (m_KI.isEmpty()) {
+        m_auto_step2_fired = false;
+        setStatus(tr("Step 2 produced no KI — will retry on next trigger."), true);
+        return;
+    }
     tryAutoStep3();
 }
 
@@ -1863,6 +1882,12 @@ void PricCoopSignDialog::tryAutoStep3()
     m_auto_step3_fired = true;
     setStatus(tr("Auto: Step 2 complete — running Step 3."));
     onStep3Compute();
+    // Retry-on-failure: clear flag if no s_share produced.
+    if (m_my_s_share.isEmpty()) {
+        m_auto_step3_fired = false;
+        setStatus(tr("Step 3 produced no s_share — will retry on next trigger."), true);
+        return;
+    }
     tryAutoSendRound3();
 }
 
@@ -1885,6 +1910,15 @@ void PricCoopSignDialog::tryAutoStep4()
     m_auto_step4_fired = true;
     setStatus(tr("Auto: peer s_share present — running Step 4."));
     onStep4Compute();
+    // Retry-on-failure: clear flag if no final blob produced.
+    if (m_final_blob_hex.isEmpty()) {
+        m_auto_step4_fired = false;
+        setStatus(tr("Step 4 produced no final pre-signature — will retry on next trigger."), true);
+        return;
+    }
+    // Final blob is in hand — auto-accept so runHeadless()'s
+    // QEventLoop quits and the outer dialog's auto-coord continues.
+    accept();
 }
 
 QString PricCoopSignDialog::RandomHex32()
@@ -1935,6 +1969,24 @@ void PricCoopSignDialog::setStatus(const QString& msg, bool error)
             ? QStringLiteral("QLabel { color: #b71c1c; }")
             : QStringLiteral("QLabel { color: #1b5e20; }"));
         m_status_label->setText(msg);
+    }
+    // Mirror to the wallet log when in headless mode — the in-dialog
+    // status widgets are invisible by definition, so the user has no
+    // way to see error messages (e.g. "round1_ml failed: ..."). Echo
+    // each setStatus call to debug.log so the on-disk trail still
+    // captures the ceremony's narrative.
+    if (m_headless) {
+        if (error) {
+            LogWarning("Pricoin coopsign[%s/%s]: %s",
+                       m_mode == Mode::PricAdaptor ? "claim" : "refund",
+                       m_swap_id.left(12).toStdString(),
+                       msg.toStdString());
+        } else {
+            LogInfo("Pricoin coopsign[%s/%s]: %s\n",
+                    m_mode == Mode::PricAdaptor ? "claim" : "refund",
+                    m_swap_id.left(12).toStdString(),
+                    msg.toStdString());
+        }
     }
     // Mirror to the progress UI so the user-visible label stays in
     // sync without us having to call two setters at every site.
