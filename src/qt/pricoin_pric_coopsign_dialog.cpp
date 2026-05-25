@@ -300,28 +300,33 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
         }
         // Always start from the top of the chain — each tryAuto step
         // is gated on its own preconditions, so calling them in order
-        // gracefully resumes whatever was in flight. Important on
-        // dialog reopen after a binary upgrade or daemon restart,
-        // where m_my_commitment / m_in_peer_share_json may be present
-        // but the auto-fire flags are false (they aren't persisted),
-        // so the next-step would otherwise sit idle. The cascade has
-        // to include EVERY intermediate step — earlier versions
-        // skipped tryAutoLoadshare and tryAutoBuildtx and ended up
-        // with dialogs stuck at "Scanning joint stealth output…"
-        // after a session restore that had both jointscan partials
-        // present but never re-ran loadshare.
-        tryAutoComputeJointscanPartial();
-        tryAutoSendJointscanPartial();
-        tryAutoSendXpubAnnounce();
-        tryAutoLoadshare();
-        tryAutoBuildtx();
-        tryAutoSendBuildtx();
-        tryAutoStep1();
-        tryAutoSendRound1();
-        tryAutoStep2();
-        tryAutoStep3();
-        tryAutoSendRound3();
-        tryAutoStep4();
+        // gracefully resumes whatever was in flight.
+        //
+        // CRITICAL: each step is queued INDIVIDUALLY (not bundled in
+        // one lambda). Each step does in-process RPC calls that can
+        // each take hundreds of milliseconds (buildtx with RandomX
+        // ring hashing being the worst). Running all 12 in a single
+        // queued lambda blocks the GUI event loop for the duration of
+        // the whole chain — which froze the entire app on dialog
+        // open. Per-step queueing lets the event loop process clicks
+        // / repaints / inbound DMs between each step.
+        auto q = [this](auto member) {
+            QMetaObject::invokeMethod(this, [this, member]() {
+                (this->*member)();
+            }, Qt::QueuedConnection);
+        };
+        q(&PricCoopSignDialog::tryAutoComputeJointscanPartial);
+        q(&PricCoopSignDialog::tryAutoSendJointscanPartial);
+        q(&PricCoopSignDialog::tryAutoSendXpubAnnounce);
+        q(&PricCoopSignDialog::tryAutoLoadshare);
+        q(&PricCoopSignDialog::tryAutoBuildtx);
+        q(&PricCoopSignDialog::tryAutoSendBuildtx);
+        q(&PricCoopSignDialog::tryAutoStep1);
+        q(&PricCoopSignDialog::tryAutoSendRound1);
+        q(&PricCoopSignDialog::tryAutoStep2);
+        q(&PricCoopSignDialog::tryAutoStep3);
+        q(&PricCoopSignDialog::tryAutoSendRound3);
+        q(&PricCoopSignDialog::tryAutoStep4);
     }, Qt::QueuedConnection);
 
     // Nostr-connectivity gate: the entire auto-coord chain is gated
