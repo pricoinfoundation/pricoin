@@ -2459,15 +2459,25 @@ void PricCoopSignDialog::setHeadlessMode(bool on)
 {
     m_headless = on;
     // Qt::WA_DontShowOnScreen keeps the widget out of the screen but
-    // still participates in the modal event loop, so exec() runs
-    // normally and the auto-coord chain drives the ceremony exactly
-    // as if the dialog were visible. The user only sees row-level
-    // progress on the Swaps page. Combined with progress-only mode,
-    // this keeps the window state coherent for any code path that
-    // queries m_progress_state etc.
+    // still participates in the local event loop spun by exec(), so
+    // the auto-coord chain drives the ceremony exactly as if the
+    // dialog were visible. Combined with progress-only mode, this
+    // keeps the window state coherent for any code path that queries
+    // m_progress_state etc.
     setAttribute(Qt::WA_DontShowOnScreen, on);
     if (on) {
         setProgressOnlyMode(true);
+        // CRITICAL: explicitly NON-modal in headless mode. exec() defaults
+        // to Qt::ApplicationModal, which blocks input to ALL other
+        // windows — including the main window's title-bar close button.
+        // With Qt::WA_DontShowOnScreen the dialog is invisible, so a
+        // modal exec() looks to the user like the entire app has
+        // frozen (clicks ignored, close button does nothing). Setting
+        // NonModal lets exec() spin its local loop without blocking
+        // input to the main window; the auto-coord serialization
+        // (helper.click() running exec() inline) still works because
+        // exec() returns when accept()/reject() is called.
+        setWindowModality(Qt::NonModal);
         // Belt-and-suspenders: tool window + frameless minimizes any
         // window-manager artefact in case WA_DontShowOnScreen is
         // honored late on some platforms.

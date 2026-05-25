@@ -1452,7 +1452,16 @@ void PricoinSwapsPage::onAdvanceClicked()
             // headless, the entire ceremony runs invisibly. The user
             // only sees the row-level state on the Swaps page advance
             // through Cooperative-signing → PreSigned.
+            //
+            // Non-modal is CRITICAL — exec() defaults to ApplicationModal
+            // which blocks input to all windows. Combined with the
+            // invisible Qt::WA_DontShowOnScreen attribute, that makes
+            // the whole app appear frozen (even the title-bar close
+            // button is dead). NonModal still lets exec() block the
+            // caller via its local event loop, so auto-coord
+            // serialization is preserved.
             dlg.setAttribute(Qt::WA_DontShowOnScreen, true);
+            dlg.setWindowModality(Qt::NonModal);
             dlg.setWindowFlag(Qt::Tool, true);
             dlg.setWindowFlag(Qt::FramelessWindowHint, true);
             QMetaObject::invokeMethod(&dlg, [pric_claim_helper, pric_p,
