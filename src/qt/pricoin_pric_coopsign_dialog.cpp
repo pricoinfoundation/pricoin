@@ -312,23 +312,33 @@ PricCoopSignDialog::PricCoopSignDialog(WalletModel* wallet_model,
         // the whole chain — which froze the entire app on dialog
         // open. Per-step queueing lets the event loop process clicks
         // / repaints / inbound DMs between each step.
-        auto q = [this](auto member) {
-            QMetaObject::invokeMethod(this, [this, member]() {
+        // Per-step queue with explicit name logging so debug.log shows
+        // which step ran (and which returned early) — every tryAutoXxx
+        // has multiple silent-return paths, and without entry logging
+        // a stalled chain looks identical to a working chain that has
+        // nothing to do.
+        auto q = [this](const char* name, auto member) {
+            QMetaObject::invokeMethod(this, [this, name, member]() {
+                if (m_headless) {
+                    LogInfo("Pricoin coopsign[%s/%s]: ENTER %s\n",
+                            m_mode == Mode::PricAdaptor ? "claim" : "refund",
+                            m_swap_id.left(12).toStdString(), name);
+                }
                 (this->*member)();
             }, Qt::QueuedConnection);
         };
-        q(&PricCoopSignDialog::tryAutoComputeJointscanPartial);
-        q(&PricCoopSignDialog::tryAutoSendJointscanPartial);
-        q(&PricCoopSignDialog::tryAutoSendXpubAnnounce);
-        q(&PricCoopSignDialog::tryAutoLoadshare);
-        q(&PricCoopSignDialog::tryAutoBuildtx);
-        q(&PricCoopSignDialog::tryAutoSendBuildtx);
-        q(&PricCoopSignDialog::tryAutoStep1);
-        q(&PricCoopSignDialog::tryAutoSendRound1);
-        q(&PricCoopSignDialog::tryAutoStep2);
-        q(&PricCoopSignDialog::tryAutoStep3);
-        q(&PricCoopSignDialog::tryAutoSendRound3);
-        q(&PricCoopSignDialog::tryAutoStep4);
+        q("tryAutoComputeJointscanPartial", &PricCoopSignDialog::tryAutoComputeJointscanPartial);
+        q("tryAutoSendJointscanPartial",    &PricCoopSignDialog::tryAutoSendJointscanPartial);
+        q("tryAutoSendXpubAnnounce",        &PricCoopSignDialog::tryAutoSendXpubAnnounce);
+        q("tryAutoLoadshare",               &PricCoopSignDialog::tryAutoLoadshare);
+        q("tryAutoBuildtx",                 &PricCoopSignDialog::tryAutoBuildtx);
+        q("tryAutoSendBuildtx",             &PricCoopSignDialog::tryAutoSendBuildtx);
+        q("tryAutoStep1",                   &PricCoopSignDialog::tryAutoStep1);
+        q("tryAutoSendRound1",              &PricCoopSignDialog::tryAutoSendRound1);
+        q("tryAutoStep2",                   &PricCoopSignDialog::tryAutoStep2);
+        q("tryAutoStep3",                   &PricCoopSignDialog::tryAutoStep3);
+        q("tryAutoSendRound3",              &PricCoopSignDialog::tryAutoSendRound3);
+        q("tryAutoStep4",                   &PricCoopSignDialog::tryAutoStep4);
     }, Qt::QueuedConnection);
 
     // Nostr-connectivity gate: the entire auto-coord chain is gated
@@ -1791,16 +1801,32 @@ void PricCoopSignDialog::tryAutoSendBuildtx()
 
 void PricCoopSignDialog::tryAutoStep1()
 {
-    if (m_auto_step1_fired) return;
+    // Headless-mode diagnostics: surface which precondition fails so
+    // a stalled chain doesn't look identical to a chain that finished.
+    auto miss = [this](const char* what) {
+        if (m_headless) {
+            static int suppress_counter = 0;
+            // Cap noise — log every 8th miss so the user gets
+            // periodic state without flooding debug.log.
+            if (++suppress_counter % 8 == 1) {
+                LogInfo("Pricoin coopsign[%s/%s]: tryAutoStep1 waiting on %s\n",
+                        m_mode == Mode::PricAdaptor ? "claim" : "refund",
+                        m_swap_id.left(12).toStdString(), what);
+            }
+        }
+    };
+    if (m_auto_step1_fired) { miss("already fired (Step 1 done or in flight)"); return; }
     if (!m_in_x_share || !m_in_joint_pubkey || !m_in_msg
-        || !m_in_pi || !m_in_session_id) return;
-    if (m_in_x_share->text().trimmed().size() != 64) return;
-    if (m_in_joint_pubkey->text().trimmed().size() != 66) return;
-    if (m_in_msg->text().trimmed().size() != 64) return;
-    if (m_in_session_id->text().trimmed().size() != 64) return;
-    if (m_in_pi->text().trimmed().isEmpty()) return;
+        || !m_in_pi || !m_in_session_id) { miss("widget pointers"); return; }
+    if (m_in_x_share->text().trimmed().size() != 64) { miss("x_share (loadshare)"); return; }
+    if (m_in_joint_pubkey->text().trimmed().size() != 66) { miss("joint_pubkey (loadshare)"); return; }
+    if (m_in_msg->text().trimmed().size() != 64) { miss("msg (buildtx DM)"); return; }
+    if (m_in_session_id->text().trimmed().size() != 64) { miss("session_id"); return; }
+    if (m_in_pi->text().trimmed().isEmpty()) { miss("pi (buildtx DM)"); return; }
     if (!m_in_ring_or_ring_ml
-        || m_in_ring_or_ring_ml->toPlainText().trimmed().isEmpty()) return;
+        || m_in_ring_or_ring_ml->toPlainText().trimmed().isEmpty()) {
+        miss("ring_or_ring_ml (buildtx DM)"); return;
+    }
     if (m_mode == Mode::PricAdaptor) {
         // Multi-layer adaptor round 1 needs ALL of: T_G + T_H +
         // X_pub_X + Z_pub_X + z_share. Previously this gate only
@@ -1810,17 +1836,17 @@ void PricCoopSignDialog::tryAutoStep1()
         // Z_pub_X). Result: round1_ml fails on Z_pub_X validation
         // or — worse — the DLEQ proofs end up bound to a stale
         // Z_pub_X if the field was restored from a prior session.
-        if (!m_in_T_G || m_in_T_G->text().trimmed().size() != 66) return;
-        if (!m_in_T_H || m_in_T_H->text().trimmed().size() != 66) return;
-        if (!m_in_X_pub_X || m_in_X_pub_X->text().trimmed().size() != 66) return;
-        if (!m_in_Z_pub_X || m_in_Z_pub_X->text().trimmed().size() != 66) return;
-        if (!m_in_z_share || m_in_z_share->text().trimmed().size() != 64) return;
+        if (!m_in_T_G || m_in_T_G->text().trimmed().size() != 66) { miss("T_G (snap)"); return; }
+        if (!m_in_T_H || m_in_T_H->text().trimmed().size() != 66) { miss("T_H (snap)"); return; }
+        if (!m_in_X_pub_X || m_in_X_pub_X->text().trimmed().size() != 66) { miss("X_pub_X (loadshare)"); return; }
+        if (!m_in_Z_pub_X || m_in_Z_pub_X->text().trimmed().size() != 66) { miss("Z_pub_X (buildtx DM z_other)"); return; }
+        if (!m_in_z_share || m_in_z_share->text().trimmed().size() != 64) { miss("z_share (buildtx DM z_other)"); return; }
         // dleq_t must also be present — combine_ml verifies it on
         // both sides at Step 2, and the validator we run there
         // wants the proof bytes to parse.
-        if (!m_in_dleq_t || m_in_dleq_t->toPlainText().trimmed().isEmpty()) return;
+        if (!m_in_dleq_t || m_in_dleq_t->toPlainText().trimmed().isEmpty()) { miss("dleq_t (snap)"); return; }
     } else {
-        if (!m_in_z_share || m_in_z_share->text().trimmed().size() != 64) return;
+        if (!m_in_z_share || m_in_z_share->text().trimmed().size() != 64) { miss("z_share (plain)"); return; }
     }
     m_auto_step1_fired = true;
     setStatus(tr("Auto: inputs ready — running Step 1."));

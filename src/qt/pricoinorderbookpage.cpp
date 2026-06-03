@@ -1122,6 +1122,23 @@ void PricoinOrderbookPage::onStartSwapClicked()
                 QString::fromStdString(peer->order_id));
             swap_dm.insert(QStringLiteral("swap_id"),
                 QString::fromStdString(created_swap_id));
+            // Sender's PRIC stealth view+spend pubkeys. The receiver
+            // needs these to persist as peer_view/peer_spend_pubkey on
+            // its mirror record so its cooperative-sign loadshare can
+            // run. Previously the receiver depended on an earlier
+            // `swap_addrs` DM landing first; if that DM was lost the
+            // cosigner side stalled at AdaptorReady with no way to
+            // recover except a manual RPC backfill.
+            {
+                const auto my_pubkeys = GetMyStealthPubkeys(m_model);
+                if (!my_pubkeys.view_hex.isEmpty()
+                    && !my_pubkeys.spend_hex.isEmpty()) {
+                    swap_dm.insert(QStringLiteral("view_pubkey"),
+                                   my_pubkeys.view_hex);
+                    swap_dm.insert(QStringLiteral("spend_pubkey"),
+                                   my_pubkeys.spend_hex);
+                }
+            }
             const QString plaintext = QString::fromUtf8(
                 QJsonDocument(swap_dm).toJson(QJsonDocument::Compact));
             LogInfo("Pricoin start_swap (happy) emit: swap_id=%s peer=%s plaintext_bytes=%d\n",
@@ -1427,6 +1444,19 @@ void PricoinOrderbookPage::onStartSwapClicked()
         // the right record on the receiving side.
         swap_dm.insert(QStringLiteral("swap_id"),
             QString::fromStdString(created_swap_id));
+        // Sender's PRIC stealth view+spend pubkeys (see happy-path
+        // emit above for rationale: removes the dependence on a prior
+        // swap_addrs DM having landed on the receiver).
+        {
+            const auto my_pubkeys = GetMyStealthPubkeys(m_model);
+            if (!my_pubkeys.view_hex.isEmpty()
+                && !my_pubkeys.spend_hex.isEmpty()) {
+                swap_dm.insert(QStringLiteral("view_pubkey"),
+                               my_pubkeys.view_hex);
+                swap_dm.insert(QStringLiteral("spend_pubkey"),
+                               my_pubkeys.spend_hex);
+            }
+        }
 
         const QString plaintext = QString::fromUtf8(
             QJsonDocument(swap_dm).toJson(QJsonDocument::Compact));
@@ -1947,23 +1977,42 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
         }
         // Persist peer's stealth pubkeys on this side's mirror record
         // too. Symmetry with the clicker-side persistence in
-        // onStartSwapClicked. The swap_addrs DM from the peer was
-        // received earlier (during match flow) and lives in
-        // m_peer_swap_addrs keyed by the local order id; look it up
-        // and persist so the cooperative-sign dialog's loadshare can
-        // read peer_spend_pubkey_hex from the swap record. Without
-        // this, the cosigner side's loadshare fails with
-        // "scriptPubKey mismatch".
+        // onStartSwapClicked. Without this, the cosigner side's
+        // cooperative-sign loadshare fails because `peer_spend_pubkey`
+        // is required (loadshare's `other_spend_pubkey` arg).
+        //
+        // Source preference: the swap_start DM now carries the
+        // sender's view+spend pubkeys directly, so we no longer
+        // depend on a prior `swap_addrs` DM having landed first.
+        // The `m_peer_swap_addrs` lookup is kept as a fallback for
+        // backward compatibility with peers running older binaries
+        // that don't include the pubkeys in swap_start yet.
         {
-            QString my_oid_qs = QString::fromStdString(my_oid);
-            auto it_addrs = m_peer_swap_addrs.find(my_oid_qs);
-            if (it_addrs != m_peer_swap_addrs.end()
-                && !it_addrs->view_pubkey.isEmpty()
-                && !it_addrs->spend_pubkey.isEmpty()) {
+            QString view_hex_to_persist;
+            QString spend_hex_to_persist;
+            const QString dm_view  = obj.value(
+                QStringLiteral("view_pubkey")).toString();
+            const QString dm_spend = obj.value(
+                QStringLiteral("spend_pubkey")).toString();
+            if (dm_view.size() == 66 && dm_spend.size() == 66) {
+                view_hex_to_persist  = dm_view;
+                spend_hex_to_persist = dm_spend;
+            } else {
+                QString my_oid_qs = QString::fromStdString(my_oid);
+                auto it_addrs = m_peer_swap_addrs.find(my_oid_qs);
+                if (it_addrs != m_peer_swap_addrs.end()
+                    && !it_addrs->view_pubkey.isEmpty()
+                    && !it_addrs->spend_pubkey.isEmpty()) {
+                    view_hex_to_persist  = it_addrs->view_pubkey;
+                    spend_hex_to_persist = it_addrs->spend_pubkey;
+                }
+            }
+            if (!view_hex_to_persist.isEmpty()
+                && !spend_hex_to_persist.isEmpty()) {
                 (void)m_model->wallet().adaptorSwapSetPeerStealthPubkeys(
                     r->swap_id,
-                    it_addrs->view_pubkey.toStdString(),
-                    it_addrs->spend_pubkey.toStdString());
+                    view_hex_to_persist.toStdString(),
+                    spend_hex_to_persist.toStdString());
             }
         }
         refreshTable();
