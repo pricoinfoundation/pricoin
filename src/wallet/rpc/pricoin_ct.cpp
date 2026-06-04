@@ -5023,6 +5023,23 @@ UniValue AdaptorSwapToJSON(const aas::AdaptorSwap& s)
         }
         pric.pushKV("pric_claim_ring", std::move(ring_arr));
     }
+    if (!s.pric_claim_ring_w.empty()) {
+        UniValue ring_w_arr{UniValue::VARR};
+        for (const auto& w : s.pric_claim_ring_w) {
+            ring_w_arr.push_back(HexStr(w));
+        }
+        pric.pushKV("pric_claim_ring_w", std::move(ring_w_arr));
+    }
+    if (!s.pric_claim_msg_hex.empty()) {
+        pric.pushKV("pric_claim_msg_hex", s.pric_claim_msg_hex);
+    }
+    if (s.pric_claim_pi >= 0) {
+        pric.pushKV("pric_claim_pi", s.pric_claim_pi);
+    }
+    if (!s.pric_claim_unsigned_tx_hex.empty()) {
+        pric.pushKV("pric_claim_unsigned_tx_hex",
+                    s.pric_claim_unsigned_tx_hex);
+    }
     if (!s.pric_claim_adaptor_session_json.empty()) {
         pric.pushKV("claim_session_json", s.pric_claim_adaptor_session_json);
     }

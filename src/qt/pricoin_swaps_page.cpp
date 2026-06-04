@@ -2529,6 +2529,30 @@ bool PricoinSwapsPage::autoAdaptPricClaim(const std::string& sid)
     p.push_back(ring_v);
     p.push_back(msg_hex_use);
     p.push_back(1);  // min_confirmations
+    const bool is_ml_ring =
+        ring_v.isArray() && !ring_v.empty() && ring_v[0].isObject();
+    // Log every adapt attempt with the precise inputs — pairs with
+    // AdaptML's LogWarning so debug.log shows BOTH what we passed
+    // AND which sub-check (t·G != T_G / s_pi+t overflow / VerifyMultiLayer)
+    // tripped. Source tag tells us whether the canonical swap-record
+    // fields were populated (preferred path) or we fell back to
+    // session_json (which is bound to whatever the last buildtx run
+    // produced — drift-vulnerable if Step 2 didn't persist canonicals).
+    const bool used_canonical =
+        !snap_opt->pric_claim_unsigned_tx_hex.empty()
+        && !snap_opt->pric_claim_msg_hex.empty()
+        && !snap_opt->pric_claim_ring_hex.empty();
+    LogInfo("Pricoin autoAdaptPricClaim: swap=%s src=%s ring=%s ring_size=%u "
+            "msg=%s tx_hex_len=%u canonical_W_len=%u canonical_msg=%s\n",
+            sid.substr(0, 16).c_str(),
+            used_canonical ? "swap_record" : "session_json",
+            is_ml_ring ? "ml(P+W)" : "single(P)",
+            (unsigned)ring_v.size(),
+            msg_hex_use.substr(0, 16).c_str(),
+            (unsigned)tx_hex_use.size(),
+            (unsigned)snap_opt->pric_claim_ring_w_hex.size(),
+            snap_opt->pric_claim_msg_hex.empty() ? "EMPTY"
+                : snap_opt->pric_claim_msg_hex.substr(0, 16).c_str());
     std::string err;
     auto r = CallWalletRpc(m_model, "pricoin_swapwatch_adapt_pric_claim", p, &err);
     if (!r) {
@@ -2536,10 +2560,8 @@ bool PricoinSwapsPage::autoAdaptPricClaim(const std::string& sid)
         // with the on-side adapt diagnostics. The adapt RPC's failure
         // message is opaque (3 possible causes); pairing it with the
         // ring shape + msg here narrows the search space.
-        const std::string ring_summary =
-            ring_v.isArray() && !ring_v.empty() && ring_v[0].isObject()
-                ? "ring_ml({P,W})"
-                : "ring_singlelayer(P)";
+        const std::string ring_summary = is_ml_ring
+            ? "ring_ml({P,W})" : "ring_singlelayer(P)";
         setStatus(tr("Auto: Adapt+broadcast PRIC failed: %1\n"
                       "  swap_id=%2  msg=%3  ring=%4 size=%5")
             .arg(QString::fromStdString(err))
@@ -2548,6 +2570,7 @@ bool PricoinSwapsPage::autoAdaptPricClaim(const std::string& sid)
             .arg(QString::fromStdString(ring_summary))
             .arg(static_cast<int>(ring_v.size())),
             true);
+        LogInfo("Pricoin autoAdaptPricClaim: RPC failed: %s\n", err.c_str());
         return false;
     }
     const QString txid = QString::fromStdString((*r)["txid"].get_str());
