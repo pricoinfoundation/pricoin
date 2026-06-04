@@ -2015,6 +2015,18 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
                     spend_hex_to_persist.toStdString());
             }
         }
+        // Reciprocal swap_addrs back to the initiator. The initiator's
+        // `adaptorSwapCreate` happens BEFORE they see our swap_addrs,
+        // so its inline `adaptorSwapSetPeerStealthPubkeys` call has
+        // nothing to persist if our match-time swap_addrs DM was lost.
+        // Sending swap_addrs in response to swap_start lets the
+        // initiator's swap_addrs handler backfill the linked swap
+        // record after the fact. Idempotent on the receiver too —
+        // their offerGet / m_peer_swap_addrs path already tolerates
+        // duplicate swap_addrs.
+        if (my_order) {
+            sendSwapAddrs(my_oid, sender_oid, my_order->foreign_chain);
+        }
         refreshTable();
         setStatus(tr("Counterparty started the swap; mirror record "
                       "created on this side. Switch to the Swaps tab."));
@@ -2039,6 +2051,21 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
         }
 
         m_peer_swap_addrs[QString::fromStdString(my_oid)] = pair;
+        // Backfill the linked swap record's peer pubkeys if this DM
+        // arrived AFTER the initiator's `adaptorSwapCreate`. Common
+        // when the original match-time swap_addrs DM was dropped and
+        // we're only seeing it now because the swap_start receiver
+        // sent a reciprocal swap_addrs back. Idempotent — the wallet
+        // call returns Ok on same-value re-set.
+        if (!pair.view_pubkey.isEmpty() && !pair.spend_pubkey.isEmpty()) {
+            const auto my_order = m_model->wallet().offerGet(my_oid);
+            if (my_order && !my_order->linked_swap_id.empty()) {
+                (void)m_model->wallet().adaptorSwapSetPeerStealthPubkeys(
+                    my_order->linked_swap_id,
+                    pair.view_pubkey.toStdString(),
+                    pair.spend_pubkey.toStdString());
+            }
+        }
         if (!pair.joint_address.isEmpty()) {
             setStatus(tr("Counterparty addresses received — Start swap is fully pre-filled "
                           "(joint stealth: %1…)")
