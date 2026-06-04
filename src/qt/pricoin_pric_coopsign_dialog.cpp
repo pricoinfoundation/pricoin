@@ -1593,9 +1593,16 @@ void PricCoopSignDialog::tryAutoLoadshare()
     const QString my   = m_in_ls_my_partial->text().trimmed();
     const QString peer = m_in_ls_peer_partial->text().trimmed();
     if (my.size() != 66 || peer.size() != 66) return;
-    m_auto_loadshare_fired = true;
     setStatus(tr("Auto: both partials present — running loadshare."));
     onRunLoadshare();
+    // Only mark fired on success — onRunLoadshare sets m_x_share when
+    // the RPC succeeds. If a precondition was missing (typically
+    // peer_spend_pubkey not yet on the swap record because Bob's
+    // reciprocal swap_addrs DM is in flight), keep the gate open so a
+    // later refresh tick can retry once the pubkeys land.
+    if (!m_x_share.isEmpty()) {
+        m_auto_loadshare_fired = true;
+    }
     // onRunLoadshare itself fires tryAutoBuildtx + tryAutoStep1
     // at the end via the explicit calls there, so don't double-fire.
 }

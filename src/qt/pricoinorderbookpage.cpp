@@ -2093,25 +2093,64 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
         // sent a reciprocal swap_addrs back. Idempotent — the wallet
         // call returns Ok on same-value re-set.
         if (!pair.view_pubkey.isEmpty() && !pair.spend_pubkey.isEmpty()) {
+            // Backfill strategy is two-pronged.
+            //
+            // 1. Initiator-side path: my local order has a
+            //    linked_swap_id (set inline by onStartSwapClicked).
+            //    Use it directly.
+            //
+            // 2. Receiver-side path: my local order does NOT have
+            //    linked_swap_id (the swap record was created by the
+            //    is_swap_start mirror handler, which doesn't call
+            //    offerLinkSwap). Fall back to scanning all adaptor
+            //    swaps for any whose counterparty_pubkey starts with
+            //    the sender's xonly. counterparty_pubkey is
+            //    33 bytes hex (02|03 prefix + xonly), and the DM
+            //    sender's xonly is the second half of it.
+            //
+            // adaptorSwapSetPeerStealthPubkeys is idempotent on
+            // same-value re-set, so a double-fire across both paths
+            // is harmless.
             const auto my_order = m_model->wallet().offerGet(my_oid);
             const bool has_link =
                 my_order && !my_order->linked_swap_id.empty();
             LogInfo("Pricoin swap_addrs recv: my_oid=%s has_order=%d "
-                    "linked_swap=%s\n",
+                    "linked_swap=%s from_xonly=%s\n",
                     my_oid.substr(0, 12),
                     (int)(my_order ? 1 : 0),
                     has_link ? my_order->linked_swap_id.substr(0, 16).c_str()
-                             : "(none)");
-            if (has_link) {
+                             : "(none)",
+                    from_xonly_hex.left(12).toStdString().c_str());
+            auto persist_for = [&](const std::string& sid,
+                                    const char* via) {
                 auto rs = m_model->wallet().adaptorSwapSetPeerStealthPubkeys(
-                    my_order->linked_swap_id,
+                    sid,
                     pair.view_pubkey.toStdString(),
                     pair.spend_pubkey.toStdString());
-                LogInfo("Pricoin swap_addrs recv: backfill SetPeerStealthPubkeys "
+                LogInfo("Pricoin swap_addrs recv: backfill via=%s "
                         "swap=%s ok=%d err=%s\n",
-                        my_order->linked_swap_id.substr(0, 16).c_str(),
+                        via,
+                        sid.substr(0, 16).c_str(),
                         (int)(rs.has_value()),
                         rs ? "" : util::ErrorString(rs).original.c_str());
+            };
+            if (has_link) {
+                persist_for(my_order->linked_swap_id, "linked_swap_id");
+            }
+            // Scan path: find any active swap whose counterparty's
+            // xonly matches the DM sender. Catches receiver-side
+            // records that lack linked_swap_id.
+            const std::string from_xonly =
+                from_xonly_hex.toStdString();
+            for (const auto& s :
+                 m_model->wallet().adaptorSwapList()) {
+                if (s.counterparty_pubkey_hex.size() < 66) continue;
+                // counterparty_pubkey_hex = "02"|"03" + xonly_hex.
+                if (s.counterparty_pubkey_hex.substr(2) != from_xonly) continue;
+                if (has_link && s.swap_id == my_order->linked_swap_id) {
+                    continue;  // already done via path 1
+                }
+                persist_for(s.swap_id, "scan_by_counterparty");
             }
         }
         if (!pair.joint_address.isEmpty()) {
