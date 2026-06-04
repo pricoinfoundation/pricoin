@@ -1981,6 +1981,16 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
                 .arg(QString::fromStdString(util::ErrorString(r).original)), true);
             return;
         }
+        // Link BOTH the local and imported peer orders to this swap.
+        // Symmetry with the initiator's `onStartSwapClicked` (which
+        // calls offerLinkSwap on its own order AND the imported peer
+        // order). Without this, the receiver's local order ends up
+        // with an empty `linked_swap_id`, so when the swap completes
+        // the chain watcher's `FillFromLinkedSwap` can't find this
+        // side's order to decrement — orders stay at full max even
+        // after the trade closes.
+        (void)m_model->wallet().offerLinkSwap(my_oid, r->swap_id);
+        (void)m_model->wallet().offerLinkSwap(sender_oid, r->swap_id);
         // Persist peer's stealth pubkeys on this side's mirror record
         // too. Symmetry with the clicker-side persistence in
         // onStartSwapClicked. Without this, the cosigner side's
