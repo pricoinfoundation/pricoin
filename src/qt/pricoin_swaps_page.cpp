@@ -389,8 +389,15 @@ void PricoinSwapsPage::refreshTable()
         if (s.state == "both_funded" && s.role == "bob") {
             // Bob auto-adapts + broadcasts the PRIC claim using the
             // pre-signed claim adaptor sig. Bypasses onAdvanceClicked.
-            QMetaObject::invokeMethod(this, [this, sid = s.swap_id]() {
-                autoAdaptPricClaim(sid);
+            // Retry-on-failure: if autoAdaptPricClaim returns false
+            // (transient broadcast / RPC / chain-watcher condition),
+            // erase the fire_key so the next refresh tick can retry.
+            // Without this, a single failure permanently strands the
+            // swap at BothFunded with no auto-recovery.
+            QMetaObject::invokeMethod(this, [this, sid = s.swap_id, fire_key]() {
+                if (!autoAdaptPricClaim(sid)) {
+                    m_auto_advance_fired.erase(fire_key);
+                }
             }, Qt::QueuedConnection);
             m_auto_advance_fired.insert(fire_key);
             continue;
@@ -445,8 +452,12 @@ void PricoinSwapsPage::refreshTable()
             // and now needs to spend the LTC HTLC. Headless if
             // -pricoinltcclaimaddr is configured; otherwise leaves
             // the manual button as the fallback.
-            QMetaObject::invokeMethod(this, [this, sid = s.swap_id]() {
-                autoLtcClaim(sid);
+            // Retry-on-failure (same pattern as both_funded → bob:
+            // erase fire_key on false return so next refresh retries).
+            QMetaObject::invokeMethod(this, [this, sid = s.swap_id, fire_key]() {
+                if (!autoLtcClaim(sid)) {
+                    m_auto_advance_fired.erase(fire_key);
+                }
             }, Qt::QueuedConnection);
             m_auto_advance_fired.insert(fire_key);
             continue;
