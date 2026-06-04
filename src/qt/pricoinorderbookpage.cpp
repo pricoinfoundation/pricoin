@@ -1129,6 +1129,7 @@ void PricoinOrderbookPage::onStartSwapClicked()
             // `swap_addrs` DM landing first; if that DM was lost the
             // cosigner side stalled at AdaptorReady with no way to
             // recover except a manual RPC backfill.
+            bool happy_pubkeys_attached = false;
             {
                 const auto my_pubkeys = GetMyStealthPubkeys(m_model);
                 if (!my_pubkeys.view_hex.isEmpty()
@@ -1137,14 +1138,16 @@ void PricoinOrderbookPage::onStartSwapClicked()
                                    my_pubkeys.view_hex);
                     swap_dm.insert(QStringLiteral("spend_pubkey"),
                                    my_pubkeys.spend_hex);
+                    happy_pubkeys_attached = true;
                 }
             }
             const QString plaintext = QString::fromUtf8(
                 QJsonDocument(swap_dm).toJson(QJsonDocument::Compact));
-            LogInfo("Pricoin start_swap (happy) emit: swap_id=%s peer=%s plaintext_bytes=%d\n",
+            LogInfo("Pricoin start_swap (happy) emit: swap_id=%s peer=%s plaintext_bytes=%d pubkeys_in_dm=%d\n",
                     created_swap_id.substr(0, 16),
                     peer_xonly.left(12).toStdString(),
-                    (int)plaintext.size());
+                    (int)plaintext.size(),
+                    (int)happy_pubkeys_attached);
             m_nostr->publishDirectMessage(peer_xonly, plaintext);
         }
 
@@ -1447,6 +1450,7 @@ void PricoinOrderbookPage::onStartSwapClicked()
         // Sender's PRIC stealth view+spend pubkeys (see happy-path
         // emit above for rationale: removes the dependence on a prior
         // swap_addrs DM having landed on the receiver).
+        bool legacy_pubkeys_attached = false;
         {
             const auto my_pubkeys = GetMyStealthPubkeys(m_model);
             if (!my_pubkeys.view_hex.isEmpty()
@@ -1455,6 +1459,7 @@ void PricoinOrderbookPage::onStartSwapClicked()
                                my_pubkeys.view_hex);
                 swap_dm.insert(QStringLiteral("spend_pubkey"),
                                my_pubkeys.spend_hex);
+                legacy_pubkeys_attached = true;
             }
         }
 
@@ -1465,10 +1470,11 @@ void PricoinOrderbookPage::onStartSwapClicked()
         // Definitive trace: confirms this build is the one with the
         // swap_id-share fix. If you don't see this line in debug.log
         // when clicking Start swap, the binary is older than this code.
-        LogInfo("Pricoin start_swap emit: swap_id=%s peer=%s plaintext_bytes=%d\n",
+        LogInfo("Pricoin start_swap emit: swap_id=%s peer=%s plaintext_bytes=%d pubkeys_in_dm=%d\n",
                 created_swap_id.substr(0, 16),
                 peer_xonly.left(12).toStdString(),
-                (int)plaintext.size());
+                (int)plaintext.size(),
+                (int)legacy_pubkeys_attached);
         m_nostr->publishDirectMessage(peer_xonly, plaintext);
         m_next_dm_label.clear();
     }
@@ -2007,12 +2013,41 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
                     spend_hex_to_persist = it_addrs->spend_pubkey;
                 }
             }
+            LogInfo("Pricoin start_swap recv: swap_id=%s "
+                    "dm_view_len=%d dm_spend_len=%d map_view_len=%d "
+                    "map_spend_len=%d persist_view_len=%d persist_spend_len=%d\n",
+                    r->swap_id.substr(0, 16),
+                    (int)dm_view.size(), (int)dm_spend.size(),
+                    [&]{
+                        auto it = m_peer_swap_addrs.find(
+                            QString::fromStdString(my_oid));
+                        return it == m_peer_swap_addrs.end() ? 0
+                            : (int)it->view_pubkey.size();
+                    }(),
+                    [&]{
+                        auto it = m_peer_swap_addrs.find(
+                            QString::fromStdString(my_oid));
+                        return it == m_peer_swap_addrs.end() ? 0
+                            : (int)it->spend_pubkey.size();
+                    }(),
+                    (int)view_hex_to_persist.size(),
+                    (int)spend_hex_to_persist.size());
             if (!view_hex_to_persist.isEmpty()
                 && !spend_hex_to_persist.isEmpty()) {
-                (void)m_model->wallet().adaptorSwapSetPeerStealthPubkeys(
+                auto rs = m_model->wallet().adaptorSwapSetPeerStealthPubkeys(
                     r->swap_id,
                     view_hex_to_persist.toStdString(),
                     spend_hex_to_persist.toStdString());
+                if (!rs) {
+                    LogInfo("Pricoin start_swap recv: SetPeerStealthPubkeys "
+                            "failed: %s\n",
+                            util::ErrorString(rs).original);
+                } else {
+                    LogInfo("Pricoin start_swap recv: SetPeerStealthPubkeys ok\n");
+                }
+            } else {
+                LogInfo("Pricoin start_swap recv: no pubkeys available — "
+                        "loadshare will fail until backfill\n");
             }
         }
         // Reciprocal swap_addrs back to the initiator. The initiator's
@@ -2059,11 +2094,24 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
         // call returns Ok on same-value re-set.
         if (!pair.view_pubkey.isEmpty() && !pair.spend_pubkey.isEmpty()) {
             const auto my_order = m_model->wallet().offerGet(my_oid);
-            if (my_order && !my_order->linked_swap_id.empty()) {
-                (void)m_model->wallet().adaptorSwapSetPeerStealthPubkeys(
+            const bool has_link =
+                my_order && !my_order->linked_swap_id.empty();
+            LogInfo("Pricoin swap_addrs recv: my_oid=%s has_order=%d "
+                    "linked_swap=%s\n",
+                    my_oid.substr(0, 12),
+                    (int)(my_order ? 1 : 0),
+                    has_link ? my_order->linked_swap_id.substr(0, 16).c_str()
+                             : "(none)");
+            if (has_link) {
+                auto rs = m_model->wallet().adaptorSwapSetPeerStealthPubkeys(
                     my_order->linked_swap_id,
                     pair.view_pubkey.toStdString(),
                     pair.spend_pubkey.toStdString());
+                LogInfo("Pricoin swap_addrs recv: backfill SetPeerStealthPubkeys "
+                        "swap=%s ok=%d err=%s\n",
+                        my_order->linked_swap_id.substr(0, 16).c_str(),
+                        (int)(rs.has_value()),
+                        rs ? "" : util::ErrorString(rs).original.c_str());
             }
         }
         if (!pair.joint_address.isEmpty()) {
