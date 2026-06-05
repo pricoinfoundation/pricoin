@@ -995,6 +995,7 @@ RPCMethod pricoin_swapwatch_broadcast_pric_export();
 RPCMethod pricoin_swapwatch_adapt_btc_claim_export();
 RPCMethod pricoin_swapwatch_extract_pric_t_export();
 RPCMethod pricoin_swapwatch_adapt_pric_claim_export();
+RPCMethod pricoin_swapwatch_verify_pric_claim_export();
 RPCMethod pricoin_btc_getaddress_export();
 RPCMethod pricoin_btc_getbalance_export();
 RPCMethod pricoin_btc_fund_swap_export();
@@ -1105,6 +1106,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &pricoin_swapwatch_adapt_btc_claim_export},
         {"wallet", &pricoin_swapwatch_extract_pric_t_export},
         {"wallet", &pricoin_swapwatch_adapt_pric_claim_export},
+        {"wallet", &pricoin_swapwatch_verify_pric_claim_export},
         {"wallet", &pricoin_btc_getaddress_export},
         {"wallet", &pricoin_btc_getbalance_export},
         {"wallet", &pricoin_btc_fund_swap_export},

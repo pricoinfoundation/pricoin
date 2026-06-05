@@ -2607,6 +2607,36 @@ void PricCoopSignDialog::onStep1Compute()
 {
     const bool adaptor = (m_mode == Mode::PricAdaptor);
 
+    // ── Round-1 nonce idempotency guard (2026-06-05) ─────────────────
+    // The round-1 nonce α MUST be generated exactly once per ceremony.
+    // onStep1Compute is reachable from the manual Step-1 button, sticky
+    // auto-resend, buildtx-DM redelivery, and relay-reconnect triggers.
+    // Calling round1_ml again mints a FRESH α and overwrites m_alpha /
+    // m_my_*_share — but the corrected round-1 share is NOT re-sent
+    // (that send is separately guarded by m_auto_step1_dm_sent). This
+    // node then holds a different α than the share the peer received, so
+    // the two sides' combine_ml / close-shares bind to inconsistent
+    // (α, c_pi). The assembled pre-signature sums two mismatched
+    // close-shares and can NEVER close VerifyMultiLayer — yet AdaptML
+    // only checks t·G==T_G, so the defect stays invisible until
+    // claim-time adapt, AFTER both legs are funded (silent fund-lock;
+    // root cause of the both_funded stuck swaps, 2026-06-05).
+    //
+    // A legitimate restart (spender re-ran buildtx → new sighash) clears
+    // m_alpha via the cross-session reset path (see onDmReceived) BEFORE
+    // reaching here and also resets m_auto_step1_dm_sent so the new share
+    // IS re-sent — that case regenerates cleanly. Here we refuse only to
+    // silently re-mint an α we already hold.
+    if (!m_alpha.isEmpty() && !m_my_commitment.isEmpty()) {
+        setStatus(tr("Step 1 already done — reusing existing nonce/share "
+                     "(regenerating would desync the peer)."));
+        // This re-entry may have been a resend trigger; make sure the
+        // unchanged share is still scheduled to reach the peer. The
+        // m_auto_step1_dm_sent guard prevents a double-send.
+        tryAutoSendRound1();
+        return;
+    }
+
     m_x_share          = m_in_x_share->text().trimmed();
     // z_share is needed for both plain and adaptor_ml.
     if (m_in_z_share) m_z_share = m_in_z_share->text().trimmed();

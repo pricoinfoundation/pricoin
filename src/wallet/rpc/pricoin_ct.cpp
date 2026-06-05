@@ -8155,6 +8155,110 @@ RPCMethod pricoin_swapwatch_adapt_pric_claim()
     };
 }
 
+RPCMethod pricoin_swapwatch_verify_pric_claim()
+{
+    return RPCMethod{
+        "pricoin_swapwatch_verify_pric_claim",
+        "Pre-funding safety gate (Bob): verify the stored PRIC-claim adaptor\n"
+        "pre-signature actually adapts — with the wallet's t_secret, over the\n"
+        "canonical {P,W} ring + msg on the swap record — into a signature that\n"
+        "passes consensus VerifyMultiLayer. Does NOT broadcast or mutate any\n"
+        "state. Returns {valid:false, reason} instead of throwing on a bad\n"
+        "pre-sig so callers can branch.\n"
+        "\n"
+        "Why this exists: a cooperative pre-sign ceremony that desynced the two\n"
+        "parties' round-1 nonces produces a pre-sig that assembles cleanly but\n"
+        "can NEVER close VerifyMultiLayer. AdaptML only checks t·G==T_G, so the\n"
+        "defect stays invisible until claim time — AFTER both legs are funded\n"
+        "(silent fund-lock). Bob calls this before funding the foreign chain\n"
+        "and refuses to fund when valid=false.\n",
+        {
+            {"swap_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::BOOL, "valid",  "True iff the pre-sig adapts to a VerifyMultiLayer-valid sig"},
+                {RPCResult::Type::STR,  "reason", "Human-readable explanation when valid=false"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_swapwatch_verify_pric_claim", "<swap_id>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            const uint256 sid = ParseChainWatchSwapId(request.params[0]);
+
+            auto invalid = [](const std::string& why) {
+                UniValue o{UniValue::VOBJ};
+                o.pushKV("valid", false);
+                o.pushKV("reason", why);
+                return o;
+            };
+
+            ::wallet::pricoin_adaptor_swap::AdaptorSwap snap;
+            if (::wallet::pricoin_adaptor_swap::Get(wallet, sid, snap)
+                != ::wallet::pricoin_adaptor_swap::LookupResult::Ok) {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "swap not found");
+            }
+            if (snap.role != ::wallet::pricoin_adaptor_swap::Role::Bob) {
+                // Only the t-holder can verify by adapting. Not a hard
+                // error — Alice's side simply can't run this gate.
+                return invalid("not Bob (no t_secret to adapt with)");
+            }
+            if (!snap.has_t)                                 return invalid("no t_secret on record");
+            if (snap.presigs.pric_claim_presig_blob.empty()) return invalid("no pric_claim_presig_blob (set_pre_signed not run?)");
+            if (snap.pric_claim_ring.empty())                return invalid("canonical pric_claim_ring not populated");
+            if (snap.pric_claim_ring_w.size() != snap.pric_claim_ring.size())
+                return invalid("pric_claim_ring_w missing/length-mismatched — need {P,W} for VerifyMultiLayer");
+            if (snap.pric_claim_msg_hex.size() != 64)        return invalid("canonical pric_claim_msg_hex is not 32-byte hex");
+
+            // Build the multi-layer ring from the canonical record fields —
+            // the SAME ones autoAdaptPricClaim feeds the adapt RPC.
+            std::vector<::pricoin::ringsig::MultiLayerMember> ring_ml;
+            ring_ml.reserve(snap.pric_claim_ring.size());
+            for (size_t i = 0; i < snap.pric_claim_ring.size(); ++i) {
+                ::pricoin::ringsig::MultiLayerMember m;
+                std::copy(snap.pric_claim_ring[i].begin(),   snap.pric_claim_ring[i].end(),   m.P.begin());
+                std::copy(snap.pric_claim_ring_w[i].begin(), snap.pric_claim_ring_w[i].end(), m.W.begin());
+                ring_ml.push_back(m);
+            }
+
+            // msg: raw-bytes copy (NOT uint256::FromHex, which reverses) —
+            // same convention as the adapt RPC and the ceremony combine.
+            auto msg_bytes = TryParseHex<unsigned char>(snap.pric_claim_msg_hex);
+            if (!msg_bytes || msg_bytes->size() != 32) return invalid("pric_claim_msg_hex failed to parse as 32 bytes");
+            uint256 msg;
+            std::copy(msg_bytes->begin(), msg_bytes->end(), msg.begin());
+
+            DataStream presig_ds{std::span<const unsigned char>{snap.presigs.pric_claim_presig_blob}};
+            ::pricoin::adaptor_ringsig::AdaptorPreSignature presig;
+            try { presig_ds >> presig; }
+            catch (const std::exception&) { return invalid("pric_claim_presig_blob did not parse as AdaptorPreSignature"); }
+
+            ::pricoin::ringsig::Scalar t_scalar;
+            std::copy(snap.t_secret.begin(), snap.t_secret.end(), t_scalar.begin());
+
+            // Dry-run adapt. AdaptML internally runs VerifyMultiLayer and
+            // returns nullopt on any failure (wrong t, degenerate s_pi, or
+            // ring/msg/nonce desync). No broadcast, no state mutation.
+            auto sig = ::pricoin::adaptor_ringsig::AdaptML(
+                presig, t_scalar,
+                std::span<const ::pricoin::ringsig::MultiLayerMember>{ring_ml},
+                msg);
+            if (!sig) {
+                return invalid("AdaptML failed — pre-sig does not adapt to a "
+                               "VerifyMultiLayer-valid signature (round-1 nonce/"
+                               "challenge desync, or wrong t). DO NOT FUND.");
+            }
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("valid", true);
+            out.pushKV("reason", "");
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_swapwatch_extract_pric_t()
 {
     return RPCMethod{
@@ -8759,6 +8863,7 @@ RPCMethod pricoin_swapwatch_broadcast_pric_export()     { return pricoin_swapwat
 RPCMethod pricoin_swapwatch_adapt_btc_claim_export()    { return pricoin_swapwatch_adapt_btc_claim(); }
 RPCMethod pricoin_swapwatch_extract_pric_t_export()     { return pricoin_swapwatch_extract_pric_t(); }
 RPCMethod pricoin_swapwatch_adapt_pric_claim_export()   { return pricoin_swapwatch_adapt_pric_claim(); }
+RPCMethod pricoin_swapwatch_verify_pric_claim_export()  { return pricoin_swapwatch_verify_pric_claim(); }
 RPCMethod pricoin_btc_getaddress_export()               { return pricoin_btc_getaddress(); }
 RPCMethod pricoin_btc_getbalance_export()               { return pricoin_btc_getbalance(); }
 RPCMethod pricoin_btc_fund_swap_export()                { return pricoin_btc_fund_swap(); }

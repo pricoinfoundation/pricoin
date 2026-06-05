@@ -1106,6 +1106,56 @@ void PricoinSwapsPage::onAdvanceClicked()
             return;
         }
         if (snap.role == "bob") {
+            // ── Pre-funding safety gate (2026-06-05) ─────────────────
+            // Bob's foreign-chain funding is the FIRST locked-value step
+            // (Alice funds PRIC only after Bob's foreign_funding lands).
+            // So this is the last point at which a defective PRIC-claim
+            // pre-signature can be caught with nothing yet at risk.
+            //
+            // A cooperative pre-sign ceremony that desynced the two
+            // parties' round-1 nonces produces a pre-sig that assembles
+            // cleanly but can NEVER close VerifyMultiLayer — it would
+            // only fail at claim time, AFTER both legs are funded
+            // (silent fund-lock; root cause of the both_funded stuck
+            // swaps). Bob holds t, so he can prove the pre-sig adapts
+            // before committing funds. Refuse to fund if it doesn't;
+            // the swap stays at PreSigned so the ceremony can be re-run.
+            {
+                UniValue pv{UniValue::VARR};
+                pv.push_back(sid);
+                UniValue vr;
+                try {
+                    vr = m_model->node().executeRpc(
+                        "pricoin_swapwatch_verify_pric_claim", pv,
+                        "/wallet/" + m_model->getWalletName().toStdString());
+                } catch (const UniValue& e) {
+                    setStatus(tr("Pre-funding pre-sig check errored: %1 — NOT funding.")
+                        .arg(e.isObject() && e.exists("message")
+                            ? QString::fromStdString(e["message"].get_str())
+                            : QString::fromStdString(e.write())), true);
+                    return;
+                } catch (const std::exception& e) {
+                    setStatus(tr("Pre-funding pre-sig check errored: %1 — NOT funding.")
+                        .arg(e.what()), true);
+                    return;
+                }
+                const bool presig_ok = vr.exists("valid")
+                    && vr["valid"].isBool() && vr["valid"].get_bool();
+                if (!presig_ok) {
+                    const std::string reason = vr.exists("reason") && vr["reason"].isStr()
+                        ? vr["reason"].get_str() : std::string{"unknown"};
+                    setStatus(tr("ABORT funding — PRIC-claim pre-signature is invalid "
+                                  "(%1). The cooperative pre-sign ceremony must be "
+                                  "re-run before any funds are locked. Swap stays at "
+                                  "PreSigned.")
+                        .arg(QString::fromStdString(reason)), true);
+                    LogWarning("Pricoin swap %s: pre-funding gate BLOCKED foreign "
+                               "funding — PRIC-claim presig invalid: %s",
+                               sid, reason);
+                    refreshTable();
+                    return;
+                }
+            }
             // Estimate the funding-tx fee from the chain backend's
             // sat/vB targets instead of the old 1000-sat hardcode.
             // Funding tx is 1-input (key-path P2TR) + 2-output P2TR
