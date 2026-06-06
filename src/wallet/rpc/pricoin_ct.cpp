@@ -8310,6 +8310,16 @@ RPCMethod pricoin_swap_recover_refund_singlesig()
             if (!snap.pric_refund_txid.IsNull()) {
                 throw JSONRPCError(RPC_INVALID_REQUEST, "swap already has a pric_refund_txid");
             }
+            // Only refund from a funded, non-terminal state — same set
+            // SetRefunded accepts. Prevents broadcasting a double-spend of
+            // an already-claimed (Complete) or never-funded joint output.
+            if (snap.state != ::wallet::pricoin_adaptor_swap::State::BtcFunded
+                && snap.state != ::wallet::pricoin_adaptor_swap::State::BothFunded
+                && snap.state != ::wallet::pricoin_adaptor_swap::State::PricClaimed) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "swap is not in a refundable funded state "
+                    "(need BtcFunded / BothFunded / PricClaimed)");
+            }
             if (snap.pric_refund_unsigned_tx_hex.empty()) {
                 throw JSONRPCError(RPC_INVALID_REQUEST,
                     "no unsigned PRIC refund tx on record (buildtx never ran on this wallet)");
@@ -8439,6 +8449,17 @@ RPCMethod pricoin_swap_recover_refund_singlesig()
                 throw JSONRPCError(RPC_WALLET_ERROR, "broadcast failed: " + err_str);
             }
             const std::string txid_hex = tx_ref->GetHash().ToString();
+
+            // Advance state synchronously. AutoBroadcast*Refund rely on the
+            // watch entry + an in-memory dedup set to avoid re-broadcast,
+            // but this recovery RPC has no such dedup — without SetRefunded
+            // here, TryAutoRefundPric would keep re-broadcasting the stored
+            // (invalid) cooperative sig every tick until the recovery tx
+            // confirms. Mark refunded now so pric_refund_txid is set.
+            if (auto refund_txid_u = uint256::FromHex(txid_hex)) {
+                (void)::wallet::pricoin_adaptor_swap::SetRefunded(
+                    wallet, sid, *refund_txid_u, /*foreign_refund_txid=*/{});
+            }
 
             pcw::WatchEntry we;
             we.swap_id = sid;

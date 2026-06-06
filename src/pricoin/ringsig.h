@@ -111,6 +111,20 @@ bool VerifyMultiLayer(
     const Signature& sig,
     const uint256& msg);
 
+// Multi-layer ADAPTOR pre-signature verifier (no adaptor secret t needed).
+// Like VerifyMultiLayer but at index `pi` it adds the adaptor anchors
+// T_G (to L) and T_H (to R) — so it verifies that the pre-signature's
+// ring closes BEFORE adapting. This is the t-free check both swap parties
+// can run at ceremony time to catch a cooperative round-1 desync, instead
+// of discovering it only at claim time after funds are locked.
+bool VerifyMultiLayerPreSig(
+    std::span<const MultiLayerMember> ring,
+    const Signature& sig,        // pre-adaptor: c0, s[], key_image, commitment_image
+    const uint256& msg,
+    size_t pi,
+    const Point& T_G,
+    const Point& T_H);
+
 // out = (a + b) mod n. Both inputs and the result must be valid
 // (non-zero, in range) secp256k1 scalars; returns nullopt otherwise.
 // Used to reconstruct a joint spend/commitment secret from its two

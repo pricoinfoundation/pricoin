@@ -1661,6 +1661,55 @@ RPCMethod pricoin_jointspend_adaptor_verify_presig()
     };
 }
 
+RPCMethod pricoin_jointspend_adaptor_verify_presig_ml()
+{
+    return RPCMethod{
+        "pricoin_jointspend_adaptor_verify_presig_ml",
+        "Off-chain verify of a MULTI-LAYER adaptor pre-signature, WITHOUT the\n"
+        "adaptor secret t. Checks the {P,W} ring closes with the adaptor\n"
+        "anchors (T_G/T_H) added at pi — the t-free analogue of VerifyMultiLayer.\n"
+        "Use to validate an `_ml` pre-sig (assemble_ml output) at ceremony time\n"
+        "so a cooperative round-1 nonce desync is caught BEFORE funding, instead\n"
+        "of only at claim time (after both legs are locked).\n",
+        {
+            {"ring_ml", RPCArg::Type::ARR, RPCArg::Optional::NO,
+                "Array of {P, W} objects (multi-layer ring).",
+                {{"member", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
+                  {{"P", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+                   {"W", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""}}}}},
+            {"presig", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Serialized AdaptorPreSignature"},
+            {"msg",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte msg"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::BOOL, "valid", "True iff the pre-sig ring closes (pre-adapt)"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_jointspend_adaptor_verify_presig_ml", "<args>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            using namespace js_helpers;
+            using namespace adaptor_helpers;
+            auto ring = ParseMLRing(request.params[0]);
+            auto presig = ParseBlob<par::AdaptorPreSignature>(request.params[1].get_str());
+            if (!presig) throw JSONRPCError(RPC_INVALID_PARAMETER,
+                "presig must be valid serialized AdaptorPreSignature hex");
+            const auto msg_scalar = ParseScalar32(request.params[2].get_str(), "msg");
+            uint256 msg;
+            std::copy(msg_scalar.begin(), msg_scalar.end(), msg.begin());
+
+            ::pricoin::ringsig::Signature sig;
+            sig.key_image        = presig->key_image;
+            sig.commitment_image = presig->commitment_image;
+            sig.c0               = presig->c0;
+            sig.s                = presig->s;
+            const bool ok = ::pricoin::ringsig::VerifyMultiLayerPreSig(
+                std::span<const ::pricoin::ringsig::MultiLayerMember>{ring}, sig, msg,
+                presig->pi, presig->adaptor.T_G, presig->adaptor.T_H);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("valid", ok);
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_jointspend_adaptor_adapt()
 {
     return RPCMethod{
@@ -1783,6 +1832,7 @@ void RegisterPricoinCTRPCCommands(CRPCTable& t)
         {"pricoin", &pricoin_jointspend_adaptor_combine_ml},
         {"pricoin", &pricoin_jointspend_adaptor_assemble_ml},
         {"pricoin", &pricoin_jointspend_adaptor_verify_presig},
+        {"pricoin", &pricoin_jointspend_adaptor_verify_presig_ml},
         {"pricoin", &pricoin_jointspend_adaptor_adapt},
         {"pricoin", &pricoin_jointspend_adaptor_extract},
     };

@@ -648,6 +648,95 @@ std::optional<Scalar> AddScalars(const Scalar& a, const Scalar& b)
     return out;
 }
 
+bool VerifyMultiLayerPreSig(
+    std::span<const MultiLayerMember> ring,
+    const Signature& sig,
+    const uint256& msg,
+    size_t pi,
+    const Point& T_G,
+    const Point& T_H)
+{
+    if (ring.empty()) {
+        LogWarning("Pricoin VerifyMultiLayerPreSig: empty ring");
+        return false;
+    }
+    if (sig.s.size() != ring.size()) {
+        LogWarning("Pricoin VerifyMultiLayerPreSig: sig.s.size=%u != ring.size=%u",
+                   (unsigned)sig.s.size(), (unsigned)ring.size());
+        return false;
+    }
+    if (pi >= ring.size()) {
+        LogWarning("Pricoin VerifyMultiLayerPreSig: pi %u out of range", (unsigned)pi);
+        return false;
+    }
+    if (HasDuplicateMembers(ring)) {
+        LogWarning("Pricoin VerifyMultiLayerPreSig: ring has duplicate members");
+        return false;
+    }
+    LOCK(g_mutex);
+
+    {
+        secp256k1_pubkey tmp;
+        if (!ParsePoint(sig.key_image, tmp)) return false;
+        if (!ParsePoint(sig.commitment_image, tmp)) return false;
+        if (!ParsePoint(T_G, tmp)) return false;
+        if (!ParsePoint(T_H, tmp)) return false;
+    }
+
+    // Same μ / aggregated-ring / image construction as VerifyMultiLayer.
+    const auto [mu_P, mu_C] = MultiLayerMu(ring, sig.key_image, sig.commitment_image);
+    std::vector<Point> T(ring.size());
+    for (size_t i = 0; i < ring.size(); ++i) {
+        if (!AggregateMember(ring[i], mu_P, mu_C, T[i])) return false;
+    }
+    Point I_agg;
+    {
+        MultiLayerMember imgs{sig.key_image, sig.commitment_image};
+        if (!AggregateMember(imgs, mu_P, mu_C, I_agg)) return false;
+    }
+
+    auto add_point = [&](const Point& a, const Point& b, Point& out) -> bool {
+        secp256k1_pubkey pa, pb;
+        if (!ParsePoint(a, pa) || !ParsePoint(b, pb)) return false;
+        const secp256k1_pubkey* parts[2] = {&pa, &pb};
+        secp256k1_pubkey sum;
+        if (!secp256k1_ec_pubkey_combine(Ctx(), &sum, parts, 2)) return false;
+        return SerializePoint(sum, out);
+    };
+
+    // Walk the ring. The pre-signature's s_pi is the PRE-adaptor value,
+    // so at i==pi we add the adaptor anchors (T_G to L, T_H to R) — the
+    // same shift the cooperative combine baked into the published
+    // challenge (L' = L_pi + T_G, R' = R_pi + T_H). The walk closes iff
+    // the pre-sig was built consistently across both parties; a round-1
+    // nonce/challenge desync makes it diverge — exactly the failure that
+    // VerifyMultiLayer would catch only AFTER adapting with t.
+    const size_t N = ring.size();
+    Scalar c = sig.c0;
+    for (size_t i = 0; i < N; ++i) {
+        Point L_i;
+        {
+            secp256k1_pubkey T_pub;
+            if (!ParsePoint(T[i], T_pub)) return false;
+            if (!LinComb_sG_plus_cP(sig.s[i], c, T_pub, L_i)) return false;
+        }
+        Point Hp_P_i = HashToPointInternal(std::span<const unsigned char>{ring[i].P.data(), ring[i].P.size()});
+        Point R_i;
+        if (!LinComb_sQ_plus_cR(sig.s[i], Hp_P_i, c, I_agg, R_i)) return false;
+
+        if (i == pi) {
+            Point Ls, Rs;
+            if (!add_point(L_i, T_G, Ls)) return false;
+            if (!add_point(R_i, T_H, Rs)) return false;
+            L_i = Ls;
+            R_i = Rs;
+        }
+
+        c = StepChallengeML(ring, msg, L_i, R_i, sig.key_image, sig.commitment_image);
+    }
+    return c == sig.c0;
+}
+
 void RunSelfTest()
 {
     // Build a ring of 4 random keypairs; sign with index 2.

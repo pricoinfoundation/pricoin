@@ -1372,6 +1372,32 @@ void RunSelfTestML()
         msg, *adaptor, *dleq_t, label_span, payload_span);
     if (!presig) throw std::runtime_error("adaptor-coop-ml: cooperative pre-sig failed");
 
+    // Self-check the t-free multi-layer pre-sig verifier: it must ACCEPT
+    // a well-formed cooperative pre-sig and REJECT a tampered one. This is
+    // the check both swap parties run at ceremony time (Step 4) to catch a
+    // round-1 nonce desync before any funds are locked.
+    {
+        ::pricoin::ringsig::Signature presig_sig;
+        presig_sig.key_image        = presig->key_image;
+        presig_sig.commitment_image = presig->commitment_image;
+        presig_sig.c0               = presig->c0;
+        presig_sig.s                = presig->s;
+        if (!::pricoin::ringsig::VerifyMultiLayerPreSig(
+                std::span<const MultiLayerMember>{ring}, presig_sig, msg, pi,
+                adaptor->T_G, adaptor->T_H)) {
+            throw std::runtime_error(
+                "adaptor-coop-ml self-test: VerifyMultiLayerPreSig rejected a valid pre-sig");
+        }
+        ::pricoin::ringsig::Signature bad = presig_sig;
+        bad.s[pi][0] ^= 0x01;
+        if (::pricoin::ringsig::VerifyMultiLayerPreSig(
+                std::span<const MultiLayerMember>{ring}, bad, msg, pi,
+                adaptor->T_G, adaptor->T_H)) {
+            throw std::runtime_error(
+                "adaptor-coop-ml self-test: VerifyMultiLayerPreSig accepted a tampered pre-sig");
+        }
+    }
+
     // Adapt: s_pi = ŝ_pi + t. Result must verify under the standard
     // multi-layer verifier — that's the correctness criterion.
     Scalar adapted_s = presig->s[pi];

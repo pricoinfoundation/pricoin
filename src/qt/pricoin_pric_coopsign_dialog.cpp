@@ -3150,6 +3150,60 @@ void PricCoopSignDialog::onStep4Compute()
         m_out_step4->setPlainText(QString::fromStdString(out.write(2)));
         setStatus(tr("Step 4 OK. Final CLSAG signature blob produced."));
     }
+
+    // ── Verify-before-commit (2026-06-06) ────────────────────────────
+    // A cooperative round-1 nonce/challenge desync produces a
+    // (pre-)signature that assembles cleanly here but can NEVER close
+    // the ring — and AdaptML only checks t·G==T_G, so the defect would
+    // stay invisible until claim time, AFTER both legs are funded
+    // (silent fund-lock; the 2026-06-05 incident). Both parties run a
+    // closure check NOW and refuse to accept a (pre-)sig that fails:
+    //   * refund leg (plain ML): full VerifyMultiLayer.
+    //   * claim leg (adaptor ML): the t-free VerifyMultiLayerPreSig.
+    // Failing here turns a post-funding fund-lock into a re-runnable
+    // pre-funding ceremony error.
+    if (!m_final_blob_hex.isEmpty()) {
+        const QString ring_src = adaptor ? m_ring_json : m_ring_ml_json;
+        UniValue ring_v;
+        bool verify_ok = false;
+        std::string verify_err;
+        if (!ring_v.read(ring_src.toStdString()) || !ring_v.isArray()) {
+            verify_err = "ring JSON unavailable for verify";
+        } else {
+            UniValue p{UniValue::VARR};
+            std::string method;
+            if (adaptor) {
+                method = "pricoin_jointspend_adaptor_verify_presig_ml";
+                p.push_back(ring_v);                          // ring_ml
+                p.push_back(m_final_blob_hex.toStdString());  // presig
+                p.push_back(m_msg_hex.toStdString());         // msg
+            } else {
+                method = "pricoin_jointspend_verify";
+                p.push_back(UniValue{UniValue::VARR});        // ring (single-layer, unused)
+                p.push_back(ring_v);                          // ring_ml
+                p.push_back(m_msg_hex.toStdString());         // msg
+                p.push_back(m_final_blob_hex.toStdString());  // signature_hex
+            }
+            auto r = callRpc(method, p.write(0));
+            if (!r.ok) {
+                verify_err = r.error_msg;
+            } else {
+                UniValue v;
+                v.read(r.json);
+                verify_ok = v.exists("valid") && v["valid"].isBool() && v["valid"].get_bool();
+                if (!verify_ok) verify_err = "ring does not close (round-1 nonce/challenge desync)";
+            }
+        }
+        if (!verify_ok) {
+            m_final_blob_hex.clear();
+            setStatus(tr("Step 4 ABORT — assembled %1 failed verify (%2). NOT "
+                         "accepting; the cooperative ceremony must be re-run.")
+                .arg(adaptor ? tr("claim pre-signature") : tr("refund signature"))
+                .arg(QString::fromStdString(verify_err)), true);
+            return;
+        }
+    }
+
     if (m_btn_broadcast) {
         m_btn_broadcast->setEnabled(
             !m_final_blob_hex.isEmpty() && !m_unsigned_tx_hex.isEmpty());
