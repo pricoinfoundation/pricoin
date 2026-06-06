@@ -16,16 +16,23 @@
 #include <qt/transactiontablemodel.h>
 #include <qt/walletmodel.h>
 
+#include <interfaces/node.h>
 #include <interfaces/wallet.h>
+#include <univalue.h>
 
 #include <QAbstractItemDelegate>
+#include <QAbstractItemView>
 #include <QApplication>
 #include <QDateTime>
 #include <QFormLayout>
 #include <QFrame>
+#include <QHeaderView>
 #include <QLabel>
 #include <QPainter>
 #include <QStatusTipEvent>
+#include <QTableWidget>
+#include <QTableWidgetItem>
+#include <QUrl>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -182,6 +189,23 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
         note->setStyleSheet("QLabel { color: #666; font-size: 11px; }");
         form->addRow(note);
 
+        // Persistent confidential-transaction history table. Unlike the
+        // balance (a snapshot quantity), this lists individual received +
+        // sent CT movements and SURVIVES spending, via the
+        // `pricoin_listcttransactions` RPC.
+        auto* tx_title = new QLabel(tr("Confidential transactions:"), ct_frame);
+        form->addRow(tx_title);
+        m_pricoin_ct_tx_table = new QTableWidget(0, 5, ct_frame);
+        m_pricoin_ct_tx_table->setHorizontalHeaderLabels(
+            {tr("Type"), tr("Amount"), tr("Height"), tr("Status"), tr("TxID")});
+        m_pricoin_ct_tx_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        m_pricoin_ct_tx_table->setSelectionBehavior(QAbstractItemView::SelectRows);
+        m_pricoin_ct_tx_table->setSelectionMode(QAbstractItemView::SingleSelection);
+        m_pricoin_ct_tx_table->verticalHeader()->setVisible(false);
+        m_pricoin_ct_tx_table->horizontalHeader()->setStretchLastSection(true);
+        m_pricoin_ct_tx_table->setMinimumHeight(160);
+        form->addRow(m_pricoin_ct_tx_table);
+
         // Insert just below the existing balance block (top of overview).
         if (auto* vlay = qobject_cast<QVBoxLayout*>(main)) {
             vlay->insertWidget(1, ct_frame);
@@ -241,6 +265,89 @@ void OverviewPage::setBalance(const interfaces::WalletBalances& balances)
         m_pricoin_ct_label->setText(BitcoinUnits::formatWithPrivacy(
             unit, balances.confidential_balance,
             BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
+    }
+    refreshPricoinCtTransactions();
+}
+
+void OverviewPage::refreshPricoinCtTransactions()
+{
+    if (!m_pricoin_ct_tx_table || !walletModel) return;
+
+    // best-effort: fetch the persistent CT history. The recovery cache is
+    // warm here (the CT balance for this same poll already synced it), so
+    // this is cheap; on any error we just leave the table unchanged.
+    UniValue result;
+    try {
+        UniValue params{UniValue::VARR};
+        params.push_back(0);  // startheight
+        const QString wname = walletModel->getWalletName();
+        std::string uri;
+        if (!wname.isEmpty()) {
+            const QByteArray enc = QUrl::toPercentEncoding(wname);
+            uri = "/wallet/" + std::string(enc.constData(), enc.length());
+        }
+        result = walletModel->node().executeRpc("pricoin_listcttransactions", params, uri);
+    } catch (...) {
+        return;
+    }
+    if (!result.isObject() || !result.exists("transactions")
+        || !result["transactions"].isArray()) {
+        return;
+    }
+    const UniValue& rows = result["transactions"];
+
+    // Newest first (mempool / unknown height == -1 sorts to the top).
+    std::vector<const UniValue*> sorted;
+    sorted.reserve(rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) sorted.push_back(&rows[i]);
+    auto height_of = [](const UniValue& r) {
+        return r["height"].isNum() ? r["height"].getInt<int>() : -1;
+    };
+    std::sort(sorted.begin(), sorted.end(),
+        [&](const UniValue* a, const UniValue* b) { return height_of(*a) > height_of(*b); });
+
+    m_pricoin_ct_tx_table->setRowCount(0);
+    for (const UniValue* rp : sorted) {
+        const UniValue& r = *rp;
+        const std::string type = r["type"].isStr() ? r["type"].get_str() : "";
+        const bool is_sent = (type == "sent");
+        const bool is_change = r.exists("is_change") && r["is_change"].isBool()
+            && r["is_change"].get_bool();
+
+        QString type_str = is_sent ? tr("Sent") : tr("Received");
+        if (is_change) type_str += tr(" (change)");
+
+        // amount is a STR_AMOUNT (already signed: + received, - sent).
+        const QString amount = QString::fromStdString(r["amount"].getValStr());
+
+        const int height = height_of(r);
+        const QString height_str = height < 0 ? tr("mempool") : QString::number(height);
+
+        QString status;
+        if (is_sent) {
+            status = tr("sent");
+        } else {
+            const bool spent = r.exists("spent") && r["spent"].isBool() && r["spent"].get_bool();
+            status = spent ? tr("spent") : tr("unspent");
+        }
+
+        const QString txid = r["txid"].isStr()
+            ? QString::fromStdString(r["txid"].get_str()) : QString{};
+        QString txid_short = txid.left(16);
+        if (txid.size() > 16) txid_short += QStringLiteral("…");
+
+        const int row = m_pricoin_ct_tx_table->rowCount();
+        m_pricoin_ct_tx_table->insertRow(row);
+        auto set = [&](int col, const QString& text, const QString& tip = {}) {
+            auto* item = new QTableWidgetItem(text);
+            if (!tip.isEmpty()) item->setToolTip(tip);
+            m_pricoin_ct_tx_table->setItem(row, col, item);
+        };
+        set(0, type_str);
+        set(1, amount);
+        set(2, height_str);
+        set(3, status);
+        set(4, txid_short, txid);
     }
 }
 

@@ -23,6 +23,7 @@ namespace Ui {
 QT_BEGIN_NAMESPACE
 class QLabel;
 class QModelIndex;
+class QTableWidget;
 QT_END_NAMESPACE
 
 /** Overview ("home") page widget */
@@ -63,6 +64,12 @@ private:
     // Pricoin Phase B: confidential balance label, populated on each
     // setBalance() call.
     QLabel* m_pricoin_ct_label{nullptr};
+
+    // Pricoin: persistent confidential-transaction history table, fed by
+    // the `pricoin_listcttransactions` RPC (received + reconstructed sends,
+    // surviving spend). Refreshed on the same trigger as the CT balance.
+    QTableWidget* m_pricoin_ct_tx_table{nullptr};
+    void refreshPricoinCtTransactions();
 
 private Q_SLOTS:
     void LimitTransactionRows();

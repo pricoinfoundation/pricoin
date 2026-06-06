@@ -1037,13 +1037,18 @@ RPCMethod pricoin_listownct()
         "deposits, the encoded subaddress so callers can attribute funds without an extra lookup.\n",
         {
             {"startheight", RPCArg::Type::NUM, RPCArg::Default{0}, "Block height to start scanning from"},
+            {"include_spent", RPCArg::Type::BOOL, RPCArg::Default{false},
+                "Also return outputs this wallet has already spent. Each row carries a "
+                "'spent' flag (and 'spent_in_txid' when this wallet broadcast the spend), "
+                "so the listing is a persistent receive history rather than just the "
+                "current UTXO set. total_recovered still reflects unspent balance only."},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
             {
                 {RPCResult::Type::NUM, "scanned_blocks", "How many blocks were scanned"},
                 {RPCResult::Type::NUM, "scanned_mempool_txs", "How many mempool txs were scanned"},
-                {RPCResult::Type::STR_AMOUNT, "total_recovered", "Total PRIC recovered as ours"},
+                {RPCResult::Type::STR_AMOUNT, "total_recovered", "Total PRIC recovered as ours (unspent only)"},
                 {RPCResult::Type::ARR, "outputs", "Per-output recoveries",
                     {{RPCResult::Type::OBJ, "", "",
                         {
@@ -1055,6 +1060,9 @@ RPCMethod pricoin_listownct()
                                 "Subaddress index that received this output (0 == master)"},
                             {RPCResult::Type::STR, "subaddress",
                                 "Encoded subaddress (pricsub-prefixed); empty when subaddress_index == 0"},
+                            {RPCResult::Type::BOOL, "spent", /*optional=*/true, "True iff this output has been spent (present when include_spent)"},
+                            {RPCResult::Type::STR_HEX, "spent_in_txid", /*optional=*/true,
+                                "Txid of the spend (only when this wallet broadcast it; omitted otherwise)"},
                         }}}}
             }
         },
@@ -1064,6 +1072,7 @@ RPCMethod pricoin_listownct()
             if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
             CWallet& wallet = *wallet_sp;
             const int startheight = request.params[0].isNull() ? 0 : request.params[0].getInt<int>();
+            const bool include_spent = !request.params[1].isNull() && request.params[1].get_bool();
 
             // Sync the per-wallet recovery cache with the chain. First
             // call after daemon restart pays a full scan; subsequent
@@ -1090,28 +1099,24 @@ RPCMethod pricoin_listownct()
                 const auto& wid = ::wallet::pricoin_stealth::GetOrCreate(wallet);
                 for (const auto& [outpoint, rec] : index.entries) {
                     if (rec.height < startheight) continue;
-                    if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
-                    // Wallet-local broadcasted-keyimage filter (2026-
-                    // 05-13 tightening): any recorded broadcast for
-                    // this KI hides the output from balance/listing,
-                    // mempool or mined alike. The prior "show if
-                    // mempool-only" carve-out caused stale-mempool
-                    // outputs to surface as spendable balance only to
-                    // fail at broadcast.
-                    if (::wallet::pricoin_broadcasted_kis::Lookup(
-                            wallet, rec.key_image)) {
-                        continue;
-                    }
-                    // Chain-mempool check — catches mempool entries
-                    // we didn't broadcast (other wallet / external
-                    // tool). See walletsendct_ring picker for the
-                    // detailed rationale.
-                    if (wallet.chain().isPricoinKeyImageInMempool(
+                    // An output is spent iff its KI is committed on-chain,
+                    // OR this wallet has broadcast a spend for it (2026-
+                    // 05-13 tightening: hides mempool/mined alike), OR the
+                    // KI is in the mempool from another wallet/tool. The
+                    // record itself is RETAINED on disk (kept as a ring-
+                    // decoy candidate), so with include_spent we can list
+                    // it as persistent history rather than dropping it.
+                    const bool committed =
+                        pricoin::IsKeyImageCommitted(rec.key_image);
+                    const auto bcast_txid =
+                        ::wallet::pricoin_broadcasted_kis::Lookup(wallet, rec.key_image);
+                    const bool in_mempool =
+                        wallet.chain().isPricoinKeyImageInMempool(
                             std::span<const unsigned char, 33>{
-                                rec.key_image.data(), 33})) {
-                        continue;
-                    }
-                    total_recovered += rec.value;
+                                rec.key_image.data(), 33});
+                    const bool spent = committed || bcast_txid.has_value() || in_mempool;
+                    if (spent && !include_spent) continue;
+                    if (!spent) total_recovered += rec.value;
                     UniValue entry{UniValue::VOBJ};
                     entry.pushKV("txid", outpoint.hash.ToString());
                     entry.pushKV("vout", (int)outpoint.n);
@@ -1127,6 +1132,8 @@ RPCMethod pricoin_listownct()
                         }
                     }
                     entry.pushKV("subaddress", sub_enc);
+                    entry.pushKV("spent", spent);
+                    if (bcast_txid) entry.pushKV("spent_in_txid", bcast_txid->ToString());
                     outputs.push_back(entry);
                 }
             }
@@ -1140,6 +1147,132 @@ RPCMethod pricoin_listownct()
             out.pushKV("scanned_mempool_txs", scanned_mempool);
             out.pushKV("total_recovered", ValueFromAmount(total_recovered));
             out.pushKV("outputs", outputs);
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_listcttransactions()
+{
+    return RPCMethod{
+        "pricoin_listcttransactions",
+        "Persistent confidential-transaction history for this wallet — does NOT\n"
+        "depend on outputs being unspent. Returns RECEIVED outputs (each with a\n"
+        "spent flag) AND reconstructed SENDS (one row per spending txid, with\n"
+        "the net amount that left the wallet). Reconstructed entirely from the\n"
+        "recovered-output cache + the broadcasted-keyimage store, so it is\n"
+        "retroactive and needs no extra per-send bookkeeping.\n"
+        "\n"
+        "Limitations (inherent to a privacy chain): the sent 'amount' is the net\n"
+        "outflow = total wallet inputs - change returned, which bundles the\n"
+        "recipient amount(s) AND the fee together; individual recipient stealth\n"
+        "addresses are not recoverable from the wallet's own view.\n",
+        {
+            {"startheight", RPCArg::Type::NUM, RPCArg::Default{0},
+                "Earliest receive height to include (sent-side grouping always uses all outputs)"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_AMOUNT, "balance", "Current unspent confidential balance"},
+                {RPCResult::Type::ARR, "transactions", "Received + sent rows",
+                    {{RPCResult::Type::OBJ, "", "",
+                        {
+                            {RPCResult::Type::STR, "type", "\"received\" or \"sent\""},
+                            {RPCResult::Type::STR_HEX, "txid", ""},
+                            {RPCResult::Type::NUM, "vout", "Output index (received rows; -1 for sent)"},
+                            {RPCResult::Type::STR_AMOUNT, "amount", "Signed: +received, -net sent (recipient+fee)"},
+                            {RPCResult::Type::NUM, "height", "Confirm height (-1 if unknown/mempool)"},
+                            {RPCResult::Type::BOOL, "spent", /*optional=*/true, "Received rows: whether this output is spent"},
+                            {RPCResult::Type::BOOL, "is_change", /*optional=*/true, "Received rows: true if this is change from one of our sends"},
+                            {RPCResult::Type::STR_HEX, "spent_in_txid", /*optional=*/true, "Received rows: the spend txid if this wallet broadcast it"},
+                            {RPCResult::Type::STR_AMOUNT, "total_input", /*optional=*/true, "Sent rows: total wallet value consumed"},
+                            {RPCResult::Type::STR_AMOUNT, "change_returned", /*optional=*/true, "Sent rows: change paid back to this wallet"},
+                        }}}}
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_listcttransactions", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            const int startheight = request.params[0].isNull() ? 0 : request.params[0].getInt<int>();
+
+            struct RxRow {
+                std::string txid; uint32_t vout; CAmount value; int height;
+                bool spent; bool is_change; std::optional<uint256> spend_txid;
+            };
+            std::vector<RxRow> rx;
+            std::map<std::string, CAmount> input_value_by_spend;   // spend txid -> our value consumed
+            std::map<std::string, CAmount> our_out_value_by_txid;  // tx -> our value created (for change netting)
+            std::map<std::string, int>     height_by_txid;         // tx -> confirm height (from our outputs)
+            CAmount balance = 0;
+
+            {
+                LOCK(g_recovery_index_mutex);
+                SyncStats sync_stats;
+                CTRecoveryIndex& index = SyncRecoveryIndexLocked(wallet, &sync_stats);
+
+                // Pass 1 (all outputs): balance + send-grouping maps.
+                for (const auto& [outpoint, rec] : index.entries) {
+                    const bool committed = pricoin::IsKeyImageCommitted(rec.key_image);
+                    const auto bcast_txid =
+                        ::wallet::pricoin_broadcasted_kis::Lookup(wallet, rec.key_image);
+                    const bool in_mempool = wallet.chain().isPricoinKeyImageInMempool(
+                        std::span<const unsigned char, 33>{rec.key_image.data(), 33});
+                    const bool spent = committed || bcast_txid.has_value() || in_mempool;
+                    if (!spent) balance += rec.value;
+
+                    const std::string rx_txid = outpoint.hash.ToString();
+                    our_out_value_by_txid[rx_txid] += rec.value;
+                    if (rec.height >= 0) height_by_txid[rx_txid] = rec.height;
+                    if (bcast_txid) input_value_by_spend[bcast_txid->ToString()] += rec.value;
+
+                    if (rec.height < 0 || rec.height >= startheight) {
+                        rx.push_back({rx_txid, outpoint.n, rec.value, rec.height,
+                                      spent, /*is_change=*/false, bcast_txid});
+                    }
+                }
+            }
+
+            UniValue txs{UniValue::VARR};
+            // Received rows (mark change so the consumer can distinguish a
+            // genuine deposit from change returned by one of our sends).
+            for (auto& r : rx) {
+                const bool is_change = input_value_by_spend.count(r.txid) > 0;
+                UniValue e{UniValue::VOBJ};
+                e.pushKV("type", "received");
+                e.pushKV("txid", r.txid);
+                e.pushKV("vout", (int)r.vout);
+                e.pushKV("amount", ValueFromAmount(r.value));
+                e.pushKV("height", r.height);
+                e.pushKV("spent", r.spent);
+                e.pushKV("is_change", is_change);
+                if (r.spend_txid) e.pushKV("spent_in_txid", r.spend_txid->ToString());
+                txs.push_back(e);
+            }
+            // Sent rows: one per spending txid, net of change returned.
+            for (const auto& [spend_txid, in_val] : input_value_by_spend) {
+                CAmount change = 0;
+                if (auto it = our_out_value_by_txid.find(spend_txid);
+                    it != our_out_value_by_txid.end()) change = it->second;
+                const CAmount net_out = in_val - change;
+                int h = -1;
+                if (auto it = height_by_txid.find(spend_txid);
+                    it != height_by_txid.end()) h = it->second;
+                UniValue e{UniValue::VOBJ};
+                e.pushKV("type", "sent");
+                e.pushKV("txid", spend_txid);
+                e.pushKV("vout", -1);
+                e.pushKV("amount", ValueFromAmount(-net_out));
+                e.pushKV("height", h);
+                e.pushKV("total_input", ValueFromAmount(in_val));
+                e.pushKV("change_returned", ValueFromAmount(change));
+                txs.push_back(e);
+            }
+
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("balance", ValueFromAmount(balance));
+            out.pushKV("transactions", std::move(txs));
             return out;
         }
     };
@@ -9093,6 +9226,7 @@ RPCMethod pricoin_btc_sweep_export()                    { return pricoin_btc_swe
 RPCMethod pricoin_ltc_claim_swap_export()               { return pricoin_ltc_claim_swap(); }
 RPCMethod pricoin_ltc_refund_swap_export()              { return pricoin_ltc_refund_swap(); }
 RPCMethod pricoin_listownct_export() { return pricoin_listownct(); }
+RPCMethod pricoin_listcttransactions_export() { return pricoin_listcttransactions(); }
 RPCMethod walletsendct_from_ct_export() { return walletsendct_from_ct(); }
 RPCMethod walletsendct_ring_export() { return walletsendct_ring(); }
 RPCMethod pricoin_ct_relay_prebuilt_export() { return pricoin_ct_relay_prebuilt(); }
