@@ -8259,6 +8259,206 @@ RPCMethod pricoin_swapwatch_verify_pric_claim()
     };
 }
 
+RPCMethod pricoin_swap_recover_refund_singlesig()
+{
+    return RPCMethod{
+        "pricoin_swap_recover_refund_singlesig",
+        "RECOVERY: sign and broadcast the PRIC timelock refund for a stuck\n"
+        "swap using a SINGLE-PARTY reconstruction of the joint spend key,\n"
+        "bypassing the cooperative ceremony entirely.\n"
+        "\n"
+        "Use this only when the stored cooperative refund signature is invalid\n"
+        "(autorefund logs 'bad-pct-ring-sig-invalid') AND you control BOTH\n"
+        "sides of the swap. It combines this wallet's joint-output key shares\n"
+        "(x_share, z_share, read from the swap's refund coopsign session) with\n"
+        "the peer's shares (passed as args) to recover the full joint secret\n"
+        "x = x_local + x_peer, z = z_local + z_peer, then signs the persisted\n"
+        "refund tx with the reference single-party multi-layer signer. The\n"
+        "signer verifies x·G == P_pi and z·G == W_pi, so wrong shares fail\n"
+        "loudly rather than producing another bad signature.\n"
+        "\n"
+        "SECURITY: combining both spend-key shares on one machine collapses\n"
+        "the 2-of-2 — only do this to recover a swap you own both legs of.\n",
+        {
+            {"swap_id",      RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"peer_x_share", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Peer's 32-byte x (spend) share for the joint output — from the "
+                "peer wallet's refund coopsign session (x_share field)"},
+            {"peer_z_share", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+                "Peer's 32-byte z (commitment) share for the REFUND leg — from "
+                "the peer wallet's refund coopsign session (z_share field)"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "txid", "Broadcast refund txid"},
+                {RPCResult::Type::STR_HEX, "sig",  "Freshly-signed CLSAG blob injected into the refund tx"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_swap_recover_refund_singlesig",
+            "<swap_id> <peer_x_share> <peer_z_share>")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            const uint256 sid = ParseChainWatchSwapId(request.params[0]);
+
+            ::wallet::pricoin_adaptor_swap::AdaptorSwap snap;
+            if (::wallet::pricoin_adaptor_swap::Get(wallet, sid, snap)
+                != ::wallet::pricoin_adaptor_swap::LookupResult::Ok) {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "swap not found");
+            }
+            if (!snap.pric_refund_txid.IsNull()) {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "swap already has a pric_refund_txid");
+            }
+            if (snap.pric_refund_unsigned_tx_hex.empty()) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "no unsigned PRIC refund tx on record (buildtx never ran on this wallet)");
+            }
+            if (snap.pric_refund_session_json.empty()) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "no refund coopsign session on record — cannot recover local key shares");
+            }
+
+            // Pull ring_ml / msg / pi / local shares from the refund session.
+            UniValue sess;
+            if (!sess.read(snap.pric_refund_session_json) || !sess.isObject()) {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "refund session JSON unparseable");
+            }
+            auto sess_str = [&](const char* k) -> std::string {
+                return sess.exists(k) && sess[k].isStr() ? sess[k].get_str() : std::string{};
+            };
+            std::string ring_str = sess_str("ring_ml_json");
+            if (ring_str.empty()) ring_str = sess_str("in_ring_or_ring_ml");
+            const std::string msg_hex = sess_str("msg_hex");
+            const std::string pi_str  = sess_str("pi");
+            const std::string x_local = sess_str("x_share");
+            const std::string z_local = sess_str("z_share");
+            if (ring_str.empty() || msg_hex.size() != 64 || pi_str.empty()
+                || x_local.size() != 64 || z_local.size() != 64) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "refund session missing ring_ml_json / msg_hex / pi / x_share / z_share");
+            }
+            const size_t pi = static_cast<size_t>(std::atoi(pi_str.c_str()));
+
+            UniValue ring_arr;
+            if (!ring_arr.read(ring_str) || !ring_arr.isArray() || ring_arr.empty()) {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "ring_ml_json is not a non-empty array");
+            }
+            std::vector<::pricoin::ringsig::MultiLayerMember> ring_ml;
+            ring_ml.reserve(ring_arr.size());
+            for (size_t i = 0; i < ring_arr.size(); ++i) {
+                const UniValue& e = ring_arr[i];
+                if (!e.isObject() || !e.exists("P") || !e.exists("W")) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        strprintf("ring[%u] must be {P,W}", (unsigned)i));
+                }
+                auto pb = TryParseHex<unsigned char>(e["P"].get_str());
+                auto wb = TryParseHex<unsigned char>(e["W"].get_str());
+                if (!pb || pb->size() != 33 || !wb || wb->size() != 33) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        strprintf("ring[%u] P/W must be 33-byte hex", (unsigned)i));
+                }
+                ::pricoin::ringsig::MultiLayerMember m;
+                std::copy(pb->begin(), pb->end(), m.P.begin());
+                std::copy(wb->begin(), wb->end(), m.W.begin());
+                ring_ml.push_back(m);
+            }
+            if (pi >= ring_ml.size()) {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "pi out of range for ring");
+            }
+
+            // msg: raw-bytes copy (matches the ceremony / adapt convention).
+            auto msg_bytes = TryParseHex<unsigned char>(msg_hex);
+            if (!msg_bytes || msg_bytes->size() != 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "msg_hex must be 32-byte hex");
+            }
+            uint256 msg;
+            std::copy(msg_bytes->begin(), msg_bytes->end(), msg.begin());
+
+            // Parse the four shares into scalars.
+            auto to_scalar = [](const std::string& h, const char* what) {
+                auto b = TryParseHex<unsigned char>(h);
+                if (!b || b->size() != 32) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        std::string(what) + " must be 32-byte hex");
+                }
+                ::pricoin::ringsig::Scalar s;
+                std::copy(b->begin(), b->end(), s.begin());
+                return s;
+            };
+            const auto xl = to_scalar(x_local, "local x_share");
+            const auto zl = to_scalar(z_local, "local z_share");
+            const auto xp = to_scalar(request.params[1].get_str(), "peer_x_share");
+            const auto zp = to_scalar(request.params[2].get_str(), "peer_z_share");
+
+            // Reconstruct the full joint secrets.
+            auto x_full = ::pricoin::ringsig::AddScalars(xl, xp);
+            auto z_full = ::pricoin::ringsig::AddScalars(zl, zp);
+            if (!x_full || !z_full) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "share addition produced an invalid scalar (zero/overflow)");
+            }
+
+            // Reference single-party signer. Verifies x·G==P_pi and z·G==W_pi
+            // internally, so mismatched peer shares fail here, not on-chain.
+            auto sig = ::pricoin::ringsig::SignMultiLayer(
+                std::span<const ::pricoin::ringsig::MultiLayerMember>{ring_ml},
+                pi, *x_full, *z_full, msg);
+            if (!sig) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "SignMultiLayer failed — reconstructed x·G != P_pi or z·G != W_pi. "
+                    "Check that the peer shares are the REFUND-leg x_share/z_share "
+                    "from the OTHER wallet's swap record.");
+            }
+            // Belt-and-suspenders: the same check consensus will run.
+            if (!::pricoin::ringsig::VerifyMultiLayer(
+                    std::span<const ::pricoin::ringsig::MultiLayerMember>{ring_ml}, *sig, msg)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "recovered signature failed VerifyMultiLayer — not broadcasting");
+            }
+
+            // Inject into the persisted refund tx and broadcast.
+            CMutableTransaction mtx;
+            if (!DecodeHexTx(mtx, snap.pric_refund_unsigned_tx_hex,
+                             /*try_no_witness=*/true, /*try_witness=*/true)) {
+                throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "stored refund tx hex failed to decode");
+            }
+            if (mtx.version != PRICOIN_CT_VERSION) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "stored refund tx is not a v4 confidential tx");
+            }
+            if (mtx.ct_bundle.ring_inputs.size() != 1) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "refund tx must have exactly one ring input");
+            }
+            mtx.ct_bundle.ring_inputs[0].sig = *sig;
+
+            CTransactionRef tx_ref = MakeTransactionRef(std::move(mtx));
+            std::string err_str;
+            if (!wallet.chain().broadcastTransaction(
+                    tx_ref, MAX_MONEY,
+                    node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL, err_str)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "broadcast failed: " + err_str);
+            }
+            const std::string txid_hex = tx_ref->GetHash().ToString();
+
+            pcw::WatchEntry we;
+            we.swap_id = sid;
+            we.kind    = pcw::WatchKind::PricRefund;
+            we.txid_hex = txid_hex;
+            we.vout    = -1;
+            we.min_confirmations = 1;
+            (void)pcw::Add(wallet, we);
+
+            DataStream sig_ds;
+            sig_ds << *sig;
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("txid", txid_hex);
+            out.pushKV("sig", HexStr(std::span<const unsigned char>{
+                UCharCast(sig_ds.data()), sig_ds.size()}));
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_swapwatch_extract_pric_t()
 {
     return RPCMethod{
@@ -8864,6 +9064,7 @@ RPCMethod pricoin_swapwatch_adapt_btc_claim_export()    { return pricoin_swapwat
 RPCMethod pricoin_swapwatch_extract_pric_t_export()     { return pricoin_swapwatch_extract_pric_t(); }
 RPCMethod pricoin_swapwatch_adapt_pric_claim_export()   { return pricoin_swapwatch_adapt_pric_claim(); }
 RPCMethod pricoin_swapwatch_verify_pric_claim_export()  { return pricoin_swapwatch_verify_pric_claim(); }
+RPCMethod pricoin_swap_recover_refund_singlesig_export() { return pricoin_swap_recover_refund_singlesig(); }
 RPCMethod pricoin_btc_getaddress_export()               { return pricoin_btc_getaddress(); }
 RPCMethod pricoin_btc_getbalance_export()               { return pricoin_btc_getbalance(); }
 RPCMethod pricoin_btc_fund_swap_export()                { return pricoin_btc_fund_swap(); }

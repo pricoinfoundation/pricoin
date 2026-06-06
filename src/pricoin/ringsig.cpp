@@ -636,6 +636,18 @@ bool VerifyMultiLayer(
     return ok;
 }
 
+std::optional<Scalar> AddScalars(const Scalar& a, const Scalar& b)
+{
+    LOCK(g_mutex);
+    secp256k1_context* ctx = Ctx();
+    if (!secp256k1_ec_seckey_verify(ctx, a.data())) return std::nullopt;
+    if (!secp256k1_ec_seckey_verify(ctx, b.data())) return std::nullopt;
+    Scalar out = a;
+    if (!secp256k1_ec_seckey_tweak_add(ctx, out.data(), b.data())) return std::nullopt;
+    if (!secp256k1_ec_seckey_verify(ctx, out.data())) return std::nullopt;
+    return out;
+}
+
 void RunSelfTest()
 {
     // Build a ring of 4 random keypairs; sign with index 2.

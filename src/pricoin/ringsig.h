@@ -111,6 +111,13 @@ bool VerifyMultiLayer(
     const Signature& sig,
     const uint256& msg);
 
+// out = (a + b) mod n. Both inputs and the result must be valid
+// (non-zero, in range) secp256k1 scalars; returns nullopt otherwise.
+// Used to reconstruct a joint spend/commitment secret from its two
+// cooperative shares (x = x_A + x_B, z = z_A + z_B) for single-party
+// recovery signing of a stuck swap output.
+std::optional<Scalar> AddScalars(const Scalar& a, const Scalar& b);
+
 // Phase 4a self-test: builds a small ring, signs, verifies, mutates,
 // expects rejection. Throws on failure. Called from init.
 void RunSelfTest();
