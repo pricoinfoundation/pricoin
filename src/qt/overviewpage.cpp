@@ -213,6 +213,15 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
             main->addWidget(ct_frame);
         }
     }
+
+    // Pricoin: on a privacy chain the native transparent "Recent
+    // transactions" list is redundant — CT activity never appears there
+    // (CT outputs aren't normal CWalletTx records). Hide it in favour of
+    // the confidential-transactions table above, so the overview shows
+    // ONE transaction section, not two.
+    if (ui->listTransactions)          ui->listTransactions->setVisible(false);
+    if (ui->label_4)                   ui->label_4->setVisible(false);
+    if (ui->labelTransactionsStatus)   ui->labelTransactionsStatus->setVisible(false);
 }
 
 void OverviewPage::handleTransactionClicked(const QModelIndex &index)
@@ -230,7 +239,8 @@ void OverviewPage::setPrivacy(bool privacy)
         setBalance(balances);
     }
 
-    ui->listTransactions->setVisible(!m_privacy);
+    // Pricoin: native transparent list stays hidden (see constructor) —
+    // the confidential-transactions table is the overview's tx view now.
 
     const QString status_tip = m_privacy ? tr("Privacy mode activated for the Overview tab. To unmask the values, uncheck Settings->Mask values.") : "";
     setStatusTip(status_tip);

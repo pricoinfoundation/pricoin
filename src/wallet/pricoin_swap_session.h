@@ -172,6 +172,14 @@ enum class CreateResult {
 // derivation produced an invalid scalar (~2^-128 probability).
 std::optional<CPubKey> GetSwapIdentityPubkey(CWallet& wallet);
 
+// Return this wallet's stable swap-identity PRIVATE key — the priv whose
+// pubkey GetSwapIdentityPubkey() returns. Lets the BTC MuSig2 signing
+// RPCs sign with the wallet's identity key WITHOUT the caller having to
+// paste a raw private key (the prerequisite for a hands-free, headless
+// BTC cooperative-signing ceremony). Same nullopt conditions as the
+// pubkey accessor (locked wallet / derivation failure).
+std::optional<CKey> GetSwapIdentityKey(CWallet& wallet);
+
 // Initiator path. Generates a fresh random session_id, derives a
 // per-session signing key from the wallet's stealth spend priv,
 // stores the session record. On success, the caller exposes

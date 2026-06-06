@@ -154,6 +154,16 @@ std::optional<CPubKey> GetSwapIdentityPubkey(CWallet& wallet)
     return priv.GetPubKey();
 }
 
+std::optional<CKey> GetSwapIdentityKey(CWallet& wallet)
+{
+    if (!RequireUnlocked(wallet)) return std::nullopt;
+    const auto& id = ::wallet::pricoin_stealth::GetOrCreate(wallet);
+    if (!id.spend.IsValid()) return std::nullopt;
+    CKey priv;
+    if (!DeriveSwapIdentityPriv(id.spend, priv)) return std::nullopt;
+    return priv;
+}
+
 CreateResult Create(
     CWallet& wallet,
     const CPubKey& counterparty_pub,

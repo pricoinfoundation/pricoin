@@ -6138,7 +6138,9 @@ RPCMethod pricoin_btc_musig2_partial_sign()
         "handle cannot be re-used.\n",
         {
             {"secnonce_handle", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Handle from round1"},
-            {"self_priv",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte priv key"},
+            {"self_priv",       RPCArg::Type::STR_HEX, RPCArg::Default{""},
+                "32-byte priv key. If omitted/empty, the wallet's swap-identity priv is "
+                "derived and used (so headless callers need not handle a raw private key)."},
             {"self_pub",        RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte compressed pub"},
             {"keyagg_cache",    RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "197-byte cache"},
             {"session", RPCArg::Type::OBJ, RPCArg::Optional::NO, "Session object from process",
@@ -6162,12 +6164,30 @@ RPCMethod pricoin_btc_musig2_partial_sign()
                 throw JSONRPCError(RPC_INVALID_REQUEST,
                     "secnonce_handle not found — already consumed, never created, or daemon restarted");
             }
-            auto priv_bytes = TryParseHex<unsigned char>(request.params[1].get_str());
-            if (!priv_bytes || priv_bytes->size() != 32) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "self_priv must be 32-byte hex");
-            }
             bma::Scalar self_priv;
-            std::copy(priv_bytes->begin(), priv_bytes->end(), self_priv.begin());
+            const std::string priv_hex =
+                request.params[1].isNull() ? "" : request.params[1].get_str();
+            if (priv_hex.empty()) {
+                // Headless path: sign with the wallet's swap-identity priv,
+                // derived in-wallet so no raw private key is ever passed.
+                auto wallet_sp = GetWalletForJSONRPCRequest(request);
+                if (!wallet_sp) {
+                    throw JSONRPCError(RPC_WALLET_NOT_FOUND,
+                        "wallet not loaded (needed to derive swap-identity priv when self_priv omitted)");
+                }
+                auto key = ::wallet::pricoin_swap_session::GetSwapIdentityKey(*wallet_sp);
+                if (!key) {
+                    throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED,
+                        "swap-identity priv unavailable (wallet locked?)");
+                }
+                std::copy(UCharCast(key->data()), UCharCast(key->data()) + 32, self_priv.begin());
+            } else {
+                auto priv_bytes = TryParseHex<unsigned char>(priv_hex);
+                if (!priv_bytes || priv_bytes->size() != 32) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "self_priv must be 32-byte hex");
+                }
+                std::copy(priv_bytes->begin(), priv_bytes->end(), self_priv.begin());
+            }
 
             auto pub_bytes = TryParseHex<unsigned char>(request.params[2].get_str());
             if (!pub_bytes || pub_bytes->size() != 33) {
@@ -6230,6 +6250,49 @@ RPCMethod pricoin_btc_musig2_aggregate_partials()
             if (!sig) throw JSONRPCError(RPC_INTERNAL_ERROR, "AggregatePartials failed");
             UniValue out{UniValue::VOBJ};
             out.pushKV("sig", HexStr(*sig));
+            return out;
+        }
+    };
+}
+
+RPCMethod pricoin_btc_musig2_partial_verify()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_partial_verify",
+        "Verify ONE party's 32-byte MuSig2 partial signature against their\n"
+        "66-byte pubnonce, 33-byte pubkey, the 197-byte keyagg_cache and the\n"
+        "processed session. Returns {valid}. Run this on the PEER's partial\n"
+        "BEFORE aggregating — aggregate_partials does not validate its inputs,\n"
+        "so a desynced or forged partial would otherwise be silently folded\n"
+        "into a (pre-)signature that only fails later, after funds are at risk.\n",
+        {
+            {"partial",      RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte partial sig (the signer's)"},
+            {"pubnonce",     RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "66-byte pubnonce (the signer's)"},
+            {"pubkey",       RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "33-byte compressed pubkey (the signer's)"},
+            {"keyagg_cache", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "197-byte keyagg_cache"},
+            {"session", RPCArg::Type::OBJ, RPCArg::Optional::NO, "Session object",
+                {
+                    {"data",         RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+                    {"nonce_parity", RPCArg::Type::NUM,     RPCArg::Optional::NO, ""},
+                }
+            },
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::BOOL, "valid", "True iff the partial verifies"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_partial_verify",
+            "<partial> <pubnonce> <pubkey> <keyagg_cache> '{\"data\":\"...\",\"nonce_parity\":0}'")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            bma::PartialSig32 partial =
+                ParseFixedHex<bma::PartialSig32>(request.params[0].get_str(), "partial");
+            bma::PubNonce66 pubnonce =
+                ParseFixedHex<bma::PubNonce66>(request.params[1].get_str(), "pubnonce");
+            CPubKey pubkey = ParseSessionPubkey(request.params[2].get_str(), "pubkey");
+            bma::KeyAggCache cache = ParseKeyAggCacheBlob(request.params[3].get_str());
+            bma::Session session = ParseSessionBlob(request.params[4]);
+            const bool ok = bma::VerifyPartialSig(partial, pubnonce, pubkey, cache, session);
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("valid", ok);
             return out;
         }
     };
@@ -6455,6 +6518,14 @@ RPCMethod pricoin_btc_musig2_round1_safe()
                 }
                 bma::Scalar s;
                 std::copy(priv_bytes->begin(), priv_bytes->end(), s.begin());
+                self_priv = s;
+            } else if (auto key = ::wallet::pricoin_swap_session::GetSwapIdentityKey(*wallet_sp)) {
+                // Headless path: bind the nonce to the wallet's swap-identity
+                // priv (stronger derivation) without passing a raw key. If
+                // derivation fails (locked), leave unbound — NonceGen still
+                // works; the priv binding is an optional hardening.
+                bma::Scalar s;
+                std::copy(UCharCast(key->data()), UCharCast(key->data()) + 32, s.begin());
                 self_priv = s;
             }
 
@@ -9184,6 +9255,7 @@ RPCMethod pricoin_btc_musig2_aggregate_nonces_export()   { return pricoin_btc_mu
 RPCMethod pricoin_btc_musig2_process_export()            { return pricoin_btc_musig2_process(); }
 RPCMethod pricoin_btc_musig2_partial_sign_export()       { return pricoin_btc_musig2_partial_sign(); }
 RPCMethod pricoin_btc_musig2_aggregate_partials_export() { return pricoin_btc_musig2_aggregate_partials(); }
+RPCMethod pricoin_btc_musig2_partial_verify_export() { return pricoin_btc_musig2_partial_verify(); }
 RPCMethod pricoin_btc_musig2_adapt_export()              { return pricoin_btc_musig2_adapt(); }
 RPCMethod pricoin_btc_musig2_extract_export()            { return pricoin_btc_musig2_extract(); }
 RPCMethod pricoin_btc_musig2_round1_safe_export()        { return pricoin_btc_musig2_round1_safe(); }

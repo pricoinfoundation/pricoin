@@ -118,6 +118,8 @@ CoopSignDialog::CoopSignDialog(WalletModel* wallet_model,
             if (m_in_peer_pub && !snap->counterparty_pubkey_hex.empty()) {
                 m_in_peer_pub->setText(QString::fromStdString(snap->counterparty_pubkey_hex));
             }
+            // Swap role — drives the canonical keyagg ordering in Step 1.
+            m_swap_role = QString::fromStdString(snap->role);
             // My pubkey: take the wallet's BIP340 swap-identity x-only
             // and synthesise the 33-byte compressed (even-y) form by
             // prefixing 0x02. BIP327 keyagg accepts this; the parity
@@ -432,7 +434,10 @@ void CoopSignDialog::buildLayout(const QString& title)
 
         m_in_session_seed = new QLineEdit(box);
         m_in_session_seed->setText(RandomHex32());
-        m_in_session_seed->setToolTip(tr("32-byte CSPRNG bytes — must be unique per call (regenerate if running again)"));
+        m_in_session_seed->setToolTip(tr("32-byte CSPRNG bytes — unique per ceremony. Do NOT regenerate "
+                                          "after sending your pubnonce to the peer: a fresh seed mints a "
+                                          "new nonce and desyncs the signature. Only regenerate for a "
+                                          "brand-new signing session."));
         form->addRow(tr("Session seed:"), m_in_session_seed);
 
         m_btn_step2 = new QPushButton(tr("Run round-1 (atomic persist)"), box);
@@ -555,11 +560,23 @@ void CoopSignDialog::onStep1Compute()
         setStatus(tr("Both pubkeys must be 33-byte (66-char) hex."), true);
         return;
     }
-    // BIP327 keyagg is order-sensitive; the convention here is the
-    // user enters [my, peer] consistently. The peer must use the
-    // SAME order on their side or the agg_xonly won't match.
+    // BIP327 keyagg is order-sensitive and secp256k1_musig_pubkey_agg
+    // does NOT sort, so both parties MUST aggregate in the SAME order.
+    // The canonical order is [alice_pub, bob_pub] — the same order
+    // pricoin_swapwatch_adapt_btc_claim uses — so derive it from the
+    // swap role rather than [my, peer] (which would give Alice [A,B]
+    // but Bob [B,A] → different aggregate keys → Bob's pre-sig would
+    // not adapt at claim time, and refund partials wouldn't aggregate).
+    // When the role is unknown (dialog opened without a swap_id), fall
+    // back to the legacy [my, peer] order.
+    QString first = my_pub, second = peer_pub;
+    if (m_swap_role == "alice") {
+        first = my_pub;  second = peer_pub;   // I am alice → [my, peer]
+    } else if (m_swap_role == "bob") {
+        first = peer_pub; second = my_pub;    // I am bob   → [peer, my] = [alice, bob]
+    }
     const std::string params = std::string("[[\"")
-        + my_pub.toStdString() + "\",\"" + peer_pub.toStdString() + "\"]]";
+        + first.toStdString() + "\",\"" + second.toStdString() + "\"]]";
     auto r = callRpc("pricoin_btc_musig2_keyagg", params);
     if (!r.ok) {
         setStatus(tr("keyagg failed: %1").arg(QString::fromStdString(r.error_msg)), true);
@@ -591,6 +608,22 @@ void CoopSignDialog::onStep2Compute()
     const QString session_seed= m_in_session_seed->text().trimmed();
     if (session_id.size() != 64 || session_seed.size() != 64) {
         setStatus(tr("session_id and session_seed must each be 32-byte hex."), true);
+        return;
+    }
+
+    // ── MuSig2 nonce idempotency guard (2026-06-06) ──────────────────
+    // The secnonce/pubnonce must be generated exactly once per (session,
+    // msg). Re-running Step 2 after the pubnonce was already sent to the
+    // peer would mint a NEW secnonce while the peer still holds the OLD
+    // pubnonce — a desync that yields an unverifiable partial/adaptor sig
+    // (the BTC analogue of the 2026-06-05 PRIC round-1 desync). The
+    // RPC-tier reuse record (bnr::Begin) already REJECTS nonce reuse, so
+    // a naive re-run here just errors confusingly; this makes it a clean
+    // no-op that re-offers the existing pubnonce. A genuine msg change
+    // (rebuilt tx → new sighash) still regenerates a fresh nonce.
+    if (!m_my_pubnonce.isEmpty() && !m_msg_hex.isEmpty() && m_msg_hex == msg) {
+        setStatus(tr("Step 2 already done — reusing the existing pubnonce "
+                     "(regenerating would desync the peer)."));
         return;
     }
 
@@ -716,6 +749,43 @@ void CoopSignDialog::onStep4Compute()
         setStatus(tr("Peer partial must be 32-byte (64-char) hex."), true);
         return;
     }
+
+    // ── Verify the peer's partial BEFORE aggregating (2026-06-06) ─────
+    // aggregate_partials does not validate its inputs, so a desynced or
+    // forged peer partial would be silently folded into a (pre-)signature
+    // that only fails later, after funds are at risk (the BTC analogue of
+    // the PRIC nonce-desync incident). secp256k1_musig_partial_sig_verify
+    // catches it now. Best-effort: we can only check when we hold the
+    // peer's pubnonce (Step 3 input) + pubkey (Step 1 input), which the
+    // normal ceremony flow always has by this point.
+    {
+        const QString peer_pn  = m_in_peer_pubnonce
+            ? m_in_peer_pubnonce->toPlainText().trimmed() : QString{};
+        const QString peer_pub = m_in_peer_pub ? m_in_peer_pub->text().trimmed() : QString{};
+        if (peer_pn.size() == 132 && peer_pub.size() == 66) {
+            const std::string vparams = std::string("[\"")
+                + peer_partial.toStdString() + "\",\""
+                + peer_pn.toStdString() + "\",\""
+                + peer_pub.toStdString() + "\",\""
+                + m_keyagg_cache.toStdString()
+                + "\",{\"data\":\"" + m_session_data.toStdString()
+                + "\",\"nonce_parity\":" + std::to_string(m_nonce_parity) + "}]";
+            auto vr = callRpc("pricoin_btc_musig2_partial_verify", vparams);
+            bool valid = false;
+            if (vr.ok) {
+                UniValue vv;
+                vv.read(vr.json);
+                valid = vv.exists("valid") && vv["valid"].isBool() && vv["valid"].get_bool();
+            }
+            if (!valid) {
+                setStatus(tr("Step 4 ABORT — the peer's partial signature failed "
+                             "verification (MuSig2 nonce/session desync). NOT "
+                             "aggregating; the ceremony must be re-run."), true);
+                return;
+            }
+        }
+    }
+
     std::string params = std::string("[{\"data\":\"")
         + m_session_data.toStdString()
         + "\",\"nonce_parity\":" + std::to_string(m_nonce_parity)

@@ -260,6 +260,27 @@ std::optional<SignatureBytes> AggregatePartials(
     return out;
 }
 
+bool VerifyPartialSig(
+    const PartialSig32& partial,
+    const PubNonce66& pubnonce,
+    const CPubKey& pubkey,
+    const KeyAggCache& cache,
+    const Session& session)
+{
+    secp256k1_musig_partial_sig psig;
+    if (!secp256k1_musig_partial_sig_parse(Ctx(), &psig, partial.data())) return false;
+    secp256k1_musig_pubnonce pn;
+    if (!secp256k1_musig_pubnonce_parse(Ctx(), &pn, pubnonce.data())) return false;
+    secp256k1_pubkey pk;
+    if (!ParsePubKey(pubkey, pk)) return false;
+    secp256k1_musig_keyagg_cache cache_local;
+    LoadCache(cache, cache_local);
+    secp256k1_musig_session session_local;
+    LoadSession(session, session_local);
+    return secp256k1_musig_partial_sig_verify(
+        Ctx(), &psig, &pn, &pk, &cache_local, &session_local) == 1;
+}
+
 std::optional<SignatureBytes> Adapt(
     const SignatureBytes& presig,
     const Scalar& t,
@@ -373,6 +394,18 @@ void RunOnce(bool with_adaptor) {
     Check(ps_B.has_value(), "PartialSign B");
     Check(!sec_A.IsValid(), "secnonce A invalidated");
     Check(!sec_B.IsValid(), "secnonce B invalidated");
+
+    // Verify each partial BEFORE aggregating — the safety check the
+    // ceremony now runs on the peer's partial. Honest partials must
+    // verify; a tampered one must be rejected.
+    Check(VerifyPartialSig(*ps_A, *pn_A, pub_A, cache, *session), "VerifyPartialSig A");
+    Check(VerifyPartialSig(*ps_B, *pn_B, pub_B, cache, *session), "VerifyPartialSig B");
+    {
+        PartialSig32 bad = *ps_A;
+        bad[0] ^= 0x01;
+        Check(!VerifyPartialSig(bad, *pn_A, pub_A, cache, *session),
+              "VerifyPartialSig rejects tampered partial");
+    }
 
     // Step 8: aggregate.
     auto presig = AggregatePartials(*session, {*ps_A, *ps_B});

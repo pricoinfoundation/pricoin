@@ -163,6 +163,19 @@ std::optional<SignatureBytes> AggregatePartials(
     const Session& session,
     const std::vector<PartialSig32>& partials);
 
+// Verify one party's partial signature against their public nonce and
+// public key (wraps secp256k1_musig_partial_sig_verify). Returns true iff
+// valid. CRITICAL safety check: AggregatePartials does NOT validate its
+// inputs, so a desynced/forged peer partial would otherwise be silently
+// folded into a (pre-)signature that only fails later. Call this on the
+// PEER's partial before aggregating.
+bool VerifyPartialSig(
+    const PartialSig32& partial,
+    const PubNonce66& pubnonce,
+    const CPubKey& pubkey,
+    const KeyAggCache& cache,
+    const Session& session);
+
 // Step 9: Adapt(presig, t, nonce_parity) → 64-byte BIP340 sig.
 // Verifies under the aggregate x-only pubkey via the deployed
 // `XOnlyPubKey::VerifySchnorr`.

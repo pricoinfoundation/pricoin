@@ -128,6 +128,12 @@ private:
     QString m_my_priv;
     QString m_msg_hex;
     QString m_role;
+    // Swap role ("alice"/"bob") from the swap record. Determines the
+    // CANONICAL MuSig2 keyagg order [alice_pub, bob_pub] — which must be
+    // identical on both sides (secp256k1_musig_pubkey_agg does not sort,
+    // and adapt_btc_claim aggregates alice-first), else the two parties
+    // derive different aggregate keys and the pre-sig won't adapt.
+    QString m_swap_role;
 
     // ─── Step 1: Keyagg ───
     QLineEdit*      m_in_my_pub{nullptr};
