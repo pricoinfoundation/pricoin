@@ -819,12 +819,8 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
         "LTC address that swap refunds are returned to (Bob's foreign-refund "
         "destination)",
         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
-    argsman.AddArg("-btcwatchurl=<url>",
-        "Esplora-compatible base URL for the BTC chain backend used by swaps",
-        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
-    argsman.AddArg("-ltcwatchurl=<url>",
-        "Esplora-compatible base URL for the LTC chain backend used by swaps",
-        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    // NB: -btcwatchurl / -ltcwatchurl are already registered above
+    // (near -chainwatchurl) — do not re-add (AddArg asserts on dupes).
 
     // Add the hidden options
     argsman.AddHiddenArgs(hidden_args);
