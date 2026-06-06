@@ -796,6 +796,36 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     hidden_args.emplace_back("-daemonwait");
 #endif
 
+    // ── Pricoin swap options ─────────────────────────────────────────
+    // These were read via gArgs but never registered, so the config
+    // loader rejected them with "Ignoring unknown configuration value"
+    // and GetArg/GetBoolArg always returned the default — e.g.
+    // -pricoinautorefund silently stayed OFF, leaving timelock refunds
+    // un-armed. Register them so config-file + command-line use works.
+    // (2026-06-06.)
+    argsman.AddArg("-pricoinautorefund",
+        "Automatically broadcast the pre-signed timelock refund for a stuck "
+        "swap once its refund height is reached (default: 0)",
+        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-pricoinswapwatch=<n>",
+        "Enable the swap chain-watcher background tick that advances swap "
+        "state and fires auto-refunds (default: 1)",
+        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-pricoinltcclaimaddr=<addr>",
+        "LTC address that swap claims are paid to (Alice's foreign-claim "
+        "destination)",
+        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-pricoinltcrefundaddr=<addr>",
+        "LTC address that swap refunds are returned to (Bob's foreign-refund "
+        "destination)",
+        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-btcwatchurl=<url>",
+        "Esplora-compatible base URL for the BTC chain backend used by swaps",
+        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-ltcwatchurl=<url>",
+        "Esplora-compatible base URL for the LTC chain backend used by swaps",
+        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+
     // Add the hidden options
     argsman.AddHiddenArgs(hidden_args);
 }
