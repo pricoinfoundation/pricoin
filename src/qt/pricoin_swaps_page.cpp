@@ -1421,6 +1421,9 @@ void PricoinSwapsPage::onAdvanceClicked()
         QPlainTextEdit* btc_p   = nullptr;
         QPlainTextEdit* btc_s   = nullptr;
         QSpinBox*       btc_par = nullptr;
+        // Hoisted so the auto-coord finale below can click them (BTC legs).
+        QPushButton*    btc_claim_helper  = nullptr;
+        QPushButton*    btc_refund_helper = nullptr;
         if (!is_ltc) {
             btc_p   = AddBlobRow(form, tr("BTC claim pre-sig (64 bytes hex):"), &dlg, 50);
             btc_s   = AddBlobRow(form, tr("BTC claim session (133 bytes hex):"), &dlg, 60);
@@ -1429,12 +1432,17 @@ void PricoinSwapsPage::onAdvanceClicked()
             // dialog. On dialog close with a final sig, the three BTC-
             // claim form fields auto-fill — saves the user from manually
             // copy-pasting blob/session/parity back into this form.
-            auto* btc_claim_helper = new QPushButton(tr("Sign BTC claim adaptor… (cooperative)"), &dlg);
+            btc_claim_helper = new QPushButton(tr("Sign BTC claim adaptor… (cooperative)"), &dlg);
             QObject::connect(btc_claim_helper, &QPushButton::clicked, &dlg,
                 [this, &dlg, sid, btc_p, btc_s, btc_par]() {
                 CoopSignDialog d(m_model, CoopSignDialog::Mode::BtcAdaptor,
                                  tr("BTC claim adaptor pre-sig"), sid, &dlg);
-                d.exec();
+                // Headless auto-coord (same rationale as the PRIC helper):
+                // runHeadless() drives keyagg → nonce → partial → aggregate
+                // and exchanges pubnonce/partial with the peer over Nostr,
+                // without a modal that would freeze the main window.
+                d.setHeadlessMode(true);
+                d.runHeadless();
                 if (!d.finalSigHex().isEmpty()) {
                     btc_p->setPlainText(d.finalSigHex());
                     if (!d.sessionDataHex().isEmpty()) {
@@ -1470,12 +1478,13 @@ void PricoinSwapsPage::onAdvanceClicked()
             btc_r = AddBlobRow(form, tr("BTC refund sig (64 bytes hex):"), &dlg, 50);
             // Launcher for the BTC refund cooperative-signing dialog
             // (plain MuSig2, no adaptor).
-            auto* btc_refund_helper = new QPushButton(tr("Sign BTC refund sig… (cooperative)"), &dlg);
+            btc_refund_helper = new QPushButton(tr("Sign BTC refund sig… (cooperative)"), &dlg);
             QObject::connect(btc_refund_helper, &QPushButton::clicked, &dlg,
                 [this, &dlg, sid, btc_r]() {
                 CoopSignDialog d(m_model, CoopSignDialog::Mode::BtcPlain,
                                  tr("BTC refund cooperative sig"), sid, &dlg);
-                d.exec();
+                d.setHeadlessMode(true);
+                d.runHeadless();
                 if (!d.finalSigHex().isEmpty()) {
                     btc_r->setPlainText(d.finalSigHex());
                 }
@@ -1499,37 +1508,41 @@ void PricoinSwapsPage::onAdvanceClicked()
         form->addRow(QString(), pric_refund_helper);
         AddOkCancel(form, &dlg);
 
-        // Auto-coord finale: chain the two cooperative-sign sub-
-        // dialogs and the outer OK so the user doesn't have to
-        // click anything between BothFunded and PreSigned. Each
-        // sub-dialog auto-runs its own ceremony (Phase 1+2+3
-        // landed in PricCoopSignDialog) and auto-accepts on Step
-        // 4 success. Manual fallback: cancel any sub-dialog or
-        // the outer dialog to fall back to paste mode. LTC variant
-        // only — BTC variant (with MuSig2 BTC sigs) still goes
-        // through the manual path until that dialog auto-coord
-        // also lands.
-        if (is_ltc) {
+        // Auto-coord finale: chain the cooperative-sign sub-dialogs and
+        // the outer OK so the user doesn't click anything between
+        // BothFunded and PreSigned. Each sub-dialog auto-runs its own
+        // ceremony headless and auto-accepts on success. For BTC this
+        // now also drives the two BTC MuSig2 legs (claim adaptor +
+        // refund) — the 2026-06 BTC auto-coord port. LTC needs only the
+        // two PRIC legs (its foreign HTLC is unilateral, no MuSig2).
+        {
             // Headless: keep the outer "Set pre-signatures" dialog
             // off-screen too — combined with the inner dialogs being
             // headless, the entire ceremony runs invisibly. The user
-            // only sees the row-level state on the Swaps page advance
-            // through Cooperative-signing → PreSigned.
+            // only sees the Swaps row advance Cooperative-signing →
+            // PreSigned.
             //
-            // CRITICAL: don't use QDialog::exec() — it unconditionally
-            // sets Qt::WA_ShowModal which application-modals the
-            // dialog. Combined with WA_DontShowOnScreen, that makes
-            // the whole app appear frozen (close button dead, no
-            // clicks). We spin a local QEventLoop manually below and
-            // connect dlg.finished() → loop.quit() so blocking-the-
-            // caller semantics are preserved without the modal flag.
+            // CRITICAL: don't use QDialog::exec() — it sets WA_ShowModal
+            // which, with WA_DontShowOnScreen, freezes the whole app. We
+            // spin a local QEventLoop and connect finished() → quit().
             dlg.setAttribute(Qt::WA_DontShowOnScreen, true);
             dlg.setWindowModality(Qt::NonModal);
             dlg.setWindowFlag(Qt::Tool, true);
             dlg.setWindowFlag(Qt::FramelessWindowHint, true);
-            QMetaObject::invokeMethod(&dlg, [pric_claim_helper, pric_p,
+            QMetaObject::invokeMethod(&dlg, [btc_claim_helper, btc_p,
+                                              btc_refund_helper, btc_r,
+                                              pric_claim_helper, pric_p,
                                               pric_refund_helper, pric_r,
                                               &dlg]() {
+                // BTC legs first (present only for BTC swaps).
+                if (btc_claim_helper) {
+                    btc_claim_helper->click();
+                    if (btc_p->toPlainText().trimmed().isEmpty()) return;
+                }
+                if (btc_refund_helper) {
+                    btc_refund_helper->click();
+                    if (btc_r->toPlainText().trimmed().isEmpty()) return;
+                }
                 pric_claim_helper->click();
                 if (pric_p->toPlainText().trimmed().isEmpty()) return;
                 pric_refund_helper->click();
@@ -1543,10 +1556,6 @@ void PricoinSwapsPage::onAdvanceClicked()
             dlg.show();
             loop.exec();
             if (dlg.result() != QDialog::Accepted) return;
-        } else {
-            // BTC / non-auto-coord path — keep legacy modal dialog with
-            // visible UI so the user can paste fields manually.
-            if (dlg.exec() != QDialog::Accepted) return;
         }
         interfaces::Wallet::PricoinAdaptorSwapPreSigsHex ps;
         if (!is_ltc) {

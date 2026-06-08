@@ -20,6 +20,7 @@
 #include <QClipboard>
 #include <QComboBox>
 #include <QDialogButtonBox>
+#include <QEventLoop>
 #include <QFontDatabase>
 #include <QFormLayout>
 #include <QGroupBox>
@@ -120,6 +121,13 @@ CoopSignDialog::CoopSignDialog(WalletModel* wallet_model,
             }
             // Swap role — drives the canonical keyagg ordering in Step 1.
             m_swap_role = QString::fromStdString(snap->role);
+            // Map the swap role to the MuSig2 role label (only used to key
+            // the per-wallet nonce-reuse record, not the signature) so the
+            // headless path has a consistent value without user input.
+            if (m_in_role) {
+                if (m_swap_role == "alice")     m_in_role->setCurrentText("initiator");
+                else if (m_swap_role == "bob")  m_in_role->setCurrentText("responder");
+            }
             // My pubkey: take the wallet's BIP340 swap-identity x-only
             // and synthesise the 33-byte compressed (even-y) form by
             // prefixing 0x02. BIP327 keyagg accepts this; the parity
@@ -599,8 +607,15 @@ void CoopSignDialog::onStep2Compute()
     }
     const QString my_priv = m_in_my_priv->text().trimmed();
     const QString msg     = m_in_msg->text().trimmed();
-    if (my_priv.size() != 64 || msg.size() != 64) {
-        setStatus(tr("priv and msg must each be 32-byte (64-char) hex."), true);
+    // my_priv may be EMPTY: round1_safe/partial_sign then derive the
+    // wallet's swap-identity priv internally (headless path — no raw key
+    // is ever pasted). If supplied it must be a 32-byte hex.
+    if (msg.size() != 64) {
+        setStatus(tr("msg must be 32-byte (64-char) hex."), true);
+        return;
+    }
+    if (!my_priv.isEmpty() && my_priv.size() != 64) {
+        setStatus(tr("priv must be empty (use wallet swap-identity) or 32-byte hex."), true);
         return;
     }
     const QString role        = m_in_role->currentText();
@@ -893,6 +908,110 @@ void CoopSignDialog::onNostrRelayStatus(const QString& url, bool connected)
     else --m_relay_connected_count;
     if (m_relay_connected_count < 0) m_relay_connected_count = 0;
     updateNostrStatus();
+    // A relay just came up — flush any pending pubnonce/partial sends and
+    // generally re-drive the cascade.
+    if (connected) kickAutoCoord();
+}
+
+void CoopSignDialog::setHeadlessMode(bool on)
+{
+    m_headless = on;
+    // Off-screen but still in the local event loop, and explicitly
+    // non-modal so exec()'s loop doesn't freeze the main window (same
+    // rationale as PricCoopSignDialog::setHeadlessMode).
+    setAttribute(Qt::WA_DontShowOnScreen, on);
+    if (on) {
+        setWindowModality(Qt::NonModal);
+        setWindowFlag(Qt::Tool, true);
+        setWindowFlag(Qt::FramelessWindowHint, true);
+        // The cascade advances on peer DMs, which only auto-paste when
+        // this is checked.
+        if (m_chk_auto_paste) m_chk_auto_paste->setChecked(true);
+    }
+}
+
+void CoopSignDialog::runHeadless()
+{
+    setHeadlessMode(true);
+    show();
+    // Bring up the DM transport so pubnonce/partial exchange can flow.
+    if (m_nostr == nullptr || m_relay_connected_count == 0) {
+        onNostrConnectClicked();
+    }
+    QEventLoop loop;
+    connect(this, &QDialog::finished, &loop, &QEventLoop::quit);
+    // Kick after the loop is running so the first synchronous steps
+    // (keyagg → sighash → nonce → send pubnonce) execute, then we idle
+    // until the peer's DMs drive the rest.
+    QMetaObject::invokeMethod(this, [this]{ kickAutoCoord(); }, Qt::QueuedConnection);
+    loop.exec();
+}
+
+void CoopSignDialog::kickAutoCoord()
+{
+    if (!m_headless) return;
+
+    // 1. Keyagg (canonical [alice,bob] order, set in onStep1Compute).
+    if (!m_auto_step1_fired
+        && m_in_my_pub   && m_in_my_pub->text().trimmed().size() == 66
+        && m_in_peer_pub && m_in_peer_pub->text().trimmed().size() == 66) {
+        m_auto_step1_fired = true;
+        onStep1Compute();
+        if (m_agg_xonly.isEmpty()) { m_auto_step1_fired = false; return; }
+    }
+
+    // 2. Compute the sighash → msg (only if not already populated).
+    if (!m_agg_xonly.isEmpty() && !m_auto_sighash_fired
+        && m_in_msg && m_in_msg->text().trimmed().isEmpty()) {
+        m_auto_sighash_fired = true;
+        onComputeSighash();
+        if (m_in_msg->text().trimmed().size() != 64) m_auto_sighash_fired = false;
+    }
+
+    // 3. Round-1 nonce (my_priv left empty → wallet-derived).
+    if (!m_auto_step2_fired && !m_agg_xonly.isEmpty()
+        && m_in_msg && m_in_msg->text().trimmed().size() == 64) {
+        m_auto_step2_fired = true;
+        onStep2Compute();
+        if (m_my_pubnonce.isEmpty()) { m_auto_step2_fired = false; return; }
+    }
+
+    // 4. Send my pubnonce to the peer.
+    if (!m_auto_pn_sent && !m_my_pubnonce.isEmpty()
+        && m_nostr && m_relay_connected_count > 0 && !m_peer_xonly.isEmpty()) {
+        m_auto_pn_sent = true;
+        onSendDmRound2();
+    }
+
+    // 5. Combine + my partial (needs the peer's pubnonce).
+    if (!m_auto_step3_fired && !m_my_pubnonce.isEmpty()
+        && m_in_peer_pubnonce
+        && m_in_peer_pubnonce->toPlainText().trimmed().size() == 132) {
+        m_auto_step3_fired = true;
+        onStep3Compute();
+        if (m_my_partial.isEmpty()) { m_auto_step3_fired = false; return; }
+    }
+
+    // 6. Send my partial to the peer.
+    if (!m_auto_partial_sent && !m_my_partial.isEmpty()
+        && m_nostr && m_relay_connected_count > 0 && !m_peer_xonly.isEmpty()) {
+        m_auto_partial_sent = true;
+        onSendDmRound3();
+    }
+
+    // 7. Aggregate → final (pre-)sig (needs the peer's partial). This runs
+    // the partial-verify gate; on success we accept() to end runHeadless().
+    if (!m_auto_step4_fired && !m_my_partial.isEmpty()
+        && m_in_peer_partial
+        && m_in_peer_partial->toPlainText().trimmed().size() == 64) {
+        m_auto_step4_fired = true;
+        onStep4Compute();
+        if (!m_final_sig_hex.isEmpty()) {
+            QMetaObject::invokeMethod(this, [this]{ accept(); }, Qt::QueuedConnection);
+        } else {
+            m_auto_step4_fired = false;  // verify failed / error — allow retry
+        }
+    }
 }
 
 void CoopSignDialog::onNostrLog(const QString& msg)
@@ -1010,10 +1129,15 @@ void CoopSignDialog::onDmReceived(const QString& from_xonly_hex,
     if (round == 2 && env.exists("pubnonce") && m_in_peer_pubnonce) {
         m_in_peer_pubnonce->setPlainText(
             QString::fromStdString(env["pubnonce"].get_str()));
-        setStatus(tr("Peer pubnonce auto-pasted from DM. Run step 3."));
+        setStatus(m_headless ? tr("Peer pubnonce received — auto-advancing.")
+                             : tr("Peer pubnonce auto-pasted from DM. Run step 3."));
     } else if (round == 3 && env.exists("partial") && m_in_peer_partial) {
         m_in_peer_partial->setPlainText(
             QString::fromStdString(env["partial"].get_str()));
-        setStatus(tr("Peer partial auto-pasted from DM. Run step 4."));
+        setStatus(m_headless ? tr("Peer partial received — auto-advancing.")
+                             : tr("Peer partial auto-pasted from DM. Run step 4."));
     }
+    // Headless: a peer DM just landed — advance the cascade (combine on
+    // pubnonce, aggregate on partial).
+    kickAutoCoord();
 }

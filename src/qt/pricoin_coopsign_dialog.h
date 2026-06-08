@@ -93,6 +93,17 @@ public:
     // pre-sig so the t-holder can call _adapt later).
     QString sessionDataHex() const { return m_session_data; }
 
+    // ─── Headless auto-coordination (mirrors PricCoopSignDialog) ───
+    // setHeadlessMode(true) keeps the dialog off-screen + non-modal;
+    // runHeadless() shows it, kicks the auto-coord cascade, and spins a
+    // local event loop until the ceremony completes (accept) or fails
+    // (reject). The cascade auto-fires each step as its inputs become
+    // available, auto-sends pubnonce/partial to the peer over Nostr, and
+    // auto-advances on the peer's DMs — the BTC equivalent of the LTC
+    // auto-coord that made PRIC swaps hands-free.
+    void setHeadlessMode(bool on);
+    void runHeadless();
+
 private Q_SLOTS:
     void onStep1Compute();
     void onStep2Compute();
@@ -194,6 +205,21 @@ private:
     void buildLayout(const QString& title);
     void setStatus(const QString& msg, bool error = false);
     void updateNostrStatus();
+
+    // ─── Headless auto-coord state ───
+    bool m_headless{false};
+    bool m_auto_step1_fired{false};   // keyagg
+    bool m_auto_sighash_fired{false}; // compute sighash → msg
+    bool m_auto_step2_fired{false};   // round-1 nonce
+    bool m_auto_pn_sent{false};       // pubnonce DM sent
+    bool m_auto_step3_fired{false};   // combine + my partial
+    bool m_auto_partial_sent{false};  // partial DM sent
+    bool m_auto_step4_fired{false};   // aggregate → final (pre-)sig
+    // Linear pass through the steps; each fires once its inputs are
+    // present. Idempotent + re-entrant: safe to call from the DM handler,
+    // relay-reconnect, and each step's tail. Resets a step's fired flag
+    // on failure so a later trigger retries.
+    void kickAutoCoord();
 
     // RPC dispatch helper. Returns the parsed UniValue result on
     // success; on RPC error, surfaces a message via setStatus and
