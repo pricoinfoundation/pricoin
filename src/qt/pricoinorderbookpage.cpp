@@ -197,7 +197,7 @@ public:
         // is similar regardless of chain.
         constexpr int64_t kMinPricSat = 100'000'000;          // 1 PRIC
         const int64_t min_foreign_sat = [&]() -> int64_t {
-            if (out.foreign_chain == "btc")     return    50'000;  // 0.0005 BTC
+            if (out.foreign_chain == "btc")     return     5'000;  // 0.00005 BTC
             if (out.foreign_chain == "ltc")     return   500'000;  // 0.005 LTC
             if (out.foreign_chain == "regtest") return         1;  // tests
             return                                          50'000;
