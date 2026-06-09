@@ -11,6 +11,7 @@
 #include <qt/walletmodel.h>
 #include <random.h>
 #include <univalue.h>
+#include <logging.h>
 #include <util/result.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
@@ -145,11 +146,19 @@ CoopSignDialog::CoopSignDialog(WalletModel* wallet_model,
             // helper rows once they exist (built later in
             // buildLayout). Done after the layout is up via a
             // single-shot timer-style assignment.
-            if (m_in_funding_txid && !snap->foreign_funding_txid.empty()) {
-                m_in_funding_txid->setText(QString::fromStdString(snap->foreign_funding_txid));
+            // Prefer the PRE-FUNDING planned outpoint (set at AdaptorReady
+            // before broadcast — presigs-before-funding) so the ceremony
+            // can build its sighash; fall back to the post-broadcast
+            // foreign_funding_txid once it exists.
+            const std::string fund_txid = !snap->btc_funding_planned_txid.empty()
+                ? snap->btc_funding_planned_txid : snap->foreign_funding_txid;
+            const int fund_vout = !snap->btc_funding_planned_txid.empty()
+                ? snap->btc_funding_planned_vout : snap->foreign_funding_vout;
+            if (m_in_funding_txid && !fund_txid.empty()) {
+                m_in_funding_txid->setText(QString::fromStdString(fund_txid));
             }
-            if (m_in_funding_vout && snap->foreign_funding_vout >= 0) {
-                m_in_funding_vout->setText(QString::number(snap->foreign_funding_vout));
+            if (m_in_funding_vout && fund_vout >= 0) {
+                m_in_funding_vout->setText(QString::number(fund_vout));
             }
             if (m_in_funding_amount && snap->foreign_amount_sat > 0) {
                 m_in_funding_amount->setText(QString::number(snap->foreign_amount_sat));
@@ -247,6 +256,19 @@ void CoopSignDialog::onComputeSighash()
                 /*error=*/false);
         }
     }
+    // BTC claim: persist the unsigned claim tx so adapt_btc_claim finalizes
+    // THIS exact tx (the one the pre-sig is bound to) instead of rebuilding
+    // — drift-proof. Mirrors the refund persistence above.
+    if (m_mode == Mode::BtcAdaptor && m_wm && !m_swap_id.isEmpty()
+        && !m_unsigned_tx_hex.isEmpty()) {
+        auto rc = m_wm->wallet().adaptorSwapSetBtcClaimTx(
+            m_swap_id.toStdString(), m_unsigned_tx_hex.toStdString());
+        if (!rc) {
+            setStatus(tr("Sighash OK; persisting BTC claim tx failed: %1")
+                .arg(QString::fromStdString(util::ErrorString(rc).original)),
+                /*error=*/false);
+        }
+    }
 }
 
 QString CoopSignDialog::RandomHex32()
@@ -293,6 +315,13 @@ CoopSignDialog::callRpc(const std::string& method, const std::string& params_jso
 
 void CoopSignDialog::setStatus(const QString& msg, bool error)
 {
+    // Headless: the status widget is off-screen, so mirror to debug.log
+    // — otherwise a stalled BTC ceremony is completely invisible.
+    if (m_headless) {
+        const char* leg = m_mode == Mode::BtcAdaptor ? "claim" : "refund";
+        if (error) LogWarning("Pricoin btc-coopsign[%s]: %s", leg, msg.toStdString());
+        else       LogInfo   ("Pricoin btc-coopsign[%s]: %s", leg, msg.toStdString());
+    }
     if (!m_status_label) return;
     m_status_label->setStyleSheet(error
         ? QStringLiteral("QLabel { color: #b71c1c; }")

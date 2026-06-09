@@ -134,6 +134,7 @@ private:
     // (set by the wallet's tx-scan extractor when Bob's PRIC claim
     // hit chain). Used by the pric_claimed auto-trigger.
     bool autoLtcClaim(const std::string& swap_id);
+    bool autoBtcClaim(const std::string& swap_id);
 };
 
 #endif // BITCOIN_QT_PRICOIN_SWAPS_PAGE_H

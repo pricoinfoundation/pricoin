@@ -7658,6 +7658,81 @@ RPCMethod pricoin_btc_getbalance()
     };
 }
 
+RPCMethod pricoin_btc_prebuild_funding()
+{
+    return RPCMethod{
+        "pricoin_btc_prebuild_funding",
+        "Pre-build (but DO NOT broadcast) Bob's BTC P2TR 2-of-2 funding tx for\n"
+        "an in-flight swap, so its outpoint is known to the cooperative claim/\n"
+        "refund MuSig2 ceremonies BEFORE funding (presigs-before-funding). The\n"
+        "signed tx + planned outpoint are persisted on the swap record; the\n"
+        "funding step later broadcasts the stored tx. Bob-only, BTC-only. DM\n"
+        "the returned {txid, vout} to the counterparty so both ceremonies\n"
+        "sign over the same funding output.\n",
+        {
+            {"swap_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
+            {"fee_sat", RPCArg::Type::NUM, RPCArg::Default{1000}, "Flat fee in sats"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "txid",      "Planned funding txid"},
+                {RPCResult::Type::NUM,     "vout",      "Funding output index (0)"},
+                {RPCResult::Type::STR_HEX, "agg_xonly", "32-byte MuSig2 aggregate x-only (the 2-of-2 funding key)"},
+                {RPCResult::Type::STR_HEX, "tx_hex",    "Signed funding tx (held until the funding step)"},
+            }
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_prebuild_funding", "<swap_id> 1000")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            CWallet& wallet = *wallet_sp;
+            const uint256 sid = ParseChainWatchSwapId(request.params[0]);
+            const int64_t fee_sat = request.params[1].isNull() ? 1000
+                : request.params[1].getInt<int64_t>();
+
+            aas::AdaptorSwap snap;
+            if (aas::Get(wallet, sid, snap) != aas::LookupResult::Ok) {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "swap not found");
+            }
+            if (snap.foreign_chain != "btc") {
+                throw JSONRPCError(RPC_INVALID_REQUEST, "pre-build funding is BTC-only");
+            }
+            if (snap.role != aas::Role::Bob) {
+                throw JSONRPCError(RPC_INVALID_REQUEST,
+                    "BTC funding is Bob's leg (the PRIC buyer funds BTC)");
+            }
+            auto key = ::wallet::pricoin_swap_session::GetSwapIdentityKey(wallet);
+            if (!key) throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "swap identity unavailable");
+            const CPubKey my_swap_pub = key->GetPubKey();
+            const CPubKey peer_pub(snap.counterparty_pub);
+            // Canonical MuSig2 keyagg order [alice_pub, bob_pub] — must match
+            // the dialog ceremony and adapt_btc_claim. Bob is local here.
+            std::vector<CPubKey> pubs{peer_pub /*alice*/, my_swap_pub /*bob*/};
+            bma::KeyAggCache cache;
+            auto agg = bma::AggregatePubkeys(pubs, cache);
+            if (!agg) throw JSONRPCError(RPC_INTERNAL_ERROR, "MuSig2 keyagg failed");
+
+            auto built = pbh::BuildFundingTx(wallet, snap.foreign_chain, *agg,
+                                             snap.foreign_amount_sat, fee_sat);
+            if (!built) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(built).original);
+
+            const auto sr = aas::SetBtcFundingPlanned(
+                wallet, sid, built->signed_tx_hex, built->txid,
+                static_cast<int32_t>(built->vout));
+            if (sr != aas::TransitionResult::Ok) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                    "failed to persist planned BTC funding (wrong state / conflicting re-build?)");
+            }
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("txid", built->txid);
+            out.pushKV("vout", static_cast<int>(built->vout));
+            out.pushKV("agg_xonly", HexStr(*agg));
+            out.pushKV("tx_hex", built->signed_tx_hex);
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_btc_fund_swap()
 {
     return RPCMethod{
@@ -7758,8 +7833,27 @@ RPCMethod pricoin_btc_fund_swap()
                 if (!txid_or) throw JSONRPCError(RPC_WALLET_ERROR,
                     util::ErrorString(txid_or).original);
                 txid = *txid_or;
+            } else if (!snap.btc_funding_unsigned_tx_hex.empty()) {
+                // ─── BTC pre-built funding (presigs-before-funding) ──
+                // A funding tx was pre-built + persisted at AdaptorReady
+                // and the cooperative presigs are bound to its outpoint —
+                // so broadcast THAT exact tx. Building a fresh one (the
+                // branch below) would pick a different UTXO → different
+                // txid → the presigs would no longer apply.
+                auto backend = pcw::MakeForeignClientFromRegistry(snap.foreign_chain);
+                if (!backend) {
+                    throw JSONRPCError(RPC_INVALID_REQUEST,
+                        "no foreign-chain backend registered for '" + snap.foreign_chain + "'");
+                }
+                try {
+                    txid = backend->Broadcast(snap.btc_funding_unsigned_tx_hex);
+                } catch (const std::exception& e) {
+                    throw JSONRPCError(RPC_WALLET_ERROR,
+                        std::string("pre-built BTC funding broadcast failed: ") + e.what());
+                }
             } else {
-                // ─── BTC P2TR cooperative funding (existing) ──────
+                // ─── BTC P2TR cooperative funding (legacy build+broadcast,
+                // for swaps with no pre-built tx) ──────
                 std::vector<CPubKey> pubs;
                 pubs.push_back(i_am_alice ? my_swap_pub : peer_pub);
                 pubs.push_back(i_am_alice ? peer_pub   : my_swap_pub);
@@ -8817,8 +8911,11 @@ RPCMethod pricoin_swapwatch_adapt_btc_claim()
         "watch_registered}.\n",
         {
             {"swap_id",            RPCArg::Type::STR_HEX, RPCArg::Optional::NO, ""},
-            {"t_hex",              RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
-                "32-byte adaptor secret t — must satisfy t·G == swap.adaptor.T_G"},
+            {"t_hex",              RPCArg::Type::STR_HEX, RPCArg::Default{""},
+                "32-byte adaptor secret t (must satisfy t·G == swap.adaptor.T_G). "
+                "If omitted/empty, the wallet's stored t_secret is used (Alice's "
+                "tx-scan extracts it from the counterparty's on-chain PRIC claim) "
+                "— this is what autoBtcClaim relies on."},
             {"refund_amount_sat",  RPCArg::Type::NUM,     RPCArg::Default{0},
                 "Output amount; if 0 defaults to (foreign_amount_sat - 1000) for fees."},
             {"min_confirmations",  RPCArg::Type::NUM,     RPCArg::Default{1}, ""},
@@ -8838,7 +8935,7 @@ RPCMethod pricoin_swapwatch_adapt_btc_claim()
             if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
             CWallet& wallet = *wallet_sp;
             const uint256 sid = ParseChainWatchSwapId(request.params[0]);
-            const std::string t_hex = request.params[1].get_str();
+            const std::string t_hex = request.params[1].isNull() ? "" : request.params[1].get_str();
             const int64_t  refund_arg = request.params[2].isNull() ? 0
                 : request.params[2].getInt<int64_t>();
             const int32_t min_conf = request.params[3].isNull() ? 1
@@ -8869,13 +8966,25 @@ RPCMethod pricoin_swapwatch_adapt_btc_claim()
                     "btc_bob_recipient_xonly not set on swap record (BTC claim recipient)");
             }
 
-            // ─── Parse t and validate length ─────────────────────
-            auto t_bytes = TryParseHex<unsigned char>(t_hex);
-            if (!t_bytes || t_bytes->size() != 32) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "t_hex must be 32-byte hex");
-            }
+            // ─── Resolve t: explicit param, else the wallet's stored
+            // t_secret (Alice's tx-scan persists it when the
+            // counterparty's PRIC claim confirms). ───
             bma::Scalar t;
-            std::copy(t_bytes->begin(), t_bytes->end(), t.begin());
+            if (t_hex.empty()) {
+                if (!snap.has_t) {
+                    throw JSONRPCError(RPC_INVALID_REQUEST,
+                        "no t_hex supplied and no t_secret on record — run "
+                        "pricoin_swapwatch_extract_pric_t after the counterparty's "
+                        "PRIC claim confirms, or pass t_hex explicitly");
+                }
+                std::copy(snap.t_secret.begin(), snap.t_secret.end(), t.begin());
+            } else {
+                auto t_bytes = TryParseHex<unsigned char>(t_hex);
+                if (!t_bytes || t_bytes->size() != 32) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "t_hex must be 32-byte hex");
+                }
+                std::copy(t_bytes->begin(), t_bytes->end(), t.begin());
+            }
 
             // ─── Compute agg_xonly = MuSig2 keyagg(alice_pub, bob_pub) ───
             // Order is role-determined: [alice_pub, bob_pub]. My
@@ -8963,14 +9072,43 @@ RPCMethod pricoin_swapwatch_adapt_btc_claim()
                 "Adapt failed — check t·G == T_G and parity");
 
             // ─── Finalize witness + serialize ────────────────────
-            auto finalized = brt::Finalize(*built,
-                std::span<const unsigned char>{final_sig->data(), final_sig->size()});
-            if (!finalized) throw JSONRPCError(RPC_INTERNAL_ERROR,
-                "Finalize failed");
-            DataStream ds;
-            ds << TX_WITH_WITNESS(*finalized);
-            const std::string tx_hex_finalized = HexStr(
-                std::span<const unsigned char>{UCharCast(ds.data()), ds.size()});
+            // Prefer the EXACT unsigned claim tx persisted at presign time
+            // (the one the pre-sig is bound to) — attach the adapted sig as
+            // the input-0 witness. Drift-proof vs. the rebuilt skeleton.
+            // Falls back to the freshly-built tx for swaps that predate the
+            // persisted-claim-tx field.
+            std::string tx_hex_finalized;
+            if (!snap.btc_claim_unsigned_tx_hex.empty()) {
+                auto tx_bytes = TryParseHex<unsigned char>(snap.btc_claim_unsigned_tx_hex);
+                if (!tx_bytes) throw JSONRPCError(RPC_INTERNAL_ERROR,
+                    "stored btc_claim_unsigned_tx_hex is not hex");
+                CMutableTransaction mtx;
+                try {
+                    DataStream ids{std::span<const unsigned char>{*tx_bytes}};
+                    ids >> TX_WITH_WITNESS(mtx);
+                } catch (const std::exception&) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR,
+                        "stored btc_claim_unsigned_tx_hex did not parse as a tx");
+                }
+                if (mtx.vin.empty()) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "stored claim tx has no inputs");
+                }
+                mtx.vin[0].scriptWitness.stack.clear();
+                mtx.vin[0].scriptWitness.stack.emplace_back(
+                    final_sig->begin(), final_sig->end());
+                DataStream ds;
+                ds << TX_WITH_WITNESS(CTransaction{mtx});
+                tx_hex_finalized = HexStr(
+                    std::span<const unsigned char>{UCharCast(ds.data()), ds.size()});
+            } else {
+                auto finalized = brt::Finalize(*built,
+                    std::span<const unsigned char>{final_sig->data(), final_sig->size()});
+                if (!finalized) throw JSONRPCError(RPC_INTERNAL_ERROR, "Finalize failed");
+                DataStream ds;
+                ds << TX_WITH_WITNESS(*finalized);
+                tx_hex_finalized = HexStr(
+                    std::span<const unsigned char>{UCharCast(ds.data()), ds.size()});
+            }
 
             // ─── Broadcast via foreign client ────────────────────
             auto client = pcw::MakeForeignClientFromRegistry(snap.foreign_chain);
@@ -9294,6 +9432,7 @@ RPCMethod pricoin_swap_recover_refund_singlesig_export() { return pricoin_swap_r
 RPCMethod pricoin_btc_getaddress_export()               { return pricoin_btc_getaddress(); }
 RPCMethod pricoin_btc_getbalance_export()               { return pricoin_btc_getbalance(); }
 RPCMethod pricoin_btc_fund_swap_export()                { return pricoin_btc_fund_swap(); }
+RPCMethod pricoin_btc_prebuild_funding_export()         { return pricoin_btc_prebuild_funding(); }
 RPCMethod pricoin_btc_sweep_export()                    { return pricoin_btc_sweep(); }
 RPCMethod pricoin_ltc_claim_swap_export()               { return pricoin_ltc_claim_swap(); }
 RPCMethod pricoin_ltc_refund_swap_export()              { return pricoin_ltc_refund_swap(); }

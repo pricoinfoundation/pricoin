@@ -95,6 +95,26 @@ util::Result<std::string> GetAddress(::wallet::CWallet& wallet,
 // (LTC doesn't support the 2-of-2 P2TR funding output that this RPC
 // produces — for LTC we'd build a 2-of-2 P2WSH instead, which has
 // different scriptPubKey + sighash semantics).
+// Result of building (but NOT broadcasting) a swap funding tx. Used by
+// the pre-built-funding flow so the funding outpoint is known to the
+// cooperative ceremonies before the tx is broadcast.
+struct FundingBuild {
+    std::string signed_tx_hex;  // fully signed, ready to broadcast
+    std::string txid;           // funding txid (display hex)
+    uint32_t    vout{0};        // 2-of-2 funding output index (always 0)
+};
+
+// Build + sign (but DO NOT broadcast) the BTC P2TR 2-of-2 funding tx.
+// Same selection/build/sign as BuildAndBroadcastFundingTx, minus the
+// broadcast — the caller holds the signed hex until the cooperative
+// ceremony completes, then broadcasts it.
+util::Result<FundingBuild> BuildFundingTx(
+    ::wallet::CWallet& wallet,
+    const std::string& chain,
+    const std::array<unsigned char, 32>& agg_xonly,
+    int64_t amount_sat,
+    int64_t fee_sat);
+
 util::Result<std::string> BuildAndBroadcastFundingTx(
     ::wallet::CWallet& wallet,
     const std::string& chain,

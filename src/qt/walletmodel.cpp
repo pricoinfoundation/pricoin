@@ -660,6 +660,18 @@ void WalletModel::onAutoSwapwatchDM(const QString& from_xonly_hex,
         const std::string txid = env["txid"].get_str();
         if (txid.size() != 64) return;
         const int32_t vout = env.exists("vout") ? env["vout"].getInt<int32_t>() : -1;
+        // BTC pre-built funding outpoint: Bob (the funder) DMs Alice the
+        // planned funding txid:vout so her BTC claim/refund ceremonies sign
+        // over the same output BEFORE it's broadcast. Alice persists just
+        // the outpoint (the signed tx is Bob's to broadcast). BTC + Alice
+        // only — LTC never sends this kind, so LTC is unaffected.
+        if (kind == "btc_funding_planned") {
+            if (snap->role == "alice" && snap->foreign_chain == "btc" && vout >= 0) {
+                wallet().adaptorSwapSetBtcFundingPlanned(
+                    swap_id, /*signed_tx_hex=*/"", txid, vout);
+            }
+            return;
+        }
         const int32_t min_conf = env.exists("min_confirmations")
             ? env["min_confirmations"].getInt<int32_t>() : 1;
         UniValue params{UniValue::VARR};

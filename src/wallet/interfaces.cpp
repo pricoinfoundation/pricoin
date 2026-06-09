@@ -554,6 +554,9 @@ public:
         o.has_btc_refund_presig  = (s.presigs.btc_refund_sig.size() == 64);
         o.pric_funding_unsigned_tx_hex = s.pric_funding_unsigned_tx_hex;
         o.pric_funding_planned_vout    = s.pric_funding_planned_vout;
+        o.btc_funding_unsigned_tx_hex  = s.btc_funding_unsigned_tx_hex;
+        o.btc_funding_planned_txid     = s.btc_funding_planned_txid;
+        o.btc_funding_planned_vout     = s.btc_funding_planned_vout;
         return o;
     }
 
@@ -761,6 +764,17 @@ public:
         return WrapTransition(r, this, *sid);
     }
 
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetBtcClaimTx(
+        const std::string& swap_id,
+        const std::string& unsigned_tx_hex) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        auto r = ::wallet::pricoin_adaptor_swap::SetBtcClaimTx(
+            *m_wallet, *sid, unsigned_tx_hex);
+        return WrapTransition(r, this, *sid);
+    }
+
     util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPricFundingPlanned(
         const std::string& swap_id,
         const std::string& unsigned_tx_hex,
@@ -770,6 +784,19 @@ public:
         if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
         auto r = ::wallet::pricoin_adaptor_swap::SetPricFundingPlanned(
             *m_wallet, *sid, unsigned_tx_hex, planned_vout);
+        return WrapTransition(r, this, *sid);
+    }
+
+    util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetBtcFundingPlanned(
+        const std::string& swap_id,
+        const std::string& signed_tx_hex,
+        const std::string& planned_txid_hex,
+        int32_t planned_vout) override
+    {
+        auto sid = uint256::FromHex(swap_id);
+        if (!sid) return util::Error{Untranslated("swap_id must be 32-byte hex")};
+        auto r = ::wallet::pricoin_adaptor_swap::SetBtcFundingPlanned(
+            *m_wallet, *sid, signed_tx_hex, planned_txid_hex, planned_vout);
         return WrapTransition(r, this, *sid);
     }
 

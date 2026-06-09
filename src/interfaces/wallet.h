@@ -357,6 +357,11 @@ public:
         // on-chain pric_funding_txid_hex is authoritative).
         std::string pric_funding_unsigned_tx_hex;
         int32_t     pric_funding_planned_vout{-1};
+        // BTC pre-built funding (Bob's signed funding tx + the planned
+        // outpoint both ceremonies sign over). Empty for LTC swaps.
+        std::string btc_funding_unsigned_tx_hex;
+        std::string btc_funding_planned_txid;
+        int32_t     btc_funding_planned_vout{-1};
     };
 
     struct PricoinAdaptorSwapCreateParams {
@@ -443,6 +448,13 @@ public:
         const std::string& swap_id,
         const std::string& unsigned_tx_hex) = 0;
 
+    // Persist the exact unsigned BTC claim tx the claim pre-sig was bound
+    // to, so adapt finalizes that tx rather than rebuilding. Mirrors
+    // adaptorSwapSetBtcRefundTx.
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetBtcClaimTx(
+        const std::string& swap_id,
+        const std::string& unsigned_tx_hex) = 0;
+
     // Pin Alice's pre-built but not-yet-broadcast PRIC funding tx hex
     // and the planned recipient_vout. Captured at AdaptorReady time
     // before cooperative presigs are gathered. Idempotent on equal
@@ -450,6 +462,14 @@ public:
     virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetPricFundingPlanned(
         const std::string& swap_id,
         const std::string& unsigned_tx_hex,
+        int32_t planned_vout) = 0;
+
+    // BTC analogue: pin the planned BTC funding outpoint (and, for the
+    // funder, the signed funding tx). Alice passes an empty signed hex.
+    virtual util::Result<PricoinAdaptorSwapSnapshot> adaptorSwapSetBtcFundingPlanned(
+        const std::string& swap_id,
+        const std::string& signed_tx_hex,
+        const std::string& planned_txid_hex,
         int32_t planned_vout) = 0;
 
     // Cooperative-sign session legs. Mirror of pricoin_adaptor_swap::CoopsignLeg.

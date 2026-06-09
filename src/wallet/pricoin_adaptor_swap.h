@@ -297,6 +297,12 @@ struct AdaptorSwap {
     // Empty for LTC swaps (LTC uses unilateral CLTV path) and for
     // BTC swaps that haven't reached PreSigned yet.
     std::string btc_refund_unsigned_tx_hex;
+    // The exact unsigned BTC claim tx skeleton the claim adaptor pre-sig
+    // was bound to (persisted at presign time). adapt_btc_claim finalizes
+    // THIS tx with the adapted sig rather than rebuilding, so the sig is
+    // guaranteed to land on the tx it signed over (drift-proof). Empty for
+    // LTC swaps and pre-PreSigned BTC swaps.
+    std::string btc_claim_unsigned_tx_hex;
 
     // PRIC funding unsigned-but-signed tx hex, captured by Alice's
     // wallet at AdaptorReady time when the protocol pre-builds the
@@ -315,6 +321,18 @@ struct AdaptorSwap {
     // time, so the vout is only known after the build. Persisted so
     // the dialog + watcher know where to look.
     int32_t     pric_funding_planned_vout{-1};
+
+    // BTC pre-built funding (appended 2026-06-09) — the BTC analogue of
+    // the PRIC pre-built funding above. Because presigs are gathered
+    // BEFORE funding, the BTC claim/refund MuSig2 ceremonies need the BTC
+    // funding outpoint to exist already. Bob pre-builds + signs his BTC
+    // P2TR 2-of-2 funding tx at AdaptorReady (without broadcasting), and
+    // DMs the planned outpoint to Alice so BOTH ceremonies sign over the
+    // same tx. btc_funding_unsigned_tx_hex is fully signed and broadcast
+    // at the funding step. All empty for LTC swaps.
+    std::string btc_funding_unsigned_tx_hex;
+    std::string btc_funding_planned_txid;
+    int32_t     btc_funding_planned_vout{-1};
 
     // Cooperative-sign session state, persisted across dialog closes
     // so the user can quit/reopen mid-ceremony without losing alpha,
@@ -464,6 +482,18 @@ struct AdaptorSwap {
         READWRITE(obj.pric_claim_msg_hex);
         READWRITE(obj.pric_claim_pi);
         READWRITE(obj.pric_claim_unsigned_tx_hex);
+
+        // BTC pre-built funding (appended 2026-06-09). Same experimental/
+        // regtest-scope caveat as prior appends — pre-format records fail
+        // to deserialize (purge via wallet reset). Empty for LTC swaps, so
+        // LTC behaviour is unaffected.
+        READWRITE(obj.btc_funding_unsigned_tx_hex);
+        READWRITE(obj.btc_funding_planned_txid);
+        READWRITE(obj.btc_funding_planned_vout);
+
+        // Canonical BTC claim tx skeleton (appended 2026-06-09). Same
+        // experimental/regtest-scope caveat as prior appends.
+        READWRITE(obj.btc_claim_unsigned_tx_hex);
     }
 };
 
@@ -663,6 +693,15 @@ TransitionResult SetBtcRefundTx(
     const uint256& swap_id,
     const std::string& unsigned_tx_hex);
 
+// Persist the exact unsigned BTC claim tx skeleton the claim adaptor
+// pre-sig was bound to (at sighash-compute time, BtcAdaptor mode), so
+// adapt_btc_claim finalizes that tx rather than rebuilding. Mirrors
+// SetBtcRefundTx.
+TransitionResult SetBtcClaimTx(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::string& unsigned_tx_hex);
+
 // Pin Alice's pre-built (but not yet broadcast) PRIC funding tx
 // hex + the planned recipient_vout for the joint stealth output.
 // Captured by Alice's wallet right after walletsendct_ring(broadcast=false)
@@ -676,6 +715,16 @@ TransitionResult SetPricFundingPlanned(
     CWallet& wallet,
     const uint256& swap_id,
     const std::string& unsigned_tx_hex,
+    int32_t planned_vout);
+
+// BTC analogue: persist Bob's pre-built+signed BTC funding tx + the
+// planned outpoint so the cooperative ceremonies sign over it before
+// broadcast. BTC-only (rejects non-BTC swaps).
+TransitionResult SetBtcFundingPlanned(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::string& signed_tx_hex,
+    const std::string& planned_txid_hex,
     int32_t planned_vout);
 
 // Cooperative-sign session legs. Selects which per-leg session JSON

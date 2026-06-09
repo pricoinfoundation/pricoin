@@ -238,7 +238,7 @@ GetBalance(::wallet::CWallet& wallet, const std::string& chain)
     }
 }
 
-util::Result<std::string> BuildAndBroadcastFundingTx(
+util::Result<FundingBuild> BuildFundingTx(
     ::wallet::CWallet& wallet,
     const std::string& chain,
     const std::array<unsigned char, 32>& agg_xonly,
@@ -361,13 +361,34 @@ util::Result<std::string> BuildAndBroadcastFundingTx(
     mtx.vin[0].scriptWitness.stack.clear();
     mtx.vin[0].scriptWitness.stack.emplace_back(sig.begin(), sig.end());
 
-    // Serialize + broadcast.
+    // Serialize the fully-signed tx. The caller decides whether/when to
+    // broadcast — the pre-built-funding flow holds it until the
+    // cooperative ceremony has the presigs bound to this funding outpoint.
     DataStream ds;
     ds << TX_WITH_WITNESS(CTransaction{mtx});
-    const std::string tx_hex = HexStr(std::span<const unsigned char>{
+    FundingBuild out;
+    out.signed_tx_hex = HexStr(std::span<const unsigned char>{
         UCharCast(ds.data()), ds.size()});
+    out.txid = CTransaction{mtx}.GetHash().ToString();
+    out.vout = 0;
+    return out;
+}
+
+util::Result<std::string> BuildAndBroadcastFundingTx(
+    ::wallet::CWallet& wallet,
+    const std::string& chain,
+    const std::array<unsigned char, 32>& agg_xonly,
+    int64_t amount_sat,
+    int64_t fee_sat)
+{
+    auto built = BuildFundingTx(wallet, chain, agg_xonly, amount_sat, fee_sat);
+    if (!built) return util::Error{util::ErrorString(built)};
+    auto backend = ::wallet::pricoin_chain_watcher::MakeForeignClientFromRegistry(chain);
+    if (!backend) {
+        return util::Error{Untranslated("no chain backend registered for " + chain)};
+    }
     try {
-        return backend->Broadcast(tx_hex);
+        return backend->Broadcast(built->signed_tx_hex);
     } catch (const std::exception& e) {
         return util::Error{Untranslated(std::string("broadcast failed: ") + e.what())};
     }

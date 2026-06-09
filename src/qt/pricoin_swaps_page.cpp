@@ -462,6 +462,20 @@ void PricoinSwapsPage::refreshTable()
             m_auto_advance_fired.insert(fire_key);
             continue;
         }
+        if (s.state == "pric_claimed" && s.role == "alice"
+            && s.foreign_chain == "btc") {
+            // BTC analogue of the LTC auto-claim above: Alice adapts +
+            // broadcasts the BTC claim once she holds t (the tx-scan
+            // extracts it from Bob's on-chain PRIC claim → SetTSecret).
+            // Retry-on-false, same pattern.
+            QMetaObject::invokeMethod(this, [this, sid = s.swap_id, fire_key]() {
+                if (!autoBtcClaim(sid)) {
+                    m_auto_advance_fired.erase(fire_key);
+                }
+            }, Qt::QueuedConnection);
+            m_auto_advance_fired.insert(fire_key);
+            continue;
+        }
         if (should_fire) {
             auto_advance_sids.push_back(s.swap_id);
             m_auto_advance_fired.insert(fire_key);
@@ -1402,11 +1416,68 @@ void PricoinSwapsPage::onAdvanceClicked()
             auto snap_after = m_model->wallet().adaptorSwapGet(sid);
             if (snap_after) snap = *snap_after;
         }
+        // BTC swaps (2026-06-09): Bob pre-builds his BTC P2TR funding tx
+        // (without broadcasting) so the BTC claim/refund MuSig2 ceremonies
+        // have the funding outpoint BEFORE funding, then DMs Alice the
+        // planned outpoint. BTC-only — LTC's foreign HTLC is unilateral and
+        // uses no MuSig2, so this whole block is skipped for LTC.
+        if (snap.foreign_chain == "btc" && snap.role == "bob"
+            && snap.btc_funding_planned_txid.empty()) {
+            UniValue p_pb{UniValue::VARR};
+            p_pb.push_back(sid);
+            p_pb.push_back(1000);  // fee_sat
+            UniValue r_pb;
+            try {
+                r_pb = m_model->node().executeRpc("pricoin_btc_prebuild_funding", p_pb,
+                    "/wallet/" + m_model->getWalletName().toStdString());
+            } catch (const UniValue& e) {
+                setStatus(tr("BTC pre-build funding failed: %1").arg(
+                    e.isObject() && e.exists("message")
+                        ? QString::fromStdString(e["message"].get_str())
+                        : QString::fromStdString(e.write())), true);
+                return;
+            } catch (const std::exception& e) {
+                setStatus(tr("BTC pre-build funding failed: %1").arg(e.what()), true);
+                return;
+            }
+            const std::string btc_txid = (r_pb.exists("txid") && r_pb["txid"].isStr())
+                ? r_pb["txid"].get_str() : std::string{};
+            const int btc_vout = (r_pb.exists("vout") && r_pb["vout"].isNum())
+                ? r_pb["vout"].getInt<int>() : 0;
+            if (btc_txid.empty()) {
+                setStatus(tr("BTC pre-build returned no txid"), true);
+                return;
+            }
+            // DM Alice the planned outpoint (reuses the tx_announce path;
+            // her walletmodel handler persists it via SetBtcFundingPlanned).
+            if (snap.counterparty_pubkey_hex.size() >= 66) {
+                auto* nostr = m_model->getOrCreateNostrClient();
+                if (nostr) {
+                    nostr->publishBroadcastAnnouncement(
+                        QString::fromStdString(snap.counterparty_pubkey_hex.substr(2)),
+                        QString::fromStdString(sid),
+                        QStringLiteral("btc_funding_planned"),
+                        QString::fromStdString(btc_txid),
+                        btc_vout,
+                        /*min_confirmations=*/1);
+                }
+            }
+            auto snap_after2 = m_model->wallet().adaptorSwapGet(sid);
+            if (snap_after2) snap = *snap_after2;
+        }
         // Bob waits until the DM lands and the swap record has the hex.
         if (snap.role == "bob"
             && snap.pric_funding_unsigned_tx_hex.empty()) {
             setStatus(tr("Waiting for PRIC seller's pre-built funding hex DM "
                          "(needed for cooperative-sign scan partials)."));
+            return;
+        }
+        // BTC swaps: Alice waits for Bob's BTC funding outpoint DM before
+        // her BTC claim/refund ceremonies can build their sighashes.
+        if (snap.foreign_chain == "btc" && snap.role == "alice"
+            && snap.btc_funding_planned_txid.empty()) {
+            setStatus(tr("Waiting for the BTC buyer's pre-built funding outpoint "
+                         "DM (needed for the BTC cooperative-sign ceremonies)."));
             return;
         }
         const bool is_ltc = (snap.foreign_chain == "ltc");
@@ -2496,6 +2567,57 @@ bool PricoinSwapsPage::autoLtcClaim(const std::string& sid)
                 txid,
                 /*vout=*/0,
                 /*min_confirmations=*/1);
+        }
+    }
+    refreshTable();
+    onSwapwatchRefresh();
+    return true;
+}
+
+bool PricoinSwapsPage::autoBtcClaim(const std::string& sid)
+{
+    // Alice's headless BTC claim (the BTC analogue of autoLtcClaim).
+    // Adapts the BTC claim pre-sig with the stored t_secret (the wallet's
+    // tx-scan extracted it when Bob's PRIC claim hit chain), then builds +
+    // broadcasts the claim tx and registers a foreign_claim watch — all
+    // inside pricoin_swapwatch_adapt_btc_claim. The recipient comes from
+    // the swap record (btc_bob_recipient_xonly), so unlike LTC there is no
+    // claim-address config to resolve.
+    if (!m_model) return false;
+    auto snap_opt = m_model->wallet().adaptorSwapGet(sid);
+    if (!snap_opt) return false;
+    if (snap_opt->role != "alice") return false;
+    if (snap_opt->foreign_chain != "btc") return false;
+    if (!snap_opt->has_t) {
+        // Wallet auto-extractor hasn't yet seen Bob's PRIC claim; retried
+        // on the next refreshTable tick.
+        return false;
+    }
+    UniValue p{UniValue::VARR};
+    p.push_back(sid);
+    p.push_back("");   // empty t_hex → use stored t_secret (has_t == true)
+    p.push_back(0);    // refund_amount_sat: 0 → RPC defaults to (funding - fee)
+    p.push_back(1);    // min_confirmations
+    std::string err;
+    auto r = CallWalletRpc(m_model, "pricoin_swapwatch_adapt_btc_claim", p, &err);
+    if (!r) {
+        setStatus(tr("Auto: BTC claim failed: %1").arg(QString::fromStdString(err)), true);
+        return false;
+    }
+    const QString txid = QString::fromStdString((*r)["txid"].get_str());
+    setStatus(tr("Auto: BTC claim broadcast — txid %1… (watching for confirmations).")
+        .arg(txid.left(16)));
+    // DM Bob the foreign_claim txid so his watcher advances pric_claimed →
+    // complete (he didn't broadcast and wouldn't otherwise know the txid).
+    if (snap_opt->counterparty_pubkey_hex.size() >= 66) {
+        const QString peer_xonly = QString::fromStdString(
+            snap_opt->counterparty_pubkey_hex.substr(2));
+        auto* nostr = m_model->getOrCreateNostrClient();
+        if (nostr) {
+            nostr->publishBroadcastAnnouncement(
+                peer_xonly, QString::fromStdString(sid),
+                QStringLiteral("foreign_claim"), txid,
+                /*vout=*/0, /*min_confirmations=*/1);
         }
     }
     refreshTable();

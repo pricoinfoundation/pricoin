@@ -611,6 +611,30 @@ TransitionResult SetBtcRefundTx(
     });
 }
 
+TransitionResult SetBtcClaimTx(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::string& unsigned_tx_hex)
+{
+    if (unsigned_tx_hex.empty()) return TransitionResult::InvalidInput;
+    if (unsigned_tx_hex.size() < 20) return TransitionResult::InvalidInput;
+    return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
+        if (s.state == State::Setup) return TransitionResult::InvalidState;
+        if (s.state == State::Complete || s.state == State::Refunded
+            || s.state == State::Aborted) {
+            return TransitionResult::InvalidState;
+        }
+        if (!s.btc_claim_unsigned_tx_hex.empty()) {
+            if (s.btc_claim_unsigned_tx_hex == unsigned_tx_hex) {
+                return TransitionResult::Ok;
+            }
+            return TransitionResult::InvalidInput;
+        }
+        s.btc_claim_unsigned_tx_hex = unsigned_tx_hex;
+        return TransitionResult::Ok;
+    });
+}
+
 TransitionResult SetPricFundingPlanned(
     CWallet& wallet,
     const uint256& swap_id,
@@ -666,6 +690,57 @@ TransitionResult SetPricFundingPlanned(
         if (s.pric_funding_txid.IsNull()) {
             s.pric_funding_txid = planned_txid;
             s.pric_funding_vout = planned_vout;
+        }
+        return TransitionResult::Ok;
+    });
+}
+
+TransitionResult SetBtcFundingPlanned(
+    CWallet& wallet,
+    const uint256& swap_id,
+    const std::string& signed_tx_hex,
+    const std::string& planned_txid_hex,
+    int32_t planned_vout)
+{
+    // BTC analogue of SetPricFundingPlanned: persist the planned BTC
+    // funding outpoint (txid:vout) so both parties' cooperative ceremonies
+    // sign over the same funding output BEFORE it is broadcast.
+    //   * Bob (the funder) passes the fully-signed tx hex too; it's
+    //     replayed at the funding step.
+    //   * Alice (cosigner) receives only the outpoint over DM and passes
+    //     an EMPTY signed_tx_hex — she just needs the outpoint for her
+    //     ceremony, not the funding tx.
+    // Does NOT touch foreign_funding_* (the post-broadcast, state-
+    // advancing path) — these are separate "planned" fields.
+    if (!signed_tx_hex.empty() && signed_tx_hex.size() < 20) {
+        return TransitionResult::InvalidInput;
+    }
+    if (planned_txid_hex.size() != 64) return TransitionResult::InvalidInput;
+    if (planned_vout < 0) return TransitionResult::InvalidInput;
+    return MutateAndPersist(wallet, swap_id, [&](AdaptorSwap& s) -> TransitionResult {
+        if (s.foreign_chain != "btc") return TransitionResult::InvalidInput;
+        // Pre-funding states only.
+        if (s.state != State::Setup
+            && s.state != State::AdaptorReady
+            && s.state != State::PreSigned) {
+            return TransitionResult::InvalidState;
+        }
+        // Outpoint is write-once: reject a conflicting re-set (don't let a
+        // late/duplicate DM repoint the ceremony).
+        if (!s.btc_funding_planned_txid.empty()
+            && (s.btc_funding_planned_txid != planned_txid_hex
+                || s.btc_funding_planned_vout != planned_vout)) {
+            return TransitionResult::InvalidInput;
+        }
+        s.btc_funding_planned_txid = planned_txid_hex;
+        s.btc_funding_planned_vout = planned_vout;
+        // Only the funder holds the signed tx; back-fill it idempotently.
+        if (!signed_tx_hex.empty()) {
+            if (!s.btc_funding_unsigned_tx_hex.empty()
+                && s.btc_funding_unsigned_tx_hex != signed_tx_hex) {
+                return TransitionResult::InvalidInput;
+            }
+            s.btc_funding_unsigned_tx_hex = signed_tx_hex;
         }
         return TransitionResult::Ok;
     });
