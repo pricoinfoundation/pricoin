@@ -117,10 +117,18 @@ CoopSignDialog::CoopSignDialog(WalletModel* wallet_model,
                 m_peer_xonly = QString::fromStdString(
                     snap->counterparty_pubkey_hex.substr(2));
             }
-            // Peer pubkey: the swap's counterparty_pubkey, 33-byte
-            // compressed already.
-            if (m_in_peer_pub && !snap->counterparty_pubkey_hex.empty()) {
-                m_in_peer_pub->setText(QString::fromStdString(snap->counterparty_pubkey_hex));
+            // Peer pubkey: force the even-y ("02"+xonly) form, exactly as
+            // we do for our OWN pubkey above. CRITICAL: the stored
+            // counterparty_pubkey_hex carries the peer key's NATURAL parity
+            // (possibly "03"+xonly). If we fed that natural form into the
+            // keyagg while representing ourselves as "02"+xonly, the two
+            // wallets would build DIFFERENT keyaggs whenever a key is odd-y
+            // → different agg_xonly → different sighash → partial sigs that
+            // never cross-verify. Both sides normalize every participant to
+            // even-y here, matching the even-y-normalized signing priv.
+            if (m_in_peer_pub && snap->counterparty_pubkey_hex.size() >= 66) {
+                m_in_peer_pub->setText(QStringLiteral("02")
+                    + QString::fromStdString(snap->counterparty_pubkey_hex.substr(2)));
             }
             // Swap role — drives the canonical keyagg ordering in Step 1.
             m_swap_role = QString::fromStdString(snap->role);

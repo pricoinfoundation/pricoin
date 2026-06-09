@@ -125,12 +125,19 @@ void RunSelfTest()
     // different curve usage but same secp256k1 group).
     CKey btc_priv_A; btc_priv_A.MakeNewKey(/*fCompressed=*/true);
     CKey btc_priv_B; btc_priv_B.MakeNewKey(/*fCompressed=*/true);
-    const CPubKey btc_pub_A = btc_priv_A.GetPubKey();
-    const CPubKey btc_pub_B = btc_priv_B.GetPubKey();
 
     bma::Scalar btc_sk_A, btc_sk_B;
     std::memcpy(btc_sk_A.data(), btc_priv_A.begin(), 32);
     std::memcpy(btc_sk_B.data(), btc_priv_B.begin(), 32);
+    // Even-y-normalize the signing keys exactly as the production wallet
+    // does (NormalizeSeckeyEvenY) — AggregatePubkeys pins every key to its
+    // even-y form, so the keys we sign with must correspond to it.
+    Check(bma::NormalizeSeckeyEvenY(btc_sk_A), "normalize btc_sk_A");
+    Check(bma::NormalizeSeckeyEvenY(btc_sk_B), "normalize btc_sk_B");
+    CKey nbtc_A; nbtc_A.Set(btc_sk_A.begin(), btc_sk_A.end(), /*fCompressedIn=*/true);
+    CKey nbtc_B; nbtc_B.Set(btc_sk_B.begin(), btc_sk_B.end(), /*fCompressedIn=*/true);
+    const CPubKey btc_pub_A = nbtc_A.GetPubKey();   // even-y
+    const CPubKey btc_pub_B = nbtc_B.GetPubKey();   // even-y
 
     // Aggregate BTC pubkey via MuSig2 keyagg.
     bma::KeyAggCache btc_cache;

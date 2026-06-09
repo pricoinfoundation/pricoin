@@ -306,11 +306,17 @@ void TestBtcRefundCooperative()
 {
     CKey priv_A; priv_A.MakeNewKey(true);
     CKey priv_B; priv_B.MakeNewKey(true);
-    const CPubKey pub_A = priv_A.GetPubKey();
-    const CPubKey pub_B = priv_B.GetPubKey();
     bma::Scalar sk_A, sk_B;
     std::memcpy(sk_A.data(), priv_A.begin(), 32);
     std::memcpy(sk_B.data(), priv_B.begin(), 32);
+    // Even-y-normalize (as production does) to match the even-y form
+    // AggregatePubkeys pins.
+    Check(bma::NormalizeSeckeyEvenY(sk_A), "normalize sk_A");
+    Check(bma::NormalizeSeckeyEvenY(sk_B), "normalize sk_B");
+    CKey nk_A; nk_A.Set(sk_A.begin(), sk_A.end(), /*fCompressedIn=*/true);
+    CKey nk_B; nk_B.Set(sk_B.begin(), sk_B.end(), /*fCompressedIn=*/true);
+    const CPubKey pub_A = nk_A.GetPubKey();   // even-y
+    const CPubKey pub_B = nk_B.GetPubKey();   // even-y
 
     const uint256 refund_msg = uint256::FromHex(
         "0123456789abcdeffeedfacedeadbeef0011223344556677889900aabbccddee").value();

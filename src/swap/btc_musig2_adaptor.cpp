@@ -67,7 +67,22 @@ std::optional<XOnlyPubKeyBytes> AggregatePubkeys(
     std::vector<const secp256k1_pubkey*> ptrs;
     ptrs.reserve(pubkeys.size());
     for (size_t i = 0; i < pubkeys.size(); ++i) {
-        if (!ParsePubKey(pubkeys[i], parsed[i])) return std::nullopt;
+        // Force every participant key to its even-y ("02"+xonly) form
+        // before aggregating. The keyagg is parity-sensitive, so two
+        // wallets that disagree on a key's parity (one stores "02"+xonly,
+        // the other the natural "03"+xonly) would compute DIFFERENT
+        // aggregates and never produce cross-verifying signatures. Pinning
+        // to even-y makes the agg a function of the xonly coordinates only,
+        // and matches the even-y-normalized signing privs (see
+        // NormalizeSeckeyEvenY) so partial_sign/verify stay consistent.
+        CPubKey even = pubkeys[i];
+        if (even.size() == 33 && even.data()[0] != 0x02) {
+            unsigned char raw[33];
+            raw[0] = 0x02;
+            std::memcpy(raw + 1, even.data() + 1, 32);
+            even = CPubKey(raw, raw + 33);
+        }
+        if (!ParsePubKey(even, parsed[i])) return std::nullopt;
         ptrs.push_back(&parsed[i]);
     }
 
@@ -364,12 +379,19 @@ void RunOnce(bool with_adaptor) {
     // Two parties A, B.
     CKey priv_A = RandKey();
     CKey priv_B = RandKey();
-    CPubKey pub_A = priv_A.GetPubKey();
-    CPubKey pub_B = priv_B.GetPubKey();
 
     Scalar sk_A, sk_B;
     std::memcpy(sk_A.data(), priv_A.begin(), 32);
     std::memcpy(sk_B.data(), priv_B.begin(), 32);
+    // Sign with even-y-normalized keys, exactly as the production code does
+    // (NormalizeSeckeyEvenY) — AggregatePubkeys pins every participant to
+    // its even-y form, so the signing keys must correspond to it.
+    Check(NormalizeSeckeyEvenY(sk_A), "normalize sk_A");
+    Check(NormalizeSeckeyEvenY(sk_B), "normalize sk_B");
+    CKey nk_A; nk_A.Set(sk_A.begin(), sk_A.end(), /*fCompressedIn=*/true);
+    CKey nk_B; nk_B.Set(sk_B.begin(), sk_B.end(), /*fCompressedIn=*/true);
+    CPubKey pub_A = nk_A.GetPubKey();   // even-y
+    CPubKey pub_B = nk_B.GetPubKey();   // even-y
 
     std::vector<CPubKey> pubs{pub_A, pub_B};
 
