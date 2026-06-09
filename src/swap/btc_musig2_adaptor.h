@@ -146,6 +146,13 @@ std::optional<Session> ProcessNonces(
     const KeyAggCache& cache,
     const std::optional<AdaptorPointCompressed>& adaptor_T_G);
 
+// BIP340-normalize a seckey to the even-y form so its pubkey matches the
+// "02"+xonly representation used in this protocol's keyaggs. Negates the
+// seckey (in place) iff its pubkey has odd y. Returns false on an invalid
+// seckey. MUST be applied to the signing priv before NonceGen/PartialSign
+// when the keyagg was built from "02"+xonly pubkeys.
+bool NormalizeSeckeyEvenY(Scalar& seckey);
+
 // Step 6: per-party partial signing. Consumes (and invalidates) the
 // secret nonce via libsecp256k1. Returns nullopt on internal
 // failure (e.g., session/cache mismatch, invalid priv key).

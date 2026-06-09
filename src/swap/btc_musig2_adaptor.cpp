@@ -190,6 +190,25 @@ std::optional<Session> ProcessNonces(
     return out;
 }
 
+bool NormalizeSeckeyEvenY(Scalar& seckey)
+{
+    // The MuSig2 keyaggs in this protocol represent each participant by
+    // the BIP340 "02"+xonly (even-y) form of their pubkey. A raw seckey
+    // whose natural pubkey has ODD y therefore does NOT correspond to the
+    // pubkey sitting in the keyagg cache — partial_sign would reject it
+    // (keypair pub ≠ declared pub). Negate (n - seckey) so the pubkey is
+    // even-y, matching the keyagg. Idempotent: even-y keys are unchanged.
+    secp256k1_pubkey pub;
+    if (!secp256k1_ec_pubkey_create(SignCtx(), &pub, seckey.data())) return false;
+    unsigned char ser[33];
+    size_t len = sizeof(ser);
+    secp256k1_ec_pubkey_serialize(Ctx(), ser, &len, &pub, SECP256K1_EC_COMPRESSED);
+    if (ser[0] == 0x03) {  // odd y
+        if (!secp256k1_ec_seckey_negate(Ctx(), seckey.data())) return false;
+    }
+    return true;
+}
+
 std::optional<PartialSig32> PartialSign(
     MuSig2SecNonce& secnonce,
     const Scalar& self_priv,

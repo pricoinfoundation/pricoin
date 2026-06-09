@@ -6199,6 +6199,15 @@ RPCMethod pricoin_btc_musig2_partial_sign()
             bma::KeyAggCache cache = ParseKeyAggCacheBlob(request.params[3].get_str());
             bma::Session session = ParseSessionBlob(request.params[4]);
 
+            // BIP340-normalize the signing priv to even-y so it matches the
+            // "02"+xonly self_pub committed in the keyagg (and the secnonce
+            // generated at round1, which was normalized the same way).
+            // Without this, an odd-y swap-identity key fails the keypair
+            // check inside PartialSign.
+            if (!bma::NormalizeSeckeyEvenY(self_priv)) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "seckey normalization failed");
+            }
+
             auto partial = bma::PartialSign(*secnonce, self_priv, self_pub, cache, session);
             if (!partial) throw JSONRPCError(RPC_INTERNAL_ERROR, "PartialSign failed");
 
@@ -6572,6 +6581,15 @@ RPCMethod pricoin_btc_musig2_round1_safe()
                 bma::Scalar s;
                 std::copy(UCharCast(key->data()), UCharCast(key->data()) + 32, s.begin());
                 self_priv = s;
+            }
+
+            // BIP340-normalize: the keyagg uses our "02"+xonly (even-y)
+            // pubkey, so the signing priv must be the even-y variant —
+            // otherwise partial_sign later rejects it (keypair pub ≠
+            // declared pub). Apply to the nonce-gen priv so the secnonce
+            // is committed to the same key partial_sign will use.
+            if (self_priv && !bma::NormalizeSeckeyEvenY(*self_priv)) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "seckey normalization failed");
             }
 
             // Make the nonce DETERMINISTIC from the record key (agg_xonly,
