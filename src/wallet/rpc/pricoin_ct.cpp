@@ -41,6 +41,7 @@
 #include <swap/btc_musig2_runtime.h>
 #include <swap/btc_refund_tx.h>
 #include <crypto/hmac_sha256.h>
+#include <crypto/sha256.h>
 #include <wallet/pricoin_adaptor_swap.h>
 #include <wallet/pricoin_broadcasted_kis.h>
 #include <wallet/pricoin_btc_holding.h>
@@ -6298,6 +6299,50 @@ RPCMethod pricoin_btc_musig2_partial_verify()
     };
 }
 
+RPCMethod pricoin_btc_musig2_nonce_reset()
+{
+    return RPCMethod{
+        "pricoin_btc_musig2_nonce_reset",
+        "RESET: erase this wallet's stored BTC MuSig2 round-1 nonce records.\n"
+        "Use to clear stale/poisoned records — e.g. from an older build that\n"
+        "used RANDOM session ids — so a fresh cooperative-sign ceremony isn't\n"
+        "blocked by '§4.1a: a record exists … under a DIFFERENT session_id'.\n"
+        "By default only NON-finalized (never-completed) records are erased;\n"
+        "include_finalized=true wipes all. SECURITY: only erase a non-\n"
+        "finalized record whose signing session you are abandoning — re-\n"
+        "signing the same message with a new nonce after a partial was\n"
+        "published would leak the key.\n",
+        {
+            {"include_finalized", RPCArg::Type::BOOL, RPCArg::Default{false},
+                "Also erase finalized records (full wipe)"},
+        },
+        RPCResult{ RPCResult::Type::OBJ, "", "",
+            {{RPCResult::Type::NUM, "erased", "Number of records erased"}}
+        },
+        RPCExamples{HelpExampleCli("pricoin_btc_musig2_nonce_reset", "")},
+        [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
+            auto wallet_sp = GetWalletForJSONRPCRequest(request);
+            if (!wallet_sp) throw JSONRPCError(RPC_WALLET_NOT_FOUND, "Wallet not loaded");
+            const bool include_finalized =
+                !request.params[0].isNull() && request.params[0].get_bool();
+            namespace nr = ::wallet::pricoin_btc_musig2_nonce_records;
+            std::vector<nr::NonceRecord> recs;
+            if (nr::List(*wallet_sp, recs) != nr::LookupResult::Ok) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                    "could not list nonce records (wallet locked?)");
+            }
+            int erased = 0;
+            for (const auto& r : recs) {
+                if (!include_finalized && r.finalized) continue;
+                if (nr::Erase(*wallet_sp, r.key) == nr::MutateResult::Ok) ++erased;
+            }
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("erased", erased);
+            return out;
+        }
+    };
+}
+
 RPCMethod pricoin_btc_musig2_adapt()
 {
     return RPCMethod{
@@ -6527,6 +6572,36 @@ RPCMethod pricoin_btc_musig2_round1_safe()
                 bma::Scalar s;
                 std::copy(UCharCast(key->data()), UCharCast(key->data()) + 32, s.begin());
                 self_priv = s;
+            }
+
+            // Make the nonce DETERMINISTIC from the record key (agg_xonly,
+            // msg, role) + priv, overriding whatever session_id/seed the
+            // caller passed. This is what makes the ceremony retry-safe:
+            // any re-created dialog (or a fresh swap that reproduces the
+            // same claim sighash, e.g. Bob funding from the same UTXO)
+            // derives the EXACT same nonce, so the reuse guard treats it as
+            // an idempotent re-commit (same session_id + same pubnonce)
+            // instead of rejecting it. RFC6979-style: priv keeps the nonce
+            // secret/unpredictable; (agg_xonly,msg,role) keeps it unique per
+            // message. (Only the BTC coopsign dialog calls round1_safe.)
+            {
+                const unsigned char role_b = static_cast<unsigned char>(key.role);
+                CSHA256 hs;
+                static const char kSeedTag[] = "pricoin/btc-musig2/det-seed-v1";
+                hs.Write(reinterpret_cast<const unsigned char*>(kSeedTag), sizeof(kSeedTag) - 1);
+                if (self_priv) hs.Write(self_priv->data(), 32);
+                hs.Write(key.agg_xonly.data(), 32);
+                hs.Write(key.msg.data(), 32);
+                hs.Write(&role_b, 1);
+                hs.Finalize(session_seed.data());
+
+                CSHA256 hi;
+                static const char kSidTag[] = "pricoin/btc-musig2/det-sid-v1";
+                hi.Write(reinterpret_cast<const unsigned char*>(kSidTag), sizeof(kSidTag) - 1);
+                hi.Write(key.agg_xonly.data(), 32);
+                hi.Write(key.msg.data(), 32);
+                hi.Write(&role_b, 1);
+                hi.Finalize(sid->data());
             }
 
             // Generate the secnonce + pubnonce.
@@ -9394,6 +9469,7 @@ RPCMethod pricoin_btc_musig2_process_export()            { return pricoin_btc_mu
 RPCMethod pricoin_btc_musig2_partial_sign_export()       { return pricoin_btc_musig2_partial_sign(); }
 RPCMethod pricoin_btc_musig2_aggregate_partials_export() { return pricoin_btc_musig2_aggregate_partials(); }
 RPCMethod pricoin_btc_musig2_partial_verify_export() { return pricoin_btc_musig2_partial_verify(); }
+RPCMethod pricoin_btc_musig2_nonce_reset_export() { return pricoin_btc_musig2_nonce_reset(); }
 RPCMethod pricoin_btc_musig2_adapt_export()              { return pricoin_btc_musig2_adapt(); }
 RPCMethod pricoin_btc_musig2_extract_export()            { return pricoin_btc_musig2_extract(); }
 RPCMethod pricoin_btc_musig2_round1_safe_export()        { return pricoin_btc_musig2_round1_safe(); }
