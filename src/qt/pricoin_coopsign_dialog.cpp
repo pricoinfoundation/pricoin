@@ -23,6 +23,7 @@
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QEventLoop>
+#include <QTimer>
 #include <QFontDatabase>
 #include <QFormLayout>
 #include <QGroupBox>
@@ -993,11 +994,36 @@ void CoopSignDialog::runHeadless()
     }
     QEventLoop loop;
     connect(this, &QDialog::finished, &loop, &QEventLoop::quit);
+    // Sticky re-send: the pubnonce/partial exchange is a two-way rendezvous
+    // — if we publish ours before the peer's dialog is listening, that DM
+    // is lost and there's no other trigger to resend it, so both sides wait
+    // forever. Periodically re-publish whatever we've produced but for
+    // which the peer's counterpart hasn't arrived, and re-drive the
+    // cascade. Re-publishing the same pubnonce/partial is idempotent for
+    // the peer. (Mirrors the PRIC dialog's sticky resend.)
+    auto* resend = new QTimer(this);
+    resend->setInterval(4000);
+    connect(resend, &QTimer::timeout, this, [this]() {
+        const bool relay_ok = m_nostr && m_relay_connected_count > 0 && !m_peer_xonly.isEmpty();
+        if (relay_ok && !m_my_pubnonce.isEmpty()
+            && (!m_in_peer_pubnonce
+                || m_in_peer_pubnonce->toPlainText().trimmed().size() != 132)) {
+            onSendDmRound2();
+        }
+        if (relay_ok && !m_my_partial.isEmpty()
+            && (!m_in_peer_partial
+                || m_in_peer_partial->toPlainText().trimmed().size() != 64)) {
+            onSendDmRound3();
+        }
+        kickAutoCoord();
+    });
+    resend->start();
     // Kick after the loop is running so the first synchronous steps
     // (keyagg → sighash → nonce → send pubnonce) execute, then we idle
     // until the peer's DMs drive the rest.
     QMetaObject::invokeMethod(this, [this]{ kickAutoCoord(); }, Qt::QueuedConnection);
     loop.exec();
+    resend->stop();
 }
 
 void CoopSignDialog::kickAutoCoord()
