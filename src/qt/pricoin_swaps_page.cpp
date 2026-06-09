@@ -1423,20 +1423,31 @@ void PricoinSwapsPage::onAdvanceClicked()
         // uses no MuSig2, so this whole block is skipped for LTC.
         if (snap.foreign_chain == "btc" && snap.role == "bob"
             && snap.btc_funding_planned_txid.empty()) {
+            // Use the same DYNAMIC fee estimate as the funding step — a
+            // flat fee both overpays on small swaps AND inflates the
+            // UTXO requirement (the pre-build needs a confirmed UTXO ≥
+            // amount + fee). The fee baked in here is the one that ships,
+            // since the funding step now broadcasts this pre-built tx.
+            const int64_t pb_fee_sat = EstimateForeignFeeSat(
+                m_model->node(), snap.foreign_chain, kVbForeignFunding);
             UniValue p_pb{UniValue::VARR};
             p_pb.push_back(sid);
-            p_pb.push_back(1000);  // fee_sat
+            p_pb.push_back(pb_fee_sat);
             UniValue r_pb;
             try {
                 r_pb = m_model->node().executeRpc("pricoin_btc_prebuild_funding", p_pb,
                     "/wallet/" + m_model->getWalletName().toStdString());
             } catch (const UniValue& e) {
-                setStatus(tr("BTC pre-build funding failed: %1").arg(
-                    e.isObject() && e.exists("message")
-                        ? QString::fromStdString(e["message"].get_str())
-                        : QString::fromStdString(e.write())), true);
+                const QString msg = e.isObject() && e.exists("message")
+                    ? QString::fromStdString(e["message"].get_str())
+                    : QString::fromStdString(e.write());
+                LogWarning("Pricoin swap %s: BTC pre-build funding failed: %s",
+                           sid, msg.toStdString());
+                setStatus(tr("BTC pre-build funding failed: %1").arg(msg), true);
                 return;
             } catch (const std::exception& e) {
+                LogWarning("Pricoin swap %s: BTC pre-build funding failed: %s",
+                           sid, std::string(e.what()));
                 setStatus(tr("BTC pre-build funding failed: %1").arg(e.what()), true);
                 return;
             }
