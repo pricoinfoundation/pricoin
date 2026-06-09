@@ -524,6 +524,23 @@ void PricoinSwapsPage::refreshTable()
                 if (m_swaps[src_idx].swap_id != sid) continue;
                 m_table->selectRow(row);
                 onAdvanceClicked();
+                // Alice's adaptor_ready BTC handler runs her PRIC prebuild
+                // + DMs Bob (so he can prebuild and DM back his BTC funding
+                // outpoint), then waits for that outpoint before launching
+                // her BTC ceremonies. While it hasn't arrived, the one-shot
+                // fire_key (swap_id@adaptor_ready) would trap her — so erase
+                // it and let the next refresh tick re-fire (the prebuild +
+                // DM are idempotent; this also re-DMs Bob = sticky resend).
+                // Cleared naturally once the outpoint lands and she launches.
+                {
+                    auto snap2 = m_model->wallet().adaptorSwapGet(sid);
+                    if (snap2 && snap2->state == "adaptor_ready"
+                        && snap2->role == "alice"
+                        && snap2->foreign_chain == "btc"
+                        && snap2->btc_funding_planned_txid.empty()) {
+                        m_auto_advance_fired.erase(sid + "@adaptor_ready");
+                    }
+                }
                 return;
             }
         }, Qt::QueuedConnection);
