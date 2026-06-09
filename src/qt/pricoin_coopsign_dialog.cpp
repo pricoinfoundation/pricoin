@@ -4,6 +4,7 @@
 
 #include <qt/pricoin_coopsign_dialog.h>
 
+#include <crypto/sha256.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <qt/pricoin_nostr_client.h>
@@ -464,13 +465,36 @@ void CoopSignDialog::buildLayout(const QString& title)
         m_in_role->addItem(QStringLiteral("responder"));
         form->addRow(tr("My role:"), m_in_role);
 
+        // Session id + seed: DETERMINISTIC per (swap, leg) when we have a
+        // swap_id. This is what makes the ceremony retry-safe: the outer
+        // auto-coord can re-create this dialog, and each instance derives
+        // the SAME session_id + seed → reproduces the SAME nonce, so the
+        // nonce-reuse guard treats it as an idempotent re-commit instead of
+        // rejecting a fresh random session (the cause of "a record exists
+        // … under a DIFFERENT session_id"). The nonce stays secret + unique
+        // because round1_safe mixes in the wallet's swap-identity priv and
+        // each (swap, leg) signs exactly one message. Falls back to random
+        // for ad-hoc (no swap_id) use.
+        auto derive32 = [this](const char* label) -> QString {
+            if (m_swap_id.isEmpty()) return RandomHex32();
+            CSHA256 h;
+            const std::string tag = std::string("pricoin/btc-coopsign/") + label;
+            h.Write(reinterpret_cast<const unsigned char*>(tag.data()), tag.size());
+            const std::string sid = m_swap_id.toStdString();
+            h.Write(reinterpret_cast<const unsigned char*>(sid.data()), sid.size());
+            const unsigned char leg = (m_mode == Mode::BtcAdaptor) ? 0 : 1;
+            h.Write(&leg, 1);
+            unsigned char out[32];
+            h.Finalize(out);
+            return QString::fromStdString(HexStr(std::span<const unsigned char>{out, 32}));
+        };
         m_in_session_id = new QLineEdit(box);
-        m_in_session_id->setText(RandomHex32());
-        m_in_session_id->setToolTip(tr("32-byte session id — both parties MUST use the same value"));
+        m_in_session_id->setText(derive32("session-id-v1"));
+        m_in_session_id->setToolTip(tr("32-byte session id — deterministic per (swap, leg) for retry-safety"));
         form->addRow(tr("Session id:"), m_in_session_id);
 
         m_in_session_seed = new QLineEdit(box);
-        m_in_session_seed->setText(RandomHex32());
+        m_in_session_seed->setText(derive32("session-seed-v1"));
         m_in_session_seed->setToolTip(tr("32-byte CSPRNG bytes — unique per ceremony. Do NOT regenerate "
                                           "after sending your pubnonce to the peer: a fresh seed mints a "
                                           "new nonce and desyncs the signature. Only regenerate for a "

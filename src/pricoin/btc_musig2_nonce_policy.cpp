@@ -58,7 +58,16 @@ Decision EvaluateCreate(
     if (existing->session_id != proposed.session_id) {
         return Decision::ConflictDifferentSession;
     }
+    // Same session_id with the IDENTICAL pubnonce is a no-op re-commit —
+    // allow it (idempotent). This lets a re-created cooperative-sign
+    // dialog that derives session_id + seed DETERMINISTICALLY per
+    // (swap, leg) resume without tripping the in-flight guard: it
+    // re-produces the exact same nonce, so there is no reuse hazard.
+    if (existing->pubnonce == proposed.pubnonce) {
+        return Decision::Ok;
+    }
     if (!existing->finalized) {
+        // Same session_id but a DIFFERENT pubnonce — genuine reuse hazard.
         return Decision::ConflictSameSessionInFlight;
     }
     // Same session_id and existing.finalized — slot is logically free.
@@ -183,6 +192,19 @@ void RunSelfTest()
         Check(s.TryCreate(MakeRecord(k, sid)) == Decision::Ok, "first");
         Check(s.TryCreate(MakeRecord(k, sid)) == Decision::ConflictSameSessionInFlight,
               "in-flight same-session reject");
+    }
+
+    // ─── Test 3b: same session + IDENTICAL pubnonce is idempotent ───
+    // A re-created dialog with a deterministic session_id + seed
+    // re-produces the exact same nonce; re-committing it must be a no-op.
+    {
+        Store s;
+        RecordKey k = MakeKey(0x10, 0x20, Role::Initiator);
+        uint256 sid;
+        GetStrongRandBytes(sid);
+        NonceRecord r = MakeRecord(k, sid);  // fixed pubnonce
+        Check(s.TryCreate(r) == Decision::Ok, "first");
+        Check(s.TryCreate(r) == Decision::Ok, "identical re-commit is idempotent");
     }
 
     // ─── Test 4: different session reject (the attack) ───
