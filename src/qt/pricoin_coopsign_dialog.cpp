@@ -1013,14 +1013,24 @@ void CoopSignDialog::runHeadless()
     resend->setInterval(4000);
     connect(resend, &QTimer::timeout, this, [this]() {
         const bool relay_ok = m_nostr && m_relay_connected_count > 0 && !m_peer_xonly.isEmpty();
-        if (relay_ok && !m_my_pubnonce.isEmpty()
-            && (!m_in_peer_pubnonce
-                || m_in_peer_pubnonce->toPlainText().trimmed().size() != 132)) {
+        const bool have_peer_partial = m_in_peer_partial
+            && m_in_peer_partial->toPlainText().trimmed().size() == 64;
+        // Re-send my pubnonce until I've received the peer's PARTIAL — not
+        // their pubnonce. The peer can only produce their partial once they
+        // hold my pubnonce, so the partial is the true "peer has my
+        // pubnonce" signal. Gating on "received peer's pubnonce" (the old
+        // bug) stopped too early: whichever side received first stopped
+        // re-sending, so if the other side had missed that pubnonce it was
+        // never re-sent → deadlock with one side unable to run Step 3.
+        if (relay_ok && !m_my_pubnonce.isEmpty() && !have_peer_partial) {
             onSendDmRound2();
         }
-        if (relay_ok && !m_my_partial.isEmpty()
-            && (!m_in_peer_partial
-                || m_in_peer_partial->toPlainText().trimmed().size() != 64)) {
+        // Re-send my partial until the ceremony finalizes here. The peer
+        // needs MY partial to finalize and I can't observe their
+        // completion, so keep it flowing until I produce the final sig
+        // (after which a short delayed accept() lets these last re-sends
+        // propagate before the dialog closes).
+        if (relay_ok && !m_my_partial.isEmpty() && m_final_sig_hex.isEmpty()) {
             onSendDmRound3();
         }
         kickAutoCoord();
@@ -1094,7 +1104,11 @@ void CoopSignDialog::kickAutoCoord()
         m_auto_step4_fired = true;
         onStep4Compute();
         if (!m_final_sig_hex.isEmpty()) {
-            QMetaObject::invokeMethod(this, [this]{ accept(); }, Qt::QueuedConnection);
+            // Don't vanish the instant we finalize: the peer still needs MY
+            // partial to finalize their own side and we can't observe their
+            // completion. Delay the close so the sticky-resend timer
+            // re-publishes the partial a couple more times first.
+            QTimer::singleShot(6000, this, [this]{ accept(); });
         } else {
             m_auto_step4_fired = false;  // verify failed / error — allow retry
         }
