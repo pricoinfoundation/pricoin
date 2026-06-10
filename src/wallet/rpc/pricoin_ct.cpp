@@ -9203,15 +9203,23 @@ RPCMethod pricoin_swapwatch_adapt_btc_claim()
                                 }
                             }
                         }
+                        // Does the RAW pre-sig verify as a COMPLETE BIP340
+                        // sig? If so the ceremony produced a non-adaptor
+                        // signature (T_G was not folded into the session) —
+                        // adapting it then breaks it. That's a distinct,
+                        // important failure mode from a genuinely bad presig.
+                        const bool raw_presig_verifies = verifies(presig);
                         throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf(
                             "adapted BTC claim sig fails BIP340 verify under "
                             "agg_xonly for BOTH nonce parities. Diagnostics: "
-                            "t.G==T_G=%s, claim_sighash=%s, agg_xonly=%s. If "
-                            "t.G!=T_G the extracted t is wrong; else compare "
-                            "claim_sighash to the ceremony's 'Sighash auto-"
-                            "filled' log line (mismatch => funding outpoint/"
-                            "amount/recipient diverged). Refusing to broadcast.",
+                            "t.G==T_G=%s, raw_presig_verifies=%s, "
+                            "claim_sighash=%s, agg_xonly=%s. "
+                            "raw_presig_verifies=true => the ceremony made a "
+                            "COMPLETE (non-adaptor) sig (T_G missing from the "
+                            "session); t.G!=T_G => bad extracted t; else the "
+                            "aggregate pre-sig is corrupt. Refusing to broadcast.",
                             t_ok ? "true" : "false",
+                            raw_presig_verifies ? "true" : "false",
                             HexStr(built->sighash),
                             HexStr(p.agg_xonly)));
                     }
