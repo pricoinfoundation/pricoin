@@ -804,6 +804,35 @@ void CoopSignDialog::onStep3Compute()
     m_my_partial    = QString::fromStdString(v3["partial_sig"].get_str());
     m_session_data  = QString::fromStdString(session_data);
     m_nonce_parity  = parity;
+
+    // SELF-VERIFY my own partial against my own pubnonce + pubkey. The
+    // Step-4 gate only verifies the PEER's partial, so a bad OWN partial
+    // (e.g. a priv/secnonce/cache parity mismatch) would silently corrupt
+    // the aggregate pre-signature and only surface as an "Invalid Schnorr
+    // signature" at BTC-claim time. Log it loudly here instead.
+    {
+        const std::string vp = std::string("[\"")
+            + m_my_partial.toStdString() + "\",\""
+            + m_my_pubnonce.toStdString() + "\",\""
+            + m_my_pub.toStdString() + "\",\""
+            + m_keyagg_cache.toStdString()
+            + "\",{\"data\":\"" + session_data
+            + "\",\"nonce_parity\":" + std::to_string(parity) + "}]";
+        auto vr = callRpc("pricoin_btc_musig2_partial_verify", vp);
+        bool self_ok = false;
+        if (vr.ok) {
+            UniValue vv; vv.read(vr.json);
+            self_ok = vv.exists("valid") && vv["valid"].isBool() && vv["valid"].get_bool();
+        }
+        if (!self_ok) {
+            setStatus(tr("Step 3 WARNING: my OWN partial failed self-verify — "
+                         "the aggregate pre-sig will be corrupt (priv/secnonce/"
+                         "cache mismatch). %1")
+                .arg(QString::fromStdString(vr.error_msg)), true);
+        } else {
+            setStatus(tr("Step 3: own partial self-verify OK."));
+        }
+    }
     // Combined output blob — pretty-printed for the user.
     UniValue combined{UniValue::VOBJ};
     combined.pushKV("aggnonce",     aggnonce_hex);

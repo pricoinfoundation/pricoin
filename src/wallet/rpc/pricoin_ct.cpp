@@ -6021,13 +6021,18 @@ RPCMethod pricoin_btc_musig2_round1()
                 std::copy(priv_bytes->begin(), priv_bytes->end(), s.begin());
                 self_priv = s;
             }
-            // Optional msg.
+            // Optional msg. MUST be parsed as FORWARD bytes (not
+            // uint256::FromHex, which byte-reverses) so the nonce binds to
+            // the same byte order the sighash + verifier use.
             std::optional<uint256> msg;
             const std::string msg_hex = request.params[4].isNull() ? "" : request.params[4].get_str();
             if (!msg_hex.empty()) {
-                auto m = uint256::FromHex(msg_hex);
-                if (!m) throw JSONRPCError(RPC_INVALID_PARAMETER, "msg must be 32-byte hex");
-                msg = *m;
+                auto mb = TryParseHex<unsigned char>(msg_hex);
+                if (!mb || mb->size() != 32) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "msg must be 32-byte hex");
+                }
+                uint256 m; std::copy(mb->begin(), mb->end(), m.begin());
+                msg = m;
             }
 
             auto secnonce = std::make_unique<MuSig2SecNonce>();
@@ -6113,8 +6118,12 @@ RPCMethod pricoin_btc_musig2_process()
         RPCExamples{HelpExampleCli("pricoin_btc_musig2_process", "<aggnonce> <msg> <cache> [<T_G>]")},
         [](const RPCMethod&, const JSONRPCRequest& request) -> UniValue {
             auto aggn = ParseFixedHex<bma::AggNonce66>(request.params[0].get_str(), "aggnonce");
-            auto msg = uint256::FromHex(request.params[1].get_str());
-            if (!msg) throw JSONRPCError(RPC_INVALID_PARAMETER, "msg must be 32-byte hex");
+            // FORWARD bytes — not uint256::FromHex (which reverses) — so the
+            // challenge binds to the same byte order the sighash/verifier use.
+            auto mb = TryParseHex<unsigned char>(request.params[1].get_str());
+            if (!mb || mb->size() != 32) throw JSONRPCError(RPC_INVALID_PARAMETER, "msg must be 32-byte hex");
+            uint256 msg_v; std::copy(mb->begin(), mb->end(), msg_v.begin());
+            const std::optional<uint256> msg = msg_v;
             bma::KeyAggCache cache = ParseKeyAggCacheBlob(request.params[2].get_str());
             std::optional<bma::AdaptorPointCompressed> T_G;
             const std::string tg_hex = request.params[3].isNull() ? "" : request.params[3].get_str();
@@ -6438,11 +6447,16 @@ bnp::RecordKey ParseBtcNonceRecordKey(
 {
     auto agg = uint256::FromHex(agg_xonly_hex.get_str());
     if (!agg) throw JSONRPCError(RPC_INVALID_PARAMETER, "agg_xonly must be 32-byte hex");
-    auto msg = uint256::FromHex(msg_hex.get_str());
-    if (!msg) throw JSONRPCError(RPC_INVALID_PARAMETER, "msg must be 32-byte hex");
+    // msg: FORWARD bytes (NOT uint256::FromHex, which reverses) — round1_safe
+    // feeds key.msg into NonceGen, and that must match the FORWARD msg that
+    // process/partial_sign/verify use. The byte-reversal here was the root
+    // cause of valid partials aggregating to a sig over the WRONG (reversed)
+    // message → on-chain "Invalid Schnorr signature".
+    auto mb = TryParseHex<unsigned char>(msg_hex.get_str());
+    if (!mb || mb->size() != 32) throw JSONRPCError(RPC_INVALID_PARAMETER, "msg must be 32-byte hex");
     bnp::RecordKey k;
     k.agg_xonly = *agg;
-    k.msg = *msg;
+    std::copy(mb->begin(), mb->end(), k.msg.begin());
     k.role = ParseBtcNonceRole(role_str.get_str());
     return k;
 }

@@ -2629,6 +2629,10 @@ bool PricoinSwapsPage::autoBtcClaim(const std::string& sid)
     std::string err;
     auto r = CallWalletRpc(m_model, "pricoin_swapwatch_adapt_btc_claim", p, &err);
     if (!r) {
+        // Log to debug.log too — the adapt RPC's diagnostics (t.G==T_G,
+        // raw_presig_verifies, claim_sighash) are otherwise only visible in
+        // the status bar and scroll away.
+        LogWarning("Pricoin autoBtcClaim[%s]: %s", sid, err);
         setStatus(tr("Auto: BTC claim failed: %1").arg(QString::fromStdString(err)), true);
         return false;
     }
