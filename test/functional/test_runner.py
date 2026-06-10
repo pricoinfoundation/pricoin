@@ -109,6 +109,7 @@ BASE_SCRIPTS = [
     'feature_pricoin_btc_swap_tx.py',
     'feature_pricoin_btc_musig2_nonce_records.py',
     'feature_pricoin_btc_musig2_wire.py',
+    'feature_pricoin_btc_musig2_adaptor.py',
     'feature_pricoin_clsag_nonce_records.py',
     'feature_pricoin_swap_ceremony.py',
     'feature_pricoin_adaptor_swap.py',
