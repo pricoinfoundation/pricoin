@@ -9164,6 +9164,40 @@ RPCMethod pricoin_swapwatch_adapt_btc_claim()
             if (!final_sig) throw JSONRPCError(RPC_INVALID_PARAMETER,
                 "Adapt failed — check t·G == T_G and parity");
 
+            // ─── Verify the adapted sig BEFORE broadcasting ──────
+            // The adaptor nonce_parity is easy to get wrong, and a bad sig
+            // would otherwise reach the network as "Invalid Schnorr
+            // signature" (funds-at-risk + a confusing failure). Verify
+            // under the aggregate xonly for the exact claim sighash; if the
+            // stored parity fails, try the flipped parity (self-heal); if
+            // neither verifies it's t or the pre-sig/sighash, so refuse.
+            {
+                XOnlyPubKey agg_xpub{std::span<const unsigned char>{
+                    p.agg_xonly.data(), 32}};
+                auto verifies = [&](const bma::SignatureBytes& s) {
+                    return agg_xpub.VerifySchnorr(built->sighash,
+                        std::span<const unsigned char>{s.data(), 64});
+                };
+                if (!verifies(*final_sig)) {
+                    const int flipped =
+                        snap.presigs.btc_claim_nonce_parity ? 0 : 1;
+                    auto alt = bma::Adapt(presig, t, flipped);
+                    if (alt && verifies(*alt)) {
+                        LogWarning("Pricoin adapt_btc_claim: stored nonce_parity "
+                            "%d produced an invalid sig; flipped parity %d "
+                            "verifies — using it",
+                            snap.presigs.btc_claim_nonce_parity, flipped);
+                        final_sig = alt;
+                    } else {
+                        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                            "adapted BTC claim sig fails BIP340 verify under "
+                            "agg_xonly for BOTH nonce parities — the pre-sig, t, "
+                            "or claim sighash is wrong; refusing to broadcast an "
+                            "invalid tx");
+                    }
+                }
+            }
+
             // ─── Finalize witness + serialize ────────────────────
             // Prefer the EXACT unsigned claim tx persisted at presign time
             // (the one the pre-sig is bound to) — attach the adapted sig as
