@@ -9189,11 +9189,31 @@ RPCMethod pricoin_swapwatch_adapt_btc_claim()
                             snap.presigs.btc_claim_nonce_parity, flipped);
                         final_sig = alt;
                     } else {
-                        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                        // Diagnose: is t the wrong scalar, or is the message
+                        // (sighash) the one the pre-sig actually signed?
+                        bool t_ok = false;
+                        {
+                            CKey k;
+                            k.Set(t.begin(), t.end(), /*fCompressedIn=*/true);
+                            if (k.IsValid()) {
+                                const CPubKey tg = k.GetPubKey();
+                                if (tg.size() == 33) {
+                                    t_ok = std::memcmp(tg.data(),
+                                        snap.T_G.data(), 33) == 0;
+                                }
+                            }
+                        }
+                        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf(
                             "adapted BTC claim sig fails BIP340 verify under "
-                            "agg_xonly for BOTH nonce parities — the pre-sig, t, "
-                            "or claim sighash is wrong; refusing to broadcast an "
-                            "invalid tx");
+                            "agg_xonly for BOTH nonce parities. Diagnostics: "
+                            "t.G==T_G=%s, claim_sighash=%s, agg_xonly=%s. If "
+                            "t.G!=T_G the extracted t is wrong; else compare "
+                            "claim_sighash to the ceremony's 'Sighash auto-"
+                            "filled' log line (mismatch => funding outpoint/"
+                            "amount/recipient diverged). Refusing to broadcast.",
+                            t_ok ? "true" : "false",
+                            HexStr(built->sighash),
+                            HexStr(p.agg_xonly)));
                     }
                 }
             }
