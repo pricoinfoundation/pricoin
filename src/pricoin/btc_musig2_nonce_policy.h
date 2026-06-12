@@ -138,6 +138,19 @@ struct NonceRecord {
     int64_t created_time{0};
     int64_t updated_time{0};
 
+    // CRITICAL nonce-reuse guard for the DETERMINISTIC round1_safe path.
+    // round1_safe re-derives the SAME secnonce k for the same record key
+    // (priv, agg_xonly, msg, role) so a crashed ceremony can resume — but
+    // that means two partial_sign calls could produce s = k + e·d and
+    // s' = k + e'·d with DIFFERENT challenges e (because the peer supplied
+    // a different aggregate nonce the second time), collapsing to
+    // d = (s − s')/(e − e') and leaking the key. To prevent it we bind the
+    // secnonce to exactly ONE aggregate nonce: the first partial_sign
+    // records SHA256(session) here; a later partial_sign over the same
+    // record with a different session is rejected, and an identical one is
+    // idempotent. Null until the first partial is produced.
+    uint256 signed_agg_hash{};
+
     bool operator==(const NonceRecord&) const = default;
 
     SERIALIZE_METHODS(NonceRecord, obj) {
@@ -149,6 +162,7 @@ struct NonceRecord {
         SER_READ(obj, obj.finalized = (fin_byte != 0));
         READWRITE(obj.created_time);
         READWRITE(obj.updated_time);
+        READWRITE(obj.signed_agg_hash);
     }
 };
 

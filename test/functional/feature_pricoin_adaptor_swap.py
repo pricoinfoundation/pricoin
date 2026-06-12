@@ -158,14 +158,21 @@ class PricoinAdaptorSwapTest(BitcoinTestFramework):
             sb_extra["swap_id"], T_G, T_H, dleq_blob, "")
         bob.pricoin_adaptor_swap_abort(sb_extra["swap_id"], "trial cleanup")
 
-        # ─── Section 4: forward path through funding + pre-sign ───
-        self.log.info("Section 4: forward path")
-        s = alice.pricoin_adaptor_swap_set_btc_funded(sid, "ab" * 32, 0, 800_000)
-        assert_equal(s["state"], "btc_funded")
-        s = alice.pricoin_adaptor_swap_set_pric_funded(sid, "cd" * 32, 1, 12_345)
-        assert_equal(s["state"], "both_funded")
+        # ─── Section 4: forward path — presigs BEFORE funding ───
+        # Post-2026-05-15 ordering: presigs are gathered while the swap is
+        # still AdaptorReady (so a refund presig exists before any funds
+        # lock), THEN funding is recorded. SetBtcFunded now refuses to
+        # advance unless presigs.IsComplete(), so funding-before-presigs is
+        # rejected (the funds-safety invariant).
+        self.log.info("Section 4: forward path (presigs before funding)")
 
-        # SetPreSigned with an incomplete blob is rejected.
+        # Funding before presigs are complete is rejected.
+        assert_raises_rpc_error(
+            -32600, "current state does not permit this transition",
+            alice.pricoin_adaptor_swap_set_btc_funded,
+            sid, "ab" * 32, 0, 800_000)
+
+        # SetPreSigned with an incomplete blob is rejected (from AdaptorReady).
         # 64-byte BTC presig, 133-byte session, 64-byte refund sig, blobs.
         bad_btc_presig = random_hex(63)   # wrong length
         good_btc_presig = random_hex(64)
@@ -185,6 +192,12 @@ class PricoinAdaptorSwapTest(BitcoinTestFramework):
         assert_equal(s["state"], "pre_signed")
         assert_equal(s["presigs"]["btc_claim_presig"], good_btc_presig)
         assert_equal(s["presigs"]["pric_claim_presig_blob"], good_pric_blob)
+
+        # Now funding is permitted (presigs complete).
+        s = alice.pricoin_adaptor_swap_set_btc_funded(sid, "ab" * 32, 0, 800_000)
+        assert_equal(s["state"], "btc_funded")
+        s = alice.pricoin_adaptor_swap_set_pric_funded(sid, "cd" * 32, 1, 12_345)
+        assert_equal(s["state"], "both_funded")
 
         # ─── Section 5: PricClaimed → Complete ───
         self.log.info("Section 5: pric_claimed → complete")
@@ -206,12 +219,12 @@ class PricoinAdaptorSwapTest(BitcoinTestFramework):
 
         # ─── Section 6: t_secret wipe on Bob's pric_claimed transition ───
         self.log.info("Section 6: Bob's t_secret wipes on pric_claimed")
-        # Walk Bob's swap forward to pric_claimed.
-        bob.pricoin_adaptor_swap_set_btc_funded(bid, "ab" * 32, 0, 800_000)
-        bob.pricoin_adaptor_swap_set_pric_funded(bid, "cd" * 32, 1, 12_345)
+        # Walk Bob's swap forward to pric_claimed — presigs BEFORE funding.
         bob.pricoin_adaptor_swap_set_pre_signed(
             bid, good_btc_presig, good_session, 1,
             good_pric_blob, good_btc_refund, good_pric_refund)
+        bob.pricoin_adaptor_swap_set_btc_funded(bid, "ab" * 32, 0, 800_000)
+        bob.pricoin_adaptor_swap_set_pric_funded(bid, "cd" * 32, 1, 12_345)
         # Before claim: Bob has t.
         s = bob.pricoin_adaptor_swap_get(bid)
         assert_equal(s["adaptor"]["has_t"], True)
@@ -226,10 +239,16 @@ class PricoinAdaptorSwapTest(BitcoinTestFramework):
         cid = sc["swap_id"]
         alice.pricoin_adaptor_swap_set_timelocks(cid, 100_000, 100_200, 144)
         alice.pricoin_adaptor_swap_set_adaptor(cid, T_G, T_H, dleq_blob, "")
+        # Presigs before funding (the refund presig must exist before funds
+        # lock — that is exactly what makes this recovery path safe).
+        alice.pricoin_adaptor_swap_set_pre_signed(
+            cid, good_btc_presig, good_session, 0,
+            good_pric_blob, good_btc_refund, good_pric_refund)
         alice.pricoin_adaptor_swap_set_btc_funded(cid, "11" * 32, 0, 800_000)
         alice.pricoin_adaptor_swap_set_pric_funded(cid, "22" * 32, 0, 12_345)
-        # Refund from BothFunded (counterparty stalled before pre-sig phase
-        # was finalized — this is the spec's bothfunded-stall recovery path).
+        # Refund from BothFunded (counterparty stalled after funding — the
+        # spec's bothfunded-stall recovery path, now always backed by a
+        # persisted refund presig).
         s = alice.pricoin_adaptor_swap_set_refunded(cid, "33" * 32, "")
         assert_equal(s["state"], "refunded")
         assert_equal(s["pric"]["refund_txid"], "33" * 32)
@@ -272,19 +291,27 @@ class PricoinAdaptorSwapTest(BitcoinTestFramework):
         sx = alice.pricoin_adaptor_swap_create(
             "alice", bob_pub, "btc", foreign_amt, joint_addr, pric_amt, "ordering test")
         xid = sx["swap_id"]
-        # Cannot SetBtcFunded before AdaptorReady.
+        # Cannot SetBtcFunded before AdaptorReady (from setup).
         assert_raises_rpc_error(
             -32600, "current state does not permit this transition",
             alice.pricoin_adaptor_swap_set_btc_funded,
             xid, "ab" * 32, 0, 800_000)
-        # Cannot SetPreSigned before BothFunded.
-        alice.pricoin_adaptor_swap_set_timelocks(xid, 100_000, 100_200, 144)
-        alice.pricoin_adaptor_swap_set_adaptor(xid, T_G, T_H, dleq_blob, "")
+        # Cannot SetPreSigned before AdaptorReady either (from setup). In the
+        # presigs-before-funding model SetPreSigned's source state is
+        # AdaptorReady, so it is rejected here.
         assert_raises_rpc_error(
             -32600, "current state does not permit this transition",
             alice.pricoin_adaptor_swap_set_pre_signed,
             xid, good_btc_presig, good_session, 0,
             good_pric_blob, good_btc_refund, good_pric_refund)
+        # And SetBtcFunded is still blocked once AdaptorReady until presigs
+        # are complete (the funds-safety gate).
+        alice.pricoin_adaptor_swap_set_timelocks(xid, 100_000, 100_200, 144)
+        alice.pricoin_adaptor_swap_set_adaptor(xid, T_G, T_H, dleq_blob, "")
+        assert_raises_rpc_error(
+            -32600, "current state does not permit this transition",
+            alice.pricoin_adaptor_swap_set_btc_funded,
+            xid, "ab" * 32, 0, 800_000)
 
         self.log.info("Pricoin adaptor-swap state machine + persistence OK")
 

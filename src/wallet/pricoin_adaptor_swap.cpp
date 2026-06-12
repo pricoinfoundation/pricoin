@@ -378,6 +378,16 @@ TransitionResult SetBtcFunded(
             && s.state != State::PreSigned) {
             return TransitionResult::InvalidState;
         }
+        // Enforce the core funds-safety invariant: presigs (incl. the
+        // refund presig that auto-refund depends on) MUST be complete and
+        // persisted before any funding is recorded. The AdaptorReady source
+        // is only meant to cover the millisecond race where funding confirms
+        // just before SetPreSigned runs — but if presigs aren't actually in
+        // hand, advancing would strand the swap with no refund path (and
+        // SetPreSigned can no longer run once we leave AdaptorReady).
+        if (!s.presigs.IsComplete(s.foreign_chain)) {
+            return TransitionResult::InvalidState;
+        }
         s.foreign_funding_txid    = foreign_funding_txid;
         s.foreign_funding_vout    = foreign_funding_vout;
         s.foreign_funding_height  = foreign_funding_height;

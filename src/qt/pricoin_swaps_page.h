@@ -108,6 +108,12 @@ private:
     std::map<std::string /*swap_id*/, std::string /*last_state*/>
         m_last_seen_state;
     std::set<std::string /*swap_id*/> m_auto_advance_fired;
+    // Swaps whose cooperative-sign ceremony is currently running inside a
+    // nested event loop in onAdvanceClicked. Guards against a second
+    // ceremony (manual "Advance" click, or a timer re-fire) for the same
+    // swap launching concurrently — which would mint a fresh round-1 nonce
+    // and desync against the peer who already holds the first one.
+    std::set<std::string /*swap_id*/> m_ceremony_in_progress;
 
     void buildLayout();
     void refreshTable();

@@ -9,6 +9,8 @@
 
 #include <QWidget>
 #include <memory>
+#include <string>
+#include <vector>
 
 class ClientModel;
 class TransactionFilterProxy;
@@ -21,6 +23,7 @@ namespace Ui {
 }
 
 QT_BEGIN_NAMESPACE
+class QDialog;
 class QLabel;
 class QModelIndex;
 class QTableWidget;
@@ -71,10 +74,17 @@ private:
     QTableWidget* m_pricoin_ct_tx_table{nullptr};
     void refreshPricoinCtTransactions();
 
+    // Full RPC JSON for each visible CT-table row (same order as the table),
+    // so the click-for-details dialog can show the fields the columns omit
+    // (vout, spent_in_txid, total_input, change_returned, ...).
+    std::vector<std::string> m_pricoin_ct_rows;
+    QDialog* m_pricoin_ct_detail_dialog{nullptr};
+
 private Q_SLOTS:
     void LimitTransactionRows();
     void updateDisplayUnit();
     void handleTransactionClicked(const QModelIndex &index);
+    void showPricoinCtTxDetails(int row, int column);
     void updateAlerts(const QString &warnings);
     void setMonospacedFont(const QFont&);
 };

@@ -31,6 +31,7 @@
 #include <numeric>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <string_view>
 #include <utility>
 
@@ -402,6 +403,46 @@ void CTxMemPool::removeConflicts(const CTransaction &tx)
     }
 }
 
+void CTxMemPool::removeKeyImageConflicts(const CTransaction& tx)
+{
+    // Pricoin: a CT ring spend's identity is its key image, not its
+    // (decoy) vin.prevout — so removeConflicts (which keys on prevout)
+    // cannot evict a mempool tx that double-spends a now-confirmed key
+    // image with a different decoy ring. Without this, such a tx lingers
+    // (it is consensus-invalid the moment its KI is committed) and can be
+    // selected into a block template, making CreateNewBlock throw — a
+    // mining-liveness DoS. Evict any mempool tx sharing a ring-input KI
+    // with the just-confirmed tx.
+    AssertLockHeld(cs);
+    if (tx.version != PRICOIN_CT_VERSION || tx.ct_bundle.ring_inputs.empty()) return;
+
+    std::set<pricoin::ringsig::Point> confirmed_kis;
+    for (const auto& ri : tx.ct_bundle.ring_inputs) confirmed_kis.insert(ri.sig.key_image);
+
+    // Collect target TXIDS first (not iterators): removeRecursive erases
+    // entries and would invalidate any still-held iterator that happens to
+    // be a descendant of an earlier removal. Re-resolve each txid right
+    // before removing, and skip any already gone.
+    std::vector<Txid> to_remove;
+    for (const auto& entry : mapTx) {
+        const CTransaction& mtx = entry.GetTx();
+        if (mtx.version != PRICOIN_CT_VERSION || mtx.ct_bundle.ring_inputs.empty()) continue;
+        if (mtx.GetHash() == tx.GetHash()) continue;
+        for (const auto& mri : mtx.ct_bundle.ring_inputs) {
+            if (confirmed_kis.count(mri.sig.key_image)) {
+                to_remove.push_back(mtx.GetHash());
+                break;
+            }
+        }
+    }
+    for (const Txid& txid : to_remove) {
+        txiter it = mapTx.find(txid);
+        if (it == mapTx.end()) continue; // already removed as a descendant
+        ClearPrioritisation(txid);
+        removeRecursive(it, MemPoolRemovalReason::CONFLICT);
+    }
+}
+
 void CTxMemPool::removeForBlock(const std::vector<CTransactionRef>& vtx, unsigned int nBlockHeight)
 {
     // Remove confirmed txs and conflicts when a new block is connected, updating the fee logic
@@ -417,6 +458,7 @@ void CTxMemPool::removeForBlock(const std::vector<CTransactionRef>& vtx, unsigne
                 removeUnchecked(it, MemPoolRemovalReason::BLOCK);
             }
             removeConflicts(*tx);
+            removeKeyImageConflicts(*tx);
             ClearPrioritisation(tx->GetHash());
         }
     }

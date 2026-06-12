@@ -19,16 +19,21 @@
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <univalue.h>
+#include <util/strencodings.h>
 
 #include <QAbstractItemDelegate>
 #include <QAbstractItemView>
 #include <QApplication>
 #include <QDateTime>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QFormLayout>
 #include <QFrame>
+#include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QPainter>
+#include <QPushButton>
 #include <QStatusTipEvent>
 #include <QTableWidget>
 #include <QTableWidgetItem>
@@ -204,6 +209,9 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
         m_pricoin_ct_tx_table->verticalHeader()->setVisible(false);
         m_pricoin_ct_tx_table->horizontalHeader()->setStretchLastSection(true);
         m_pricoin_ct_tx_table->setMinimumHeight(160);
+        m_pricoin_ct_tx_table->setToolTip(tr("Click a row for full details"));
+        connect(m_pricoin_ct_tx_table, &QTableWidget::cellClicked,
+                this, &OverviewPage::showPricoinCtTxDetails);
         form->addRow(m_pricoin_ct_tx_table);
 
         // Insert just below the existing balance block (top of overview).
@@ -317,6 +325,7 @@ void OverviewPage::refreshPricoinCtTransactions()
         [&](const UniValue* a, const UniValue* b) { return height_of(*a) > height_of(*b); });
 
     m_pricoin_ct_tx_table->setRowCount(0);
+    m_pricoin_ct_rows.clear();
     for (const UniValue* rp : sorted) {
         const UniValue& r = *rp;
         const std::string type = r["type"].isStr() ? r["type"].get_str() : "";
@@ -358,7 +367,114 @@ void OverviewPage::refreshPricoinCtTransactions()
         set(2, height_str);
         set(3, status);
         set(4, txid_short, txid);
+        m_pricoin_ct_rows.push_back(r.write());
     }
+}
+
+void OverviewPage::showPricoinCtTxDetails(int row, int column)
+{
+    Q_UNUSED(column);
+    if (row < 0 || row >= (int)m_pricoin_ct_rows.size()) return;
+    UniValue r;
+    if (!r.read(m_pricoin_ct_rows[row]) || !r.isObject()) return;
+
+    // One detail dialog at a time: clicking another row replaces it.
+    if (m_pricoin_ct_detail_dialog) {
+        m_pricoin_ct_detail_dialog->close();
+        m_pricoin_ct_detail_dialog->deleteLater();
+        m_pricoin_ct_detail_dialog = nullptr;
+    }
+
+    const BitcoinUnit unit = (walletModel && walletModel->getOptionsModel())
+        ? walletModel->getOptionsModel()->getDisplayUnit() : BitcoinUnit::BTC;
+    // RPC amounts arrive as decimal strings (ValueFromAmount); parse back to
+    // CAmount so the dialog honours the display unit and privacy masking.
+    auto fmt_amount = [&](const UniValue& v) -> QString {
+        CAmount amt{0};
+        if (!v.isNull() && ParseFixedPoint(v.getValStr(), 8, &amt)) {
+            return BitcoinUnits::formatWithPrivacy(unit, amt, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy);
+        }
+        return QString::fromStdString(v.getValStr());
+    };
+
+    auto* dlg = new QDialog(this);
+    dlg->setWindowTitle(tr("Confidential transaction details"));
+    dlg->setMinimumWidth(560);
+    auto* form = new QFormLayout(dlg);
+    auto add_text = [&](const QString& label, const QString& value, bool mono = false) {
+        auto* l = new QLabel(value, dlg);
+        l->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        l->setWordWrap(true);
+        if (mono) l->setFont(GUIUtil::fixedPitchFont());
+        form->addRow(label, l);
+    };
+    auto add_txid = [&](const QString& label, const QString& txid) {
+        auto* line = new QHBoxLayout();
+        auto* l = new QLabel(txid, dlg);
+        l->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        l->setWordWrap(true);
+        l->setFont(GUIUtil::fixedPitchFont());
+        auto* copy = new QPushButton(tr("Copy"), dlg);
+        copy->setMaximumWidth(60);
+        connect(copy, &QPushButton::clicked, this, [txid] { GUIUtil::setClipboard(txid); });
+        line->addWidget(l, /*stretch=*/1);
+        line->addWidget(copy);
+        form->addRow(label, line);
+    };
+
+    const std::string type = r["type"].isStr() ? r["type"].get_str() : "";
+    const bool is_sent = (type == "sent");
+    const bool is_change = r.exists("is_change") && r["is_change"].isBool() && r["is_change"].get_bool();
+
+    QString type_str = is_sent ? tr("Sent") : tr("Received");
+    if (is_change) type_str += tr(" (change from one of your own sends)");
+    add_text(tr("Type:"), type_str);
+    add_text(tr("Amount:"), fmt_amount(r["amount"]));
+
+    if (r["txid"].isStr()) add_txid(tr("Transaction ID:"), QString::fromStdString(r["txid"].get_str()));
+    if (!is_sent && r["vout"].isNum() && r["vout"].getInt<int>() >= 0) {
+        add_text(tr("Output index:"), QString::number(r["vout"].getInt<int>()));
+    }
+
+    const int height = r["height"].isNum() ? r["height"].getInt<int>() : -1;
+    if (height < 0) {
+        add_text(tr("Confirmations:"), tr("Unconfirmed (in mempool)"));
+    } else {
+        QString conf = tr("Block %1").arg(height);
+        if (clientModel) {
+            const int tip = clientModel->getNumBlocks();
+            if (tip >= height) conf += tr(" (%n confirmation(s))", "", tip - height + 1);
+        }
+        add_text(tr("Confirmations:"), conf);
+    }
+
+    if (is_sent) {
+        if (!r["total_input"].isNull()) add_text(tr("Total input:"), fmt_amount(r["total_input"]));
+        if (!r["change_returned"].isNull()) add_text(tr("Change returned:"), fmt_amount(r["change_returned"]));
+        auto* note = new QLabel(tr(
+            "The sent amount is the net outflow from this wallet: recipient "
+            "amount(s) and network fee combined. On a confidential chain the "
+            "recipient's stealth address is not recoverable from your own "
+            "wallet data."), dlg);
+        note->setWordWrap(true);
+        note->setStyleSheet("QLabel { color: #666; font-size: 11px; }");
+        form->addRow(note);
+    } else {
+        const bool spent = r.exists("spent") && r["spent"].isBool() && r["spent"].get_bool();
+        add_text(tr("Status:"), spent ? tr("Spent") : tr("Unspent"));
+        if (r["spent_in_txid"].isStr()) {
+            add_txid(tr("Spent in:"), QString::fromStdString(r["spent_in_txid"].get_str()));
+        }
+    }
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dlg);
+    connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::close);
+    form->addRow(buttons);
+
+    m_pricoin_ct_detail_dialog = dlg;
+    dlg->show();
+    dlg->raise();
+    dlg->activateWindow();
 }
 
 void OverviewPage::setClientModel(ClientModel *model)

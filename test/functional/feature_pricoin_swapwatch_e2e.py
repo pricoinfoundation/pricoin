@@ -139,6 +139,12 @@ class PricoinSwapwatchE2ETest(BitcoinTestFramework):
         sid = sa["swap_id"]
         alice.pricoin_adaptor_swap_set_timelocks(sid, 100_000, 100_200, 144)
         alice.pricoin_adaptor_swap_set_adaptor(sid, T_G, T_H, dleq_blob, "")
+        # Presigs before funding (the watcher's SetBtcFunded now requires
+        # presigs.IsComplete()) — so reach pre_signed before the funding
+        # watch can advance the swap.
+        alice.pricoin_adaptor_swap_set_pre_signed(
+            sid, random_hex(64), random_hex(133), 0,
+            random_hex(120), random_hex(64), random_hex(160))
 
         # ─── Section 2: register watch + tick on tx-not-found ───
         # Backend returns 404 → entry stays pending.
@@ -147,7 +153,7 @@ class PricoinSwapwatchE2ETest(BitcoinTestFramework):
         alice.pricoin_swapwatch_add(sid, "foreign_funding", f_txid, 0, 1)
         r = alice.pricoin_swapwatch_tick_once()
         assert_equal(r["pending_after"], 1)
-        assert_equal(alice.pricoin_adaptor_swap_get(sid)["state"], "adaptor_ready")
+        assert_equal(alice.pricoin_adaptor_swap_get(sid)["state"], "pre_signed")
 
         # ─── Section 3: tx exists but unconfirmed → pending ─────
         self.log.info("Section 3: tick with unconfirmed tx")
@@ -156,7 +162,7 @@ class PricoinSwapwatchE2ETest(BitcoinTestFramework):
         }
         r = alice.pricoin_swapwatch_tick_once()
         assert_equal(r["pending_after"], 1)
-        assert_equal(alice.pricoin_adaptor_swap_get(sid)["state"], "adaptor_ready")
+        assert_equal(alice.pricoin_adaptor_swap_get(sid)["state"], "pre_signed")
 
         # ─── Section 4: tx confirmed at depth 5 (tip 1234, block 1230)
         # → 5 confirmations ≥ min_confirmations=1 → transition fires.
@@ -203,6 +209,9 @@ class PricoinSwapwatchE2ETest(BitcoinTestFramework):
         bid = sb["swap_id"]
         alice.pricoin_adaptor_swap_set_timelocks(bid, 100_000, 100_200, 144)
         alice.pricoin_adaptor_swap_set_adaptor(bid, T_G, T_H, dleq_blob, "")
+        alice.pricoin_adaptor_swap_set_pre_signed(
+            bid, random_hex(64), random_hex(133), 0,
+            random_hex(120), random_hex(64), random_hex(160))
 
         f2_txid = "22" * 32
         # min_confirmations=6
@@ -218,7 +227,7 @@ class PricoinSwapwatchE2ETest(BitcoinTestFramework):
         }
         r = alice.pricoin_swapwatch_tick_once()
         assert_equal(r["pending_after"], 1)
-        assert_equal(alice.pricoin_adaptor_swap_get(bid)["state"], "adaptor_ready")
+        assert_equal(alice.pricoin_adaptor_swap_get(bid)["state"], "pre_signed")
 
         # Bump tip so the same tx now has 6 confirmations.
         _FakeEsploraHandler.state["height"] = 1235

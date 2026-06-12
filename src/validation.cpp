@@ -74,6 +74,7 @@
 #include <numeric>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <span>
 #include <string>
 #include <tuple>
@@ -2632,6 +2633,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // Pricoin: accumulate this block's v4-ring-input key images so we
     // can commit them in one block-tagged batch after the loop.
     std::vector<pricoin::ringsig::Point> block_kis;
+    // Pricoin: reject a key image that appears in two transactions within
+    // the SAME block. The per-tx VerifyConfidentialContextual check only
+    // consults the already-committed set (g_key_images), which does not
+    // yet contain this block's KIs — so without this intra-block guard a
+    // miner could place two ring spends of the same output in one block
+    // (double-spend / supply inflation), and every node would accept it
+    // because CommitBlockKIs silently de-duplicates on insert. This must
+    // run on BOTH the fJustCheck (TestBlockValidity) and real-connect
+    // passes so block-template assembly and full validation agree.
+    std::set<pricoin::ringsig::Point> seen_block_kis;
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
         if (!state.IsValid()) break;
@@ -2724,9 +2735,21 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         // TestBlockValidity runs this loop with fJustCheck=true, and we
         // must not pollute the committed set there or the actual
         // ConnectBlock will reject as double-spend.
-        if (!fJustCheck && tx.version == PRICOIN_CT_VERSION) {
+        if (tx.version == PRICOIN_CT_VERSION) {
+            bool intra_block_dup = false;
             for (const auto& ri : tx.ct_bundle.ring_inputs) {
-                block_kis.push_back(ri.sig.key_image);
+                if (!seen_block_kis.insert(ri.sig.key_image).second) {
+                    intra_block_dup = true;
+                    break;
+                }
+                // Only the real-connect pass commits KIs to the store.
+                if (!fJustCheck) block_kis.push_back(ri.sig.key_image);
+            }
+            if (intra_block_dup) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                              "bad-pct-double-spend-keyimage-intrablock",
+                              "duplicate ring key image within block");
+                break;
             }
         }
     }

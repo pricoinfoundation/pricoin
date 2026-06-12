@@ -1343,12 +1343,17 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
                 update_fn = [&ct_receives](CWalletTx& wtx, bool /*new_tx*/) -> bool {
                     bool changed = false;
                     for (const auto& rec : ct_receives) {
+                        // Persist only the recovered VALUE (used by
+                        // gettransaction). The one-time private key is
+                        // deliberately NOT stored: mapValue is serialized
+                        // unencrypted even on an encrypted wallet, so writing
+                        // the spend key here would defeat at-rest encryption.
+                        // It is rederived on demand from the (encrypted)
+                        // stealth identity via RehydrateRecovery when a spend
+                        // actually needs it.
                         const std::string vk = "pct_v" + std::to_string(rec.vout_index);
-                        const std::string pk = "pct_p" + std::to_string(rec.vout_index);
                         const std::string vs = std::to_string(rec.value);
-                        const std::string ps = HexStr(rec.one_time_priv);
                         if (wtx.mapValue[vk] != vs) { wtx.mapValue[vk] = vs; changed = true; }
-                        if (wtx.mapValue[pk] != ps) { wtx.mapValue[pk] = ps; changed = true; }
                     }
                     return changed;
                 };

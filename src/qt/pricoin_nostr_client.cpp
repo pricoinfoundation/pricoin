@@ -581,6 +581,24 @@ void PricoinNostrClient::onTextMessage(const QString& message)
             static_cast<qint64>(ev.value("created_at").toDouble());
 
         if (m_seen_event_ids.contains(id_hex)) return;
+
+        // Freshness window: reject events whose created_at is far from now.
+        // The relay transport is untrusted and can re-deliver an old (still
+        // validly-signed) event after a restart — the in-memory seen-set is
+        // lost on restart, so without a time bound a replayed swap_addrs /
+        // adaptor_setup / coopsign DM could re-drive or corrupt swap state.
+        // A ±15-minute window makes a stale replay un-actionable while
+        // tolerating modest clock skew. (Live ceremony DMs are seconds old.)
+        {
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            constexpr qint64 kMaxSkewSecs = 15 * 60;
+            if (created_at < now - kMaxSkewSecs || created_at > now + kMaxSkewSecs) {
+                Q_EMIT log(tr("Rejected event %1: timestamp outside freshness "
+                              "window (replay?)").arg(id_hex.left(12) + "…"));
+                return;
+            }
+        }
+
         Q_EMIT log(tr("Received kind=%1 event %2 from %3…")
             .arg(kind).arg(id_hex.left(12) + "…").arg(pubkey_hex.left(12)));
 
@@ -604,6 +622,15 @@ void PricoinNostrClient::onTextMessage(const QString& message)
             return;
         }
 
+        // Bound the dedup set so it can't grow without limit over a long
+        // session (sticky DM resends + offer churn). The freshness window
+        // above is the real replay defence; this set only suppresses
+        // duplicates within the window, so dropping the oldest entries on
+        // overflow is safe.
+        constexpr int kMaxSeenEventIds = 8192;
+        if (m_seen_event_ids.size() >= kMaxSeenEventIds) {
+            m_seen_event_ids.clear();
+        }
         m_seen_event_ids.insert(id_hex);
         if (kind == kOfferKind) {
             // Branch on cancellation tombstone. Cancellation events

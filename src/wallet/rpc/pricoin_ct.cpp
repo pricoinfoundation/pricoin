@@ -450,9 +450,18 @@ util::Result<ResolvedDest> ResolveDest(
         if (!IsValidDestination(dest)) {
             return util::Error{Untranslated("invalid address (neither stealth nor bech32)")};
         }
-        d.spk = GetScriptForDestination(dest);
-        GetRandBytes(d.nonce);
-        // d.R and d.otp stay zero — scanner skips outputs whose tx_pubkey is all-zero.
+        // Reject transparent (non-stealth) destinations: a confidential
+        // output paid to one is effectively BURNED. With no stealth R and a
+        // random rangeproof nonce, the recipient cannot rewind the proof to
+        // learn (value, blind) — and the blind is required to ever spend the
+        // output (direct or ring). They hold the P2WPKH key but can build no
+        // valid spend. Fail loudly instead of silently destroying funds.
+        // (Swap funding uses the separate pinned-ephemeral stealth builder,
+        // so this does not affect swaps.)
+        return util::Error{Untranslated(
+            "transparent (bech32) destination not supported for confidential "
+            "sends: funds paid this way are unspendable by the recipient. Use "
+            "a stealth (pric1...) address.")};
     }
     return d;
 }
@@ -990,7 +999,17 @@ CTRecoveryIndex& SyncRecoveryIndexLocked(CWallet& wallet, SyncStats* stats = nul
     for (int h = index.last_scanned_height + 1; h <= tip_height; ++h) {
         const uint256 block_hash = chain.getBlockHash(h);
         CBlock block;
-        if (!chain.findBlock(block_hash, interfaces::FoundBlock().data(block))) continue;
+        if (!chain.findBlock(block_hash, interfaces::FoundBlock().data(block))) {
+            // STOP at the first unreadable block rather than skipping it:
+            // last_scanned_height must not advance past a block we never
+            // scanned, or a later success would persist a permanent gap and
+            // any CT output to this wallet in block h would be invisible to
+            // balance/spend forever. Leaving last_scanned_height at h-1 makes
+            // the next sync retry from h.
+            LogWarning("Pricoin CT scan: block at height %d unreadable; "
+                       "pausing scan here, will retry next sync\n", h);
+            break;
+        }
         ++new_blocks;
         for (const auto& tx_ref : block.vtx) {
             if (tx_ref->version != PRICOIN_CT_VERSION) continue;
@@ -1340,6 +1359,33 @@ std::vector<ChainCTOutput> CollectChainCTOutputs(interfaces::Chain& chain)
                 });
             }
         }
+    }
+
+    // Drop candidates that consensus would reject as ring members. A
+    // ring-spent CT output is intentionally NOT erased from chainstate, so
+    // it stays a valid decoy — but a DIRECT (non-ring) spend DOES erase its
+    // coin, and a ring referencing an erased/missing output is rejected
+    // (bad-pct-ring-member-missing). Including such outputs as decoys would
+    // make the whole tx consensus-invalid — only discovered at broadcast,
+    // and for the jointspend presig path only AFTER both legs are funded.
+    // Keep exactly what consensus accepts: present (unspent) AND confidential.
+    if (!result.empty()) {
+        std::map<COutPoint, Coin> coins;
+        for (const auto& c : result) {
+            coins.try_emplace(COutPoint{Txid::FromUint256(c.ref.hash), c.ref.n});
+        }
+        chain.findCoins(coins);
+        std::vector<ChainCTOutput> filtered;
+        filtered.reserve(result.size());
+        for (auto& c : result) {
+            const COutPoint op{Txid::FromUint256(c.ref.hash), c.ref.n};
+            auto it = coins.find(op);
+            if (it == coins.end()) continue;
+            const Coin& coin = it->second;
+            if (coin.IsSpent() || !coin.IsConfidential()) continue;
+            filtered.push_back(std::move(c));
+        }
+        result = std::move(filtered);
     }
     return result;
 }
@@ -2058,7 +2104,14 @@ RPCMethod walletsendct_from_ct()
             if (!parsed_dest) {
                 CTxDestination d = DecodeDestination(dest_addr_str);
                 if (!IsValidDestination(d)) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid dest_address");
-                transparent_dest_spk = GetScriptForDestination(d);
+                // A confidential output paid to a transparent address is
+                // unspendable by the recipient (no stealth R / rangeproof
+                // nonce → they can't recover the blind needed to spend).
+                // Reject rather than silently burn funds.
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                    "transparent (bech32) destination not supported for confidential "
+                    "sends: the recipient could never spend the output. Use a stealth "
+                    "(pric1...) address.");
             }
             const CAmount change_value = input_total - target;
 
@@ -2216,6 +2269,24 @@ RPCMethod walletsendct_from_ct()
                                              node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL,
                                              err_str)) {
                 throw JSONRPCError(RPC_WALLET_ERROR, "broadcastTransaction failed: " + err_str);
+            }
+
+            // Mark each consumed CT output spent by its key image. A direct
+            // (non-ring) v4 spend publishes NO ring key image on-chain, so
+            // pricoin::IsKeyImageCommitted never flips for these inputs;
+            // without recording them here the picker and balance would keep
+            // counting them as unspent forever, re-selecting dead coins into
+            // chain-rejected txs. (walletsendct_ring does the analogous Add
+            // from the ring key image.) Best-effort: broadcast already
+            // succeeded.
+            for (const auto& p : picked_list) {
+                if (!::wallet::pricoin_broadcasted_kis::Add(
+                        wallet, p.rec.key_image, tx_ref->GetHash().ToUint256())) {
+                    LogInfo("Pricoin walletsendct_from_ct: broadcasted-KI persist "
+                            "failed for tx %s input — recovery cache may briefly "
+                            "over-report until confirmation\n",
+                            tx_ref->GetHash().ToString());
+                }
             }
 
             UniValue spent_arr{UniValue::VARR};
@@ -5847,6 +5918,53 @@ namespace btr = ::pricoin::swap::btc_musig2_runtime;
 
 namespace {
 
+// Maps a live round1_safe secnonce handle to the persistent nonce-policy
+// record key it was committed under. Lets partial_sign find the durable
+// record and enforce one-aggregate-nonce-per-secnonce (the deterministic
+// round1_safe path re-derives the same k, so two partials over different
+// aggregate nonces would leak the key — see NonceRecord::signed_agg_hash).
+// Plain (non-_safe) round1 nonces are fresh-random + single-use and do NOT
+// appear here, so partial_sign skips the binding for them.
+Mutex g_btc_safe_nonce_keys_mutex;
+std::map<uint256, ::pricoin::btc_musig2_nonce_policy::RecordKey>
+    g_btc_safe_nonce_keys GUARDED_BY(g_btc_safe_nonce_keys_mutex);
+
+void StashSafeNonceKey(const uint256& handle,
+                       const ::pricoin::btc_musig2_nonce_policy::RecordKey& key)
+{
+    LOCK(g_btc_safe_nonce_keys_mutex);
+    g_btc_safe_nonce_keys[handle] = key;
+}
+
+std::optional<::pricoin::btc_musig2_nonce_policy::RecordKey>
+TakeSafeNonceKey(const uint256& handle)
+{
+    LOCK(g_btc_safe_nonce_keys_mutex);
+    auto it = g_btc_safe_nonce_keys.find(handle);
+    if (it == g_btc_safe_nonce_keys.end()) return std::nullopt;
+    auto key = it->second;
+    g_btc_safe_nonce_keys.erase(it);
+    return key;
+}
+
+// SHA256("pricoin/btc-musig2/agg-bind" || session_data || nonce_parity).
+// Identifies the exact aggregate-nonce session a partial signs over. Any
+// change in the peer's nonce changes the session data → a different hash.
+uint256 BtcMusig2SessionBindHash(const std::string& session_data_hex,
+                                 int nonce_parity)
+{
+    CSHA256 h;
+    static const char kTag[] = "pricoin/btc-musig2/agg-bind-v1";
+    h.Write(reinterpret_cast<const unsigned char*>(kTag), sizeof(kTag) - 1);
+    h.Write(reinterpret_cast<const unsigned char*>(session_data_hex.data()),
+            session_data_hex.size());
+    unsigned char p = static_cast<unsigned char>(nonce_parity & 0xff);
+    h.Write(&p, 1);
+    uint256 out;
+    h.Finalize(out.data());
+    return out;
+}
+
 std::vector<CPubKey> ParseBtcPubKeys(const UniValue& arr)
 {
     if (!arr.isArray() || arr.empty()) {
@@ -6174,6 +6292,11 @@ RPCMethod pricoin_btc_musig2_partial_sign()
                 throw JSONRPCError(RPC_INVALID_REQUEST,
                     "secnonce_handle not found — already consumed, never created, or daemon restarted");
             }
+            // If this handle came from the DETERMINISTIC round1_safe path,
+            // bind its secnonce to a single aggregate nonce now and refuse a
+            // second partial over a different one (the key-extraction guard).
+            // Done before signing so a rejected attempt produces no partial.
+            const auto safe_nonce_key = TakeSafeNonceKey(*handle_opt);
             bma::Scalar self_priv;
             const std::string priv_hex =
                 request.params[1].isNull() ? "" : request.params[1].get_str();
@@ -6215,6 +6338,32 @@ RPCMethod pricoin_btc_musig2_partial_sign()
             // check inside PartialSign.
             if (!bma::NormalizeSeckeyEvenY(self_priv)) {
                 throw JSONRPCError(RPC_INTERNAL_ERROR, "seckey normalization failed");
+            }
+
+            if (safe_nonce_key) {
+                namespace bnrec = ::wallet::pricoin_btc_musig2_nonce_records;
+                auto wallet_for_bind = GetWalletForJSONRPCRequest(request);
+                if (!wallet_for_bind) {
+                    throw JSONRPCError(RPC_WALLET_NOT_FOUND,
+                        "wallet not loaded (needed to enforce MuSig2 nonce binding)");
+                }
+                const std::string sess_data = request.params[4]["data"].get_str();
+                const int parity = request.params[4]["nonce_parity"].getInt<int>();
+                const uint256 agg_hash = BtcMusig2SessionBindHash(sess_data, parity);
+                const auto br = bnrec::BindAggNonceAndCheck(
+                    *wallet_for_bind, *safe_nonce_key, agg_hash);
+                using BR = bnrec::BindResult;
+                if (br == BR::ConflictDifferentAggNonce) {
+                    throw JSONRPCError(RPC_INVALID_REQUEST,
+                        "refusing to partial-sign: this secnonce already signed a "
+                        "different aggregate nonce — a second partial would leak the "
+                        "signing key (MuSig2 nonce-reuse). Restart the ceremony from "
+                        "round1 with a fresh session.");
+                }
+                if (br != BR::Ok) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR,
+                        strprintf("MuSig2 nonce binding failed (code %d)", (int)br));
+                }
             }
 
             auto partial = bma::PartialSign(*secnonce, self_priv, self_pub, cache, session);
@@ -6656,6 +6805,11 @@ RPCMethod pricoin_btc_musig2_round1_safe()
                 // Should never happen — fresh random handle.
                 throw JSONRPCError(RPC_INTERNAL_ERROR, "secnonce handle collision");
             }
+            // Remember which durable nonce-policy record this handle was
+            // committed under, so partial_sign can bind the (deterministic)
+            // secnonce to a single aggregate nonce and refuse a key-leaking
+            // second partial over a different one.
+            StashSafeNonceKey(handle, key);
 
             UniValue out{UniValue::VOBJ};
             out.pushKV("pubnonce",        HexStr(*pubnonce));
@@ -9716,8 +9870,17 @@ CAmount ConfidentialBalance(CWallet& wallet)
     const CTRecoveryIndex& index = SyncRecoveryIndexLocked(wallet);
     CAmount total = 0;
     for (const auto& [_, rec] : index.entries) {
-        // Phase 3a: spentness is the KI set, not chainstate erasure.
-        if (pricoin::IsKeyImageCommitted(rec.key_image)) continue;
+        // Phase 3a: spentness is the KI set, not chainstate erasure. Use
+        // the SAME three-way predicate as pricoin_listownct and the spend
+        // pickers — committed on-chain OR broadcast-by-us OR in mempool —
+        // so the displayed balance never over-reports an output whose spend
+        // is in flight but not yet confirmed.
+        const bool committed = pricoin::IsKeyImageCommitted(rec.key_image);
+        const bool bcast = ::wallet::pricoin_broadcasted_kis::Lookup(
+                               wallet, rec.key_image).has_value();
+        const bool in_mempool = wallet.chain().isPricoinKeyImageInMempool(
+            std::span<const unsigned char, 33>{rec.key_image.data(), 33});
+        if (committed || bcast || in_mempool) continue;
         total += rec.value;
     }
     return total;

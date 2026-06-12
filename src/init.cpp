@@ -2309,6 +2309,44 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     node.background_init_thread = std::thread(&util::TraceThread, "initload", [=, &chainman, &args, &node] {
         ScheduleBatchPriority();
+
+        // Pricoin: BEFORE reconnecting blocks, drop key images committed
+        // for blocks ABOVE the durable coins-view tip. The KI store is
+        // fsync'd on every block connect, but the chainstate (coins DB)
+        // flushes lazily — so after an unclean shutdown the KI store can be
+        // ahead of the durable chainstate. ImportBlocks→ActivateBestChain
+        // then reconnects those higher blocks, and VerifyRingInputs would
+        // reject each one as a double-spend of its OWN already-committed key
+        // image, marking the node's valid chain BLOCK_FAILED_VALID. The
+        // post-activation self-heal below runs too late to prevent that, so
+        // we pre-prune here keyed on the durable coins tip (not the active
+        // chain, which after load already points at the higher tip). The
+        // reconnection re-commits these KIs idempotently.
+        {
+            LOCK(::cs_main);
+            const uint256 durable_tip =
+                chainman.ActiveChainstate().CoinsTip().GetBestBlock();
+            const CBlockIndex* durable_index = durable_tip.IsNull()
+                ? nullptr : chainman.m_blockman.LookupBlockIndex(durable_tip);
+            if (durable_index) {
+                pricoin::PruneOrphanedKeyImages(
+                    std::function<bool(const uint256&)>{
+                        [&chainman, durable_index](const uint256& block_hash)
+                            EXCLUSIVE_LOCKS_REQUIRED(::cs_main) -> bool {
+                            // Preserve the legacy/untagged bucket (null hash);
+                            // it carries no block attribution and the active-
+                            // chain rebuild walk can't recreate it.
+                            if (block_hash.IsNull()) return true;
+                            // Keep iff block_hash is an ancestor-or-equal of
+                            // the durable coins tip (already reflected in the
+                            // flushed chainstate); drop anything above it.
+                            const CBlockIndex* bi = chainman.m_blockman
+                                .LookupBlockIndex(block_hash);
+                            return bi && durable_index->GetAncestor(bi->nHeight) == bi;
+                        }});
+            }
+        }
+
         // Import blocks and ActivateBestChain()
         ImportBlocks(chainman, vImportFiles);
         WITH_LOCK(::cs_main, chainman.UpdateIBDStatus());

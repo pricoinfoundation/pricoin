@@ -276,7 +276,18 @@ std::optional<RangeProof> CreateRangeProof(
                                        blind.data(),
                                        nonce.data(),
                                        /*exp=*/0,
-                                       /*min_bits=*/0,
+                                       // min_bits=64: prove the full [0, 2^64)
+                                       // range for EVERY output so the proof
+                                       // size and proven range are identical
+                                       // regardless of the amount. With
+                                       // min_bits=0 the proof used only
+                                       // ceil(log2(value+1)) mantissa bits, so
+                                       // its byte-length and max_value leaked
+                                       // each output's order of magnitude — a
+                                       // systemic amount-privacy hole for a
+                                       // privacy chain. Worst-case size still
+                                       // fits kMaxRangeProofSize (5134).
+                                       /*min_bits=*/64,
                                        value,
                                        /*message=*/nullptr, /*msg_len=*/0,
                                        extra_commit.empty() ? nullptr : extra_commit.data(),

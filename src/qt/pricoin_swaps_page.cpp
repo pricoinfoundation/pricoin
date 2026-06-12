@@ -739,6 +739,26 @@ void PricoinSwapsPage::onAdvanceClicked()
     const std::string sid = selectedSwapId();
     if (sid.empty()) return;
 
+    // Re-entrancy guard. onAdvanceClicked drives the cooperative-sign
+    // ceremony inside nested QEventLoops (the off-screen headless dialogs),
+    // during which the 5s auto-advance timer keeps firing and the "Advance
+    // state" button stays enabled. A second entry for the SAME swap would
+    // start a second round-1 nonce against a peer who already holds the
+    // first — the exact ceremony desync behind the both_funded-stuck class.
+    // Block it; the in-flight ceremony will finish and the next tick can
+    // continue. RAII clears the marker on every return path.
+    if (m_ceremony_in_progress.count(sid)) {
+        setStatus(tr("A signing step for this swap is already running; "
+                     "please wait for it to finish."), true);
+        return;
+    }
+    m_ceremony_in_progress.insert(sid);
+    struct CeremonyGuard {
+        std::set<std::string>& set;
+        std::string id;
+        ~CeremonyGuard() { set.erase(id); }
+    } ceremony_guard{m_ceremony_in_progress, sid};
+
     // Capture a copy of the selected swap.
     interfaces::Wallet::PricoinAdaptorSwapSnapshot snap{};
     bool found = false;

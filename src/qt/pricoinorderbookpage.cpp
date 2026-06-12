@@ -1866,7 +1866,19 @@ void PricoinOrderbookPage::onNostrDmReceived(const QString& from_xonly_hex,
             .arg(QString::fromStdString(sender_oid).left(12)), true);
         return;
     }
-    if (sender_order->maker_pubkey_hex.size() >= 66) {
+    // Fail CLOSED: a malformed/short maker pubkey must NOT bypass sender
+    // authentication. Previously this check only ran when size() >= 66, so
+    // any order whose maker_pubkey_hex was shorter became a channel through
+    // which match/unmatch/swap_start/swap_addrs DMs were processed without
+    // verifying the sender. Reject anything that isn't a well-formed
+    // 66-char (compressed, "02"/"03"-prefixed) key.
+    if (sender_order->maker_pubkey_hex.size() != 66) {
+        setStatus(tr("DM rejected: order %1 has a malformed maker pubkey; "
+                     "cannot authenticate sender")
+            .arg(QString::fromStdString(sender_oid).left(12)), true);
+        return;
+    }
+    {
         const QString claimed_xonly = QString::fromStdString(
             sender_order->maker_pubkey_hex.substr(2));
         if (claimed_xonly != from_xonly_hex) {

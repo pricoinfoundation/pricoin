@@ -5,6 +5,7 @@
 #include <wallet/pricoin_btc_musig2_nonce_records.h>
 
 #include <pricoin/btc_musig2_nonce_policy.h>
+#include <logging.h>
 #include <streams.h>
 #include <sync.h>
 #include <util/time.h>
@@ -61,9 +62,21 @@ bool LoadFromDBLocked(CWallet& wallet, WalletCache& cache)
         try {
             ds >> rec;
         } catch (const std::exception&) {
-            return false;
+            // A record that no longer parses is an old-format (pre
+            // signed_agg_hash) or otherwise corrupt row. Skip it rather
+            // than failing the whole load: an in-flight nonce record can
+            // never be completed across this format change anyway (the
+            // volatile secnonce is long gone), so dropping it just forces
+            // a fresh round-1 — strictly safer than blocking the wallet.
+            LogWarning("Pricoin BTC musig2 nonce: skipping unparseable record "
+                       "%s (old format or corrupt)\n", digest.ToString());
+            continue;
         }
-        if (policy::RecordDigest(rec.key) != digest) return false;
+        if (policy::RecordDigest(rec.key) != digest) {
+            LogWarning("Pricoin BTC musig2 nonce: skipping record with digest "
+                       "mismatch %s\n", digest.ToString());
+            continue;
+        }
         cache.store.Replay(std::move(rec));
     }
     return true;
@@ -135,6 +148,19 @@ BeginResult Begin(
         return BeginResult::ConflictSameSessionInFlight;
     }
 
+    // Preserve the aggregate-nonce binding across an idempotent re-commit.
+    // A deterministic round1_safe re-derives the same pubnonce, so this is
+    // the same secnonce being re-committed (crash-resume). TryCreate just
+    // overwrote the stored record with a fresh one whose signed_agg_hash is
+    // null — if a partial had already bound an aggregate nonce, carry it
+    // forward, or the regeneration would silently wipe the key-leak guard
+    // and a second partial over a different aggregate nonce would be allowed.
+    if (prior && !prior->signed_agg_hash.IsNull()
+        && rec.pubnonce == prior->pubnonce) {
+        rec.signed_agg_hash = prior->signed_agg_hash;
+        cache.store.Replay(rec);
+    }
+
     if (!WriteRecordToDB(wallet, rec)) {
         if (prior) cache.store.Replay(*prior);
         else       cache.store.Erase(rec.key);
@@ -162,6 +188,40 @@ MutateResult MarkFinalized(CWallet& wallet, const RecordKey& key)
         return MutateResult::WriteFailed;
     }
     return MutateResult::Ok;
+}
+
+BindResult BindAggNonceAndCheck(
+    CWallet& wallet, const RecordKey& key, const uint256& agg_hash)
+{
+    if (agg_hash.IsNull()) return BindResult::InvalidInput;
+    if (!RequireUnlocked(wallet)) return BindResult::Locked;
+    LOCK(g_mutex);
+    auto& cache = EnsureCache(wallet);
+    if (!EnsureLoadedLocked(wallet, cache)) return BindResult::WriteFailed;
+
+    const NonceRecord* existing = cache.store.Get(key);
+    if (!existing) return BindResult::NotFound;
+
+    // Already bound: idempotent only if the SAME aggregate nonce. A
+    // different agg_hash means a second partial_sign over the same
+    // deterministic secnonce with a different challenge — the key-leak
+    // attack — so refuse.
+    if (!existing->signed_agg_hash.IsNull()) {
+        return existing->signed_agg_hash == agg_hash
+                   ? BindResult::Ok
+                   : BindResult::ConflictDifferentAggNonce;
+    }
+
+    NonceRecord prior = *existing;
+    NonceRecord updated = *existing;
+    updated.signed_agg_hash = agg_hash;
+    updated.updated_time = GetTime<std::chrono::seconds>().count();
+    cache.store.Replay(updated);
+    if (!WriteRecordToDB(wallet, updated)) {
+        cache.store.Replay(prior);
+        return BindResult::WriteFailed;
+    }
+    return BindResult::Ok;
 }
 
 MutateResult Erase(CWallet& wallet, const RecordKey& key)

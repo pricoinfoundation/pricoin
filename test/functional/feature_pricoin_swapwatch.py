@@ -120,8 +120,20 @@ class PricoinSwapwatchTest(BitcoinTestFramework):
         assert_equal(before, after)
         assert_equal(len(after), 2)
 
-        # ─── Section 5: notify drives transitions ──────────────
-        self.log.info("Section 5: notify → SetBtcFunded → BtcFunded")
+        # Presig blobs reused across sections (presigs-before-funding).
+        good_btc_presig = "00" * 64
+        good_session    = "00" * 133
+        good_pric_blob  = "00" * 200
+        good_btc_refund = "00" * 64
+        good_pric_refund = "00" * 200
+
+        # ─── Section 5: presigs, then notify drives funding ─────
+        self.log.info("Section 5: pre_signed → notify → SetBtcFunded")
+        # SetBtcFunded now requires presigs.IsComplete(); reach pre_signed
+        # before funding can be recorded.
+        alice.pricoin_adaptor_swap_set_pre_signed(
+            sid, good_btc_presig, good_session, 0,
+            good_pric_blob, good_btc_refund, good_pric_refund)
         s = alice.pricoin_swapwatch_notify(
             sid, "foreign_funding", f_txid, 0, 800_000)
         assert_equal(s["state"], "btc_funded")
@@ -133,7 +145,7 @@ class PricoinSwapwatchTest(BitcoinTestFramework):
         assert "foreign_funding" not in kinds_left
 
         # ─── Section 6: out-of-order notify rejected ───────────
-        self.log.info("Section 6: pric_claim before pre_signed rejected")
+        self.log.info("Section 6: pric_claim before both_funded rejected")
         assert_raises_rpc_error(
             -32600, "current state does not permit this transition",
             alice.pricoin_swapwatch_notify,
@@ -145,15 +157,6 @@ class PricoinSwapwatchTest(BitcoinTestFramework):
         self.log.info("Section 7: forward through to complete via notify")
         p_txid = "11" * 32
         alice.pricoin_swapwatch_notify(sid, "pric_funding", p_txid, 0, 12_345)
-
-        good_btc_presig = "00" * 64
-        good_session    = "00" * 133
-        good_pric_blob  = "00" * 200
-        good_btc_refund = "00" * 64
-        good_pric_refund = "00" * 200
-        alice.pricoin_adaptor_swap_set_pre_signed(
-            sid, good_btc_presig, good_session, 0,
-            good_pric_blob, good_btc_refund, good_pric_refund)
 
         s = alice.pricoin_swapwatch_notify(sid, "pric_claim", "22" * 32, -1, -1)
         assert_equal(s["state"], "pric_claimed")
@@ -167,6 +170,9 @@ class PricoinSwapwatchTest(BitcoinTestFramework):
         cid = sc["swap_id"]
         alice.pricoin_adaptor_swap_set_timelocks(cid, 100_000, 100_200, 144)
         alice.pricoin_adaptor_swap_set_adaptor(cid, T_G, T_H, dleq_blob, "")
+        alice.pricoin_adaptor_swap_set_pre_signed(
+            cid, good_btc_presig, good_session, 0,
+            good_pric_blob, good_btc_refund, good_pric_refund)
         alice.pricoin_swapwatch_notify(cid, "foreign_funding", "44" * 32, 0, 800_000)
         alice.pricoin_swapwatch_notify(cid, "pric_funding", "55" * 32, 0, 12_345)
         s = alice.pricoin_swapwatch_notify(cid, "pric_refund", "66" * 32, -1, -1)

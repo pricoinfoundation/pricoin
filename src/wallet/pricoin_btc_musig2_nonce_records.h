@@ -76,6 +76,25 @@ enum class MutateResult {
 // rejected per the strict §4.1a reading).
 MutateResult MarkFinalized(CWallet& wallet, const RecordKey& key);
 
+enum class BindResult {
+    Ok,                       // bound (or idempotent re-bind to same agg nonce)
+    InvalidInput,
+    NotFound,
+    Locked,
+    WriteFailed,
+    ConflictDifferentAggNonce, // SECOND partial over same secnonce, different
+                               // aggregate nonce — the key-extraction attack
+};
+
+// Bind the record for `key` to a single aggregate nonce (identified by
+// `agg_hash`) at partial-sign time, and reject a second partial over the
+// same deterministic secnonce against a DIFFERENT aggregate nonce. MUST be
+// called by partial_sign BEFORE producing the partial signature for any
+// nonce that came from the deterministic round1_safe path; on a non-Ok
+// return (other than idempotent Ok) the caller MUST NOT sign.
+BindResult BindAggNonceAndCheck(
+    CWallet& wallet, const RecordKey& key, const uint256& agg_hash);
+
 // Hard-erase a record. Use only when the wallet has decided the
 // in-flight signing session is permanently aborted and the slot
 // needs to be reset. Audit-logged at the call site.

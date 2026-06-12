@@ -294,6 +294,11 @@ private:
     // transaction (used for transactions appearing in a block).
     void removeConflicts(const CTransaction& tx) EXCLUSIVE_LOCKS_REQUIRED(cs);
 
+    // Pricoin: evict mempool CT ring spends whose key image was just
+    // confirmed by `tx` (a confirmed block tx). Keys on the key image,
+    // not the decoy vin.prevout that removeConflicts uses.
+    void removeKeyImageConflicts(const CTransaction& tx) EXCLUSIVE_LOCKS_REQUIRED(cs);
+
 public:
     indirectmap<COutPoint, txiter> mapNextTx GUARDED_BY(cs);
     std::map<Txid, CAmount> mapDeltas GUARDED_BY(cs);
